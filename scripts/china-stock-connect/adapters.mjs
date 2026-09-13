@@ -493,19 +493,20 @@ async function fetchThroughLadder(url, contract, {
   const remember = (proxyAttempt) => {
     if (sticky) sticky.proxyAttempt = proxyAttempt;
   };
+  const rememberedProxyAttempt = sticky?.proxyAttempt;
 
   // The remembered hop is tried first, but a failure here DEMOTES it and falls
-  // through to the full ladder rather than aborting: sticky is a latency
+  // through to the remaining ladder rather than aborting: sticky is a latency
   // optimisation, and letting one blip on the remembered hop kill the source
   // would turn it into a single point of failure while other transports work.
-  if (Number.isInteger(sticky?.proxyAttempt) && proxyFetchFn) {
+  if (Number.isInteger(rememberedProxyAttempt) && proxyFetchFn) {
     routing.transportPath = 'proxy';
     try {
       const payload = await attempt(
         (input, init) => proxyFetchFn(
           input,
           init,
-          sticky.proxyAttempt,
+          rememberedProxyAttempt,
           (port) => { routing.proxyExitPorts.push(port); },
         ),
         proxyTimeoutMs,
@@ -531,6 +532,7 @@ async function fetchThroughLadder(url, contract, {
     if (proxyFetchFn) {
       routing.transportPath = 'proxy';
       for (let index = 0; index < contract.maxProxyRequestsPerRun; index += 1) {
+        if (index === rememberedProxyAttempt) continue;
         try {
           const payload = await attempt(
             (input, init) => proxyFetchFn(
@@ -893,6 +895,9 @@ function isCompleteMarginPair(margin) {
     && isoDay(margin.tradeDate) === margin.tradeDate
     && sse?.tradeDate === margin.tradeDate
     && szse?.tradeDate === margin.tradeDate
+    && sse.totalBalanceCny === sse.financingBalanceCny + sse.securitiesLendingBalanceCny
+    // SZSE rounds each balance independently to 0.01 yi (CNY 1 million).
+    && Math.abs(szse.totalBalanceCny - szse.financingBalanceCny - szse.securitiesLendingBalanceCny) <= YI / 100
     && MARGIN_BALANCE_FIELDS.every((field) =>
       Number.isFinite(sse[field]) && sse[field] >= 0
       && Number.isFinite(szse[field]) && szse[field] >= 0

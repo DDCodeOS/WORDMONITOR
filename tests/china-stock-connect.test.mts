@@ -181,6 +181,52 @@ describe('Stock Connect retry and last-good recovery', () => {
 
   const failedMargin = [['CATALOGID=1837_xxpl', () => { throw new Error('timeout'); }]];
 
+  it('tries each proxy exit only once per request after a sticky timeout, within the report deadline', async () => {
+    for (const winningPort of [30001, 30002]) {
+      let elapsed = 0;
+      let marginStartedAt = 0;
+      const calls: Array<number | null> = [];
+      const alternatePort = winningPort === 30001 ? 30002 : 30001;
+      const fixtures = fixtureFetch([]);
+      const { snapshot } = await fetchWithFixtures({
+        now: NOW - 8 * 60 * 60_000,
+        clock: () => elapsed,
+        proxyUrl: 'http://fixture:fixture@cn.decodo.com:30001',
+        fetchFn: async (input: unknown, init: RequestInit) => {
+          const url = String(input);
+          if (!url.includes('www.szse.cn')) return fixtures(input, init);
+          if (url.includes('CATALOGID=1837_xxpl')) calls.push(null);
+          elapsed += 15_000;
+          throw new Error('timeout');
+        },
+        proxyRequestFn: async (input: unknown, config: { port: number }) => {
+          const url = String(input);
+          const isMargin = url.includes('CATALOGID=1837_xxpl');
+          if (isMargin) {
+            if (calls.length === 0) marginStartedAt = elapsed;
+            calls.push(config.port);
+            if (config.port === winningPort) {
+              elapsed += 12_000;
+              throw new Error('timeout');
+            }
+          } else if (config.port !== winningPort) {
+            elapsed += 1_000;
+            throw new Error('timeout');
+          }
+          elapsed += 1_000;
+          return { status: 200, contentType: 'application/json',
+            buffer: Buffer.from(await (await fixtures(input, {})).text()) };
+        },
+      });
+      const margin = snapshot.sources.find((source: { id: string }) => source.id === 'szse-margin');
+      assert.equal(margin.errorCode, null);
+      assert.equal(snapshot.status, 'healthy');
+      assert.deepEqual(calls, [winningPort, null, alternatePort, alternatePort]);
+      assert.equal(margin.requestCount, 4);
+      assert.equal(elapsed - marginStartedAt, 29_000);
+    }
+  });
+
   it('falls back when the winning exit fails without rotating past an account denial', async () => {
     for (const directMarginWorks of [true, false]) {
       const calls: Array<number | null> = [];
@@ -307,6 +353,50 @@ describe('Stock Connect retry and last-good recovery', () => {
       const { snapshot } = await fetchWithFixtures({ previousSnapshot, now: NOW + 60_000, overrides });
       assert.equal(snapshot.margin.retained, false);
       assert.equal(snapshot.margin.totalBalanceCny.status, 'unavailable');
+    }
+  });
+
+  it('does not verify or retain internally inconsistent exchange totals even when combined sums match', async () => {
+    const sse = structuredClone(sseMarginFixture);
+    sse.pageHelp.data[0].rzrqjyzl += 1;
+    const szse = structuredClone(szseMarginFixture);
+    szse[0].data[0].jrrzrjye = '12,568.81';
+    for (const overrides of [[['queryMargin.do', sse]], [['CATALOGID=1837_xxpl', szse]]]) {
+      const { snapshot: inconsistent } = await fetchWithFixtures({ overrides });
+      const margin = inconsistent.margin;
+      assert.equal(margin.totalBalanceCny.value,
+        margin.exchanges.sse.totalBalanceCny + margin.exchanges.szse.totalBalanceCny);
+      assert.equal(margin.verifiedAt, null);
+      assert.equal(margin.retained, false);
+      for (const legacy of [false, true]) {
+        const previousSnapshot = structuredClone(inconsistent);
+        if (legacy) {
+          delete previousSnapshot.margin.verifiedAt;
+          delete previousSnapshot.margin.retained;
+        } else {
+          previousSnapshot.margin.verifiedAt = previousSnapshot.generatedAt;
+        }
+        const { snapshot } = await fetchWithFixtures({
+          previousSnapshot, now: NOW + 60_000, overrides: failedMargin,
+        });
+        assert.equal(snapshot.margin.retained, false);
+        assert.equal(snapshot.margin.totalBalanceCny.status, 'unavailable');
+      }
+    }
+  });
+
+  it('accepts independent SZSE balance rounding at the published 0.01-yi precision', async () => {
+    for (const total of ['12,568.78', '12,568.80']) {
+      const szse = structuredClone(szseMarginFixture);
+      szse[0].data[0].jrrzrjye = total;
+      const { snapshot: previousSnapshot } = await fetchWithFixtures({
+        overrides: [['CATALOGID=1837_xxpl', szse]],
+      });
+      assert.equal(previousSnapshot.margin.verifiedAt, previousSnapshot.generatedAt);
+      const { snapshot } = await fetchWithFixtures({
+        previousSnapshot, now: NOW + 60_000, overrides: failedMargin,
+      });
+      assert.deepEqual(snapshot.margin, { ...previousSnapshot.margin, retained: true });
     }
   });
 });
