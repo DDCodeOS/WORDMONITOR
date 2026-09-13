@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { createServer } from 'node:http';
 import { describe, it } from 'node:test';
 import YAML from 'yaml';
@@ -107,7 +107,8 @@ if (process.argv.includes('--paginate')) {
 `, { mode: 0o755 });
     const result = spawnSync(process.execPath, ['scripts/report-mcp-preset-liveness.mjs'], {
       cwd: new URL('..', import.meta.url), encoding: 'utf8', timeout: 10_000,
-      env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, MCP_PRESET_REPORT: reportPath,
+      env: { ...process.env, PATH: `${dir}${delimiter}${process.env.PATH}`, MCP_PRESET_REPORT: reportPath,
+        GITHUB_STEP_SUMMARY: join(dir, 'summary.md'),
         MOCK_PAYLOAD: payloadPath, GITHUB_REPOSITORY: 'owner/repo', PROBE_OUTCOME: 'failure' },
     });
     assert.equal(result.status, 0, result.stderr);
@@ -161,7 +162,7 @@ if (process.argv.includes('--paginate')) {
     const preload = join(dir, 'fetch.mjs');
     const reportPath = join(dir, 'report.json');
     writeFileSync(preload, `globalThis.fetch = async url => new Response('', { status: url === ${JSON.stringify(hosted[0].serverUrl)} ? 308 : 200 });`);
-    const env = { ...process.env, LIVE_MCP_TESTS: '1', MCP_PRESET_REPORT: reportPath };
+    const env = { ...process.env, LIVE_MCP_TESTS: '1', MCP_PRESET_REPORT: reportPath, GITHUB_STEP_SUMMARY: join(dir, 'summary.md') };
     delete env.NODE_TEST_CONTEXT;
     const result = spawnSync(process.execPath, ['--import', preload, '--test', 'tests/mcp-presets.test.mjs'], {
       cwd: new URL('..', import.meta.url), env, encoding: 'utf8', timeout: 10_000,
