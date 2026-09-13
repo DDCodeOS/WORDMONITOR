@@ -1,4 +1,8 @@
+import { createRequire } from 'node:module';
 import ts from 'typescript';
+
+const require = createRequire(import.meta.url);
+const { assertNotificationWebhookDeliveryUrlSafe } = require('./notification-webhook-ssrf.cjs');
 
 // Read catalog data without loading mcp-store's browser/storage dependencies.
 // An unsupported entry must fail the monitor, never silently lose coverage.
@@ -48,7 +52,13 @@ export function isTemplatePreset(preset) {
 const METHOD_PRESERVING_REDIRECTS = new Set([307, 308]);
 const MAX_REDIRECT_HOPS = 1;
 
-function redirectTargetFor(response, fromUrl) {
+// The vendor chooses this target, so it is untrusted in exactly the way the
+// proxy's serverUrl is: without the same checks a 308 could point the probe at
+// a loopback, private, or link-local address, and because `observed` is
+// published into a public issue, the reachability answer leaks. api/mcp-proxy.ts
+// re-runs assertServerUrlSafe on every hop; this is the scripts-side equivalent,
+// reusing the repo's SSRF classifier rather than restating its address ranges.
+async function redirectTargetFor(response, fromUrl, { resolveHostname } = {}) {
   const location = response.headers?.get?.('location');
   if (!location) return null;
   let next;
@@ -57,11 +67,19 @@ function redirectTargetFor(response, fromUrl) {
   } catch {
     return null;
   }
-  // assertServerUrlSafe's scheme rule, mirrored: never downgrade to plaintext.
-  return next.protocol === 'https:' ? next : null;
+  try {
+    // Covers the scheme rule, metadata hostnames, literal private addresses,
+    // and a hostname whose DNS resolves into a reserved range.
+    await (resolveHostname
+      ? assertNotificationWebhookDeliveryUrlSafe(next.toString(), resolveHostname)
+      : assertNotificationWebhookDeliveryUrlSafe(next.toString()));
+  } catch {
+    return null;
+  }
+  return next;
 }
 
-export async function probePreset(preset, { fetchImpl = (...args) => globalThis.fetch(...args), timeoutMs = 15_000 } = {}) {
+export async function probePreset(preset, { fetchImpl = (...args) => globalThis.fetch(...args), timeoutMs = 15_000, resolveHostname } = {}) {
   const result = { name: preset.name, serverUrl: preset.serverUrl, ok: false };
   const controller = new AbortController();
   // One deadline covers both hops, so a redirecting vendor cannot quietly take
@@ -86,7 +104,7 @@ export async function probePreset(preset, { fetchImpl = (...args) => globalThis.
         signal: controller.signal,
       });
       const next = hop < MAX_REDIRECT_HOPS && METHOD_PRESERVING_REDIRECTS.has(response.status)
-        ? redirectTargetFor(response, target)
+        ? await redirectTargetFor(response, target, { resolveHostname })
         : null;
       if (next) {
         // Record the hop even when it resolves cleanly — a working redirect is

@@ -51,6 +51,11 @@ describe('MCP preset catalog and probes', () => {
   // failures because they permit a rewrite to GET, which kills the JSON-RPC
   // handshake (#4938) and which the proxy refuses for the same reason.
   describe('redirect handling mirrors the proxy', () => {
+    // Redirect targets are SSRF-checked, so the fake vendor hosts must resolve
+    // to something public or every follow test would fail for the wrong reason.
+    const publicAddress = async () => ['93.184.216.34'];
+    const hostOf = (u) => { try { return new URL(String(u)).host; } catch { return ''; } };
+
     function hops(...responses) {
       const seen = [];
       const queue = [...responses];
@@ -69,7 +74,7 @@ describe('MCP preset catalog and probes', () => {
     for (const status of [307, 308]) {
       it(`follows a single ${status} and judges the resolved endpoint`, async () => {
         const h = hops(redirect(status, 'https://moved.vendor.test/mcp'), new Response('', { status: 200 }));
-        const result = await probePreset(openPreset, { fetchImpl: h.fetchImpl });
+        const result = await probePreset(openPreset, { fetchImpl: h.fetchImpl, resolveHostname: publicAddress });
         assert.equal(result.ok, true);
         assert.equal(result.observed, `HTTP ${status} -> HTTP 200 https://moved.vendor.test/mcp`);
         assert.deepEqual(h.seen, [openPreset.serverUrl, 'https://moved.vendor.test/mcp']);
@@ -78,14 +83,14 @@ describe('MCP preset catalog and probes', () => {
 
     it('judges a keyed preset from the resolved status, not the hop', async () => {
       const h = hops(redirect(308, 'https://moved.vendor.test/mcp'), new Response('', { status: 401 }));
-      const result = await probePreset(keyedPreset, { fetchImpl: h.fetchImpl });
+      const result = await probePreset(keyedPreset, { fetchImpl: h.fetchImpl, resolveHostname: publicAddress });
       assert.equal(result.ok, true, '401 behind a hop is still healthy for a keyed preset');
       assert.match(result.observed, /HTTP 308 -> HTTP 401/);
     });
 
     it('reports a finding when the resolved endpoint is itself broken', async () => {
       const h = hops(redirect(308, 'https://moved.vendor.test/mcp'), new Response('', { status: 404 }));
-      const result = await probePreset(openPreset, { fetchImpl: h.fetchImpl });
+      const result = await probePreset(openPreset, { fetchImpl: h.fetchImpl, resolveHostname: publicAddress });
       assert.equal(result.ok, false);
       assert.equal(result.observed, 'HTTP 308 -> HTTP 404 https://moved.vendor.test/mcp');
     });
@@ -93,7 +98,7 @@ describe('MCP preset catalog and probes', () => {
     for (const status of [301, 302, 303]) {
       it(`refuses to follow a ${status}, which would rewrite the POST to GET`, async () => {
         const h = hops(redirect(status, 'https://moved.vendor.test/mcp'));
-        const result = await probePreset(openPreset, { fetchImpl: h.fetchImpl });
+        const result = await probePreset(openPreset, { fetchImpl: h.fetchImpl, resolveHostname: publicAddress });
         assert.equal(result.ok, false);
         assert.equal(result.observed, `HTTP ${status}`);
         assert.deepEqual(h.seen, [openPreset.serverUrl], 'the redirect target must never be dispatched');
@@ -105,15 +110,37 @@ describe('MCP preset catalog and probes', () => {
         redirect(308, 'https://one.vendor.test/mcp'),
         redirect(308, 'https://two.vendor.test/mcp'),
       );
-      const result = await probePreset(openPreset, { fetchImpl: h.fetchImpl });
+      const result = await probePreset(openPreset, { fetchImpl: h.fetchImpl, resolveHostname: publicAddress });
       assert.equal(result.ok, false);
       assert.match(result.observed, /HTTP 308 -> HTTP 308 https:\/\/one\.vendor\.test/);
-      assert.ok(!h.seen.includes('https://two.vendor.test/mcp'), 'the second hop must never be dispatched');
+      // Compare parsed hosts, never a substring of the URL: `includes` would
+      // also match https://two.vendor.test.attacker.example, so it models the
+      // dispatch less precisely than the code under test does.
+      assert.ok(
+        !h.seen.some(u => hostOf(u) === 'two.vendor.test'),
+        'the second hop must never be dispatched',
+      );
+    });
+
+    it('refuses a redirect onto a private address even over https', async () => {
+      for (const [label, resolver] of [
+        ['literal loopback', publicAddress],
+        ['DNS into a reserved range', async () => ['10.0.0.7']],
+      ]) {
+        const location = label === 'literal loopback'
+          ? 'https://127.0.0.1/mcp'
+          : 'https://internal.vendor.test/mcp';
+        const h = hops(redirect(308, location));
+        const result = await probePreset(openPreset, { fetchImpl: h.fetchImpl, resolveHostname: resolver });
+        assert.equal(result.ok, false, label);
+        assert.equal(result.observed, 'HTTP 308', label);
+        assert.deepEqual(h.seen, [openPreset.serverUrl], `${label}: the blocked target must never be dispatched`);
+      }
     });
 
     it('refuses an http:// Location instead of downgrading the probe', async () => {
       const h = hops(redirect(308, 'http://moved.vendor.test/mcp'));
-      const result = await probePreset(openPreset, { fetchImpl: h.fetchImpl });
+      const result = await probePreset(openPreset, { fetchImpl: h.fetchImpl, resolveHostname: publicAddress });
       assert.equal(result.ok, false);
       assert.equal(result.observed, 'HTTP 308');
       assert.deepEqual(h.seen, [openPreset.serverUrl]);
