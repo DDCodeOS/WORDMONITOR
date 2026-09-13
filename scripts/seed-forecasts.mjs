@@ -10,7 +10,7 @@ import { unwrapEnvelope } from './_seed-envelope-source.mjs';
 import { allBootstrapMarkets } from './_prediction-classify.mjs';
 import { tagRegions } from './_prediction-scoring.mjs';
 import { attachResolutionSpecs } from './_forecast-resolution.mjs';
-import { assessFunnelDiversity } from './_forecast-funnel.mjs';
+import { assessFunnelDiversity, NON_REAL_FUNNEL_ORIGINS } from './_forecast-funnel.mjs';
 import { resolveR2StorageConfig, putR2JsonObject, getR2JsonObject } from './_r2-storage.mjs';
 import { extractFirstJsonObject, extractFirstJsonArray, cleanJsonText } from './_llm-json.mjs';
 import {
@@ -5562,7 +5562,7 @@ function buildForecastRunActorRegistry(predictions) {
       objectives: [...actor.objectives].slice(0, 4),
       constraints: [...actor.constraints].slice(0, 4),
       likelyActions: [...actor.likelyActions].slice(0, 4),
-      forecastIds: [...actor.forecastIds].slice(0, 8),
+      forecastIds: [...actor.forecastIds],
     }))
     .sort((a, b) => b.influenceScore - a.influenceScore || a.name.localeCompare(b.name));
 }
@@ -6039,7 +6039,7 @@ function finalizeSituationCluster(cluster) {
     stableKey,
     label: formatSituationLabel(cluster),
     forecastCount: cluster.forecastCount,
-    forecastIds: cluster.forecastIds.slice(0, 12),
+    forecastIds: [...cluster.forecastIds],
     dominantRegion,
     dominantDomain,
     regions: cluster.regions,
@@ -6581,7 +6581,7 @@ function finalizeStateUnit(unit) {
     sourceSituationIds: unit.sourceSituationIds,
     situationIds: unit.sourceSituationIds,
     situationCount: unit.sourceSituationIds.length,
-    forecastIds: unit.forecastIds.slice(0, 16),
+    forecastIds: [...unit.forecastIds],
     forecastCount,
     avgProbability: +avgProbability.toFixed(3),
     avgConfidence: +avgConfidence.toFixed(3),
@@ -7892,7 +7892,7 @@ function buildSituationSimulationState(worldState, priorWorldState = null) {
       avgConfidence: Number(source.avgConfidence || 0),
       regions: source.regions || [],
       domains: source.domains || [],
-      forecastIds: forecastIds.slice(0, 12),
+      forecastIds: [...forecastIds],
       actorIds: actors.map((actor) => actor.id).slice(0, 8),
       branchIds: branches.map((branch) => branch.id).slice(0, 10),
       pressureSignals: (source.topSignals || []).slice(0, 5),
@@ -9348,7 +9348,7 @@ function projectSituationClusters(situationClusters, predictions) {
         dominantDomain,
       }),
       forecastCount: clusterPredictions.length,
-      forecastIds: clusterPredictions.map((prediction) => prediction.id).slice(0, 12),
+      forecastIds: clusterPredictions.map((prediction) => prediction.id),
       avgProbability: +avgProbability.toFixed(3),
       avgConfidence: +avgConfidence.toFixed(3),
       topSignals,
@@ -14001,6 +14001,13 @@ function summarizePublishFiltering(predictions, selectedPredictions = [], publis
       .map((pred) => pred.publishDiagnostics?.reason)
       .filter(Boolean),
   );
+  const eligible = predictions.filter(pred => (pred.probability || 0) > PUBLISH_MIN_PROBABILITY && !isWeakForecastFallback(pred));
+  const realDomains = items => [...new Set(items.filter(isRealForecastForDomainCoverage).map(pred => pred.domain))].sort();
+  const eligibleDomains = realDomains(eligible);
+  const selectedDomains = realDomains(selectedPredictions);
+  const publishedDomains = realDomains(publishedPredictions);
+  const publishedResolutionCoverage = summarizeResolutionHardCoverage(publishedPredictions);
+  const targetHardCount = Math.ceil(publishedPredictions.length * MIN_HARD_RESOLUTION_PUBLISH_RATIO);
 
   return {
     suppressedFamilySelection: reasonCounts.family_selection || 0,
@@ -14025,12 +14032,52 @@ function summarizePublishFiltering(predictions, selectedPredictions = [], publis
     suppressedSupplyChainByReason,
     candidateResolutionCoverage: summarizeResolutionHardCoverage(predictions),
     selectedResolutionCoverage: summarizeResolutionHardCoverage(selectedPredictions),
-    publishedResolutionCoverage: summarizeResolutionHardCoverage(publishedPredictions),
+    publishedResolutionCoverage,
+    domainCoverage: {
+      eligible: eligibleDomains,
+      selected: selectedDomains,
+      published: publishedDomains,
+      missing: eligibleDomains.filter(domain => !publishedDomains.includes(domain)),
+    },
+    hardResolutionTarget: {
+      target: targetHardCount,
+      actual: publishedResolutionCoverage.hard,
+      met: publishedResolutionCoverage.hard >= targetHardCount,
+    },
   };
 }
 
 function isHardResolvableForecast(pred) {
   return pred?.resolution?.kind === 'hard';
+}
+
+function isRealForecastForDomainCoverage(pred) {
+  return !!pred?.domain && !NON_REAL_FUNNEL_ORIGINS.includes(pred.generationOrigin || 'legacy_detector');
+}
+
+function orderDomainRepresentativesFirst(predictions) {
+  const domains = new Set();
+  const representatives = [];
+  const remaining = [];
+  for (const pred of predictions) {
+    if (isRealForecastForDomainCoverage(pred) && !domains.has(pred.domain)) {
+      domains.add(pred.domain);
+      representatives.push(pred);
+    } else {
+      remaining.push(pred);
+    }
+  }
+  return [...representatives, ...remaining];
+}
+
+function isWeakForecastFallback(pred) {
+  if ((pred?.traceMeta?.narrativeSource || 'fallback') !== 'fallback') return false;
+  const readiness = pred?.readiness?.overall ?? scoreForecastReadiness(pred).overall;
+  const priority = typeof pred?.analysisPriority === 'number' ? pred.analysisPriority : computeAnalysisPriority(pred);
+  const counterEvidenceTypes = new Set((pred?.caseFile?.counterEvidence || []).map(item => item.type));
+  return readiness < 0.4 && priority < 0.08 && (pred?.confidence || 0) < 0.45
+    && (pred?.probability || 0) < 0.12 && counterEvidenceTypes.has('coverage_gap')
+    && counterEvidenceTypes.has('confidence');
 }
 
 function summarizeResolutionHardCoverage(predictions = []) {
@@ -14047,6 +14094,9 @@ function summarizeResolutionHardCoverage(predictions = []) {
 
 function selectDeferredForecastForPublishBackfill(deferredCandidates, publishedPredictions = [], targetCount = 0) {
   if (!Array.isArray(deferredCandidates) || deferredCandidates.length === 0) return null;
+  const publishedDomains = new Set(publishedPredictions.filter(isRealForecastForDomainCoverage).map(pred => pred.domain));
+  const isMissingDomain = pred => isRealForecastForDomainCoverage(pred)
+    && !publishedDomains.has(pred.domain) && (pred.probability || 0) > PUBLISH_MIN_PROBABILITY && !isWeakForecastFallback(pred);
   const publishedCoverage = summarizeResolutionHardCoverage(publishedPredictions);
   const deferredHardCount = deferredCandidates.filter(isHardResolvableForecast).length;
   const projectedTotal = Math.max(targetCount || 0, publishedCoverage.total + 1);
@@ -14054,6 +14104,12 @@ function selectDeferredForecastForPublishBackfill(deferredCandidates, publishedP
     publishedCoverage.hard + deferredHardCount,
     Math.ceil(projectedTotal * MIN_HARD_RESOLUTION_PUBLISH_RATIO),
   );
+  if (publishedCoverage.hard < targetHardCount) {
+    const missingHardIndex = deferredCandidates.findIndex(pred => isMissingDomain(pred) && isHardResolvableForecast(pred));
+    if (missingHardIndex >= 0) return deferredCandidates.splice(missingHardIndex, 1)[0];
+  }
+  const missingDomainIndex = deferredCandidates.findIndex(isMissingDomain);
+  if (missingDomainIndex >= 0) return deferredCandidates.splice(missingDomainIndex, 1)[0];
   if (publishedCoverage.hard < targetHardCount) {
     const hardIndex = deferredCandidates.findIndex(isHardResolvableForecast);
     if (hardIndex >= 0) return deferredCandidates.splice(hardIndex, 1)[0];
@@ -14265,7 +14321,8 @@ function canCoexistAsDistinctStrategicFollowOn(pred, selected = []) {
 }
 
 function selectPublishedForecastPool(predictions, options = {}) {
-  const eligible = (predictions || []).filter((pred) => (pred?.probability || 0) > (options.minProbability ?? PUBLISH_MIN_PROBABILITY));
+  const eligible = (predictions || []).filter((pred) => (pred?.probability || 0) > (options.minProbability ?? PUBLISH_MIN_PROBABILITY)
+    && !isWeakForecastFallback(pred));
   const targetCount = options.targetCount ?? getPublishSelectionTarget(eligible);
   const memoryIndex = options.memoryIndex || null;
   const selected = [];
@@ -14281,7 +14338,8 @@ function selectPublishedForecastPool(predictions, options = {}) {
     .slice()
     .sort((a, b) => (b.publishSelectionScore || 0) - (a.publishSelectionScore || 0)
       || (b.analysisPriority || 0) - (a.analysisPriority || 0)
-      || (b.probability || 0) - (a.probability || 0));
+      || (b.probability || 0) - (a.probability || 0)
+      || a.id.localeCompare(b.id));
 
   const familyBuckets = new Map();
   for (const pred of ranked) {
@@ -14345,13 +14403,16 @@ function selectPublishedForecastPool(predictions, options = {}) {
     updateSelectionCounts(pred, 1);
   }
 
-  function isProtectedRebalanceRepresentative(pred) {
+  function isProtectedRebalanceRepresentative(pred, candidate) {
     if (!pred) return false;
-    if (pred.domain === 'military') {
-      return selected.filter((item) => item.domain === 'military').length <= 1;
+    if (isRealForecastForDomainCoverage(pred)
+      && selected.filter(item => item.domain === pred.domain && isRealForecastForDomainCoverage(item)).length === 1
+      && !(candidate.domain === pred.domain && isRealForecastForDomainCoverage(candidate))) {
+      return true;
     }
     if (pred.domain === 'supply_chain' && isStrategicSupplyChainCandidate(pred)) {
-      return selected.filter((item) => item.domain === 'supply_chain' && isStrategicSupplyChainCandidate(item)).length <= 1;
+      return selected.filter((item) => item.domain === 'supply_chain' && isStrategicSupplyChainCandidate(item)).length <= 1
+        && !isStrategicSupplyChainCandidate(candidate);
     }
     return false;
   }
@@ -14393,11 +14454,12 @@ function selectPublishedForecastPool(predictions, options = {}) {
       if (selectedHardCount >= targetHardCount) break;
       const replacements = selected
         .map((pred, index) => ({ pred, index }))
-        .filter(({ pred }) => !isHardResolvableForecast(pred) && !isProtectedRebalanceRepresentative(pred))
+        .filter(({ pred }) => !isHardResolvableForecast(pred) && !isProtectedRebalanceRepresentative(pred, candidate))
         .sort((a, b) => (a.pred.publishSelectionScore || 0) - (b.pred.publishSelectionScore || 0)
           || (a.pred.analysisPriority || 0) - (b.pred.analysisPriority || 0)
-          || (a.pred.probability || 0) - (b.pred.probability || 0));
-      if (replacements.length === 0) break;
+          || (a.pred.probability || 0) - (b.pred.probability || 0)
+          || a.pred.id.localeCompare(b.pred.id));
+      if (replacements.length === 0) continue;
 
       for (const replacement of replacements) {
         const selectionWithoutReplacement = selected.filter((_, index) => index !== replacement.index);
@@ -14445,6 +14507,12 @@ function selectPublishedForecastPool(predictions, options = {}) {
       )
     )
   ));
+  // Reserve real domains before a busy state or family can fill the shortlist.
+  for (const pred of ranked) {
+    if (selected.length >= targetCount) break;
+    if (!isRealForecastForDomainCoverage(pred) || selected.some(item => item.domain === pred.domain)) continue;
+    if (canSelect(pred, 'backfill')) take(pred);
+  }
   for (const pred of stateAnchors) {
     if (selected.length >= Math.min(targetCount, stateAnchors.length)) break;
     if (canSelect(pred, 'state_anchor')) take(pred);
@@ -14532,7 +14600,8 @@ function selectPublishedForecastPool(predictions, options = {}) {
     .slice()
     .sort((a, b) => (b.analysisPriority || 0) - (a.analysisPriority || 0)
       || (b.publishSelectionScore || 0) - (a.publishSelectionScore || 0)
-      || (b.probability || 0) - (a.probability || 0));
+      || (b.probability || 0) - (a.probability || 0)
+      || a.id.localeCompare(b.id));
   result.deferredCandidates = deferredCandidates;
   result.targetCount = targetCount;
   return result;
@@ -14574,6 +14643,10 @@ function markDeferredFamilySelection(predictions, selectedPool) {
     if ((pred?.probability || 0) <= PUBLISH_MIN_PROBABILITY) continue;
     if (selectedIds.has(pred.id)) continue;
     if (pred.publishDiagnostics?.reason) continue;
+    if (isWeakForecastFallback(pred)) {
+      pred.publishDiagnostics = { reason: 'weak_fallback' };
+      continue;
+    }
     pred.publishDiagnostics = {
       reason: 'family_selection',
       familyId: pred.familyContext?.id || '',
@@ -14594,28 +14667,17 @@ function filterPublishedForecasts(predictions, minProbability = PUBLISH_MIN_PROB
     pred.publishDiagnostics = null;
     pred.publishTokens = pred.publishTokens || getForecastSituationTokens(pred);
     if ((pred?.probability || 0) <= minProbability) continue;
-    const narrativeSource = pred?.traceMeta?.narrativeSource || 'fallback';
     const readiness = pred?.readiness?.overall ?? scoreForecastReadiness(pred).overall;
     const priority = typeof pred?.analysisPriority === 'number' ? pred.analysisPriority : computeAnalysisPriority(pred);
-    const counterEvidenceTypes = new Set((pred?.caseFile?.counterEvidence || []).map(item => item.type));
-    if (narrativeSource === 'fallback') {
-      const weakFallback = (
-        readiness < 0.4 &&
-        priority < 0.08 &&
-        (pred?.confidence || 0) < 0.45 &&
-        (pred?.probability || 0) < 0.12 &&
-        counterEvidenceTypes.has('coverage_gap') &&
-        counterEvidenceTypes.has('confidence')
-      );
-      if (weakFallback) {
-        weakFallbackCount++;
-        pred.publishDiagnostics = { reason: 'weak_fallback' };
-        continue;
-      }
+    if (isWeakForecastFallback(pred)) {
+      weakFallbackCount++;
+      pred.publishDiagnostics = { reason: 'weak_fallback' };
+      continue;
     }
 
     const bestDuplicate = kept.find((item) => {
       if (item.domain !== pred.domain) return false;
+      if (isRealForecastForDomainCoverage(pred) && !isRealForecastForDomainCoverage(item)) return false;
       if (item.familyContext?.id && pred.familyContext?.id && item.familyContext.id !== pred.familyContext.id) return false;
       const duplicateScore = computeSituationDuplicateScore(pred, item);
       if (!shouldSuppressAsSituationDuplicate(pred, item, duplicateScore)) return false;
@@ -14648,7 +14710,7 @@ function filterPublishedForecasts(predictions, minProbability = PUBLISH_MIN_PROB
   const published = [];
   const situationCounts = new Map();
   const situationDomainCounts = new Map();
-  for (const pred of kept) {
+  for (const pred of orderDomainRepresentativesFirst(kept)) {
     const situationId = getForecastSelectionStateContext(pred)?.id || '';
     if (!situationId) {
       published.push(pred);
@@ -14694,7 +14756,8 @@ function filterPublishedForecasts(predictions, minProbability = PUBLISH_MIN_PROB
   if (situationCapSuppressedCount > 0) {
     console.log(`  [filterPublished] Suppressed ${situationCapSuppressedCount} situation-cap forecast(s)`);
   }
-  return published;
+  const publishedIds = new Set(published.map(pred => pred.id));
+  return kept.filter(pred => publishedIds.has(pred.id));
 }
 
 function applySituationFamilyCaps(predictions, situationFamilies = []) {
@@ -14704,7 +14767,7 @@ function applySituationFamilyCaps(predictions, situationFamilies = []) {
   const familyDomainCounts = new Map();
   const familyIndex = buildSituationFamilyIndex(situationFamilies);
 
-  for (const pred of predictions || []) {
+  for (const pred of orderDomainRepresentativesFirst(predictions || [])) {
     const family = familyIndex.get(pred.situationContext?.id || '');
     if (!family) {
       published.push(pred);
@@ -14746,7 +14809,8 @@ function applySituationFamilyCaps(predictions, situationFamilies = []) {
     console.log(`  [filterPublished] Suppressed ${familyCapSuppressedCount} situation-family-cap forecast(s)`);
   }
 
-  return published;
+  const publishedIds = new Set(published.map(pred => pred.id));
+  return (predictions || []).filter(pred => publishedIds.has(pred.id));
 }
 
 function selectForecastsForEnrichment(predictions, options = {}) {
@@ -19426,6 +19490,7 @@ export {
   rankForecastsForAnalysis,
   selectPublishedForecastPool,
   selectDeferredForecastForPublishBackfill,
+  markDeferredFamilySelection,
   buildPublishedForecastArtifacts,
   filterPublishedForecasts,
   applySituationFamilyCaps,

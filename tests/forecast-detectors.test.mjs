@@ -56,6 +56,7 @@ import {
   rankForecastsForAnalysis,
   selectPublishedForecastPool,
   selectDeferredForecastForPublishBackfill,
+  markDeferredFamilySelection,
   buildPublishedForecastArtifacts,
   filterPublishedForecasts,
   applySituationFamilyCaps,
@@ -86,6 +87,7 @@ import {
 } from '../scripts/seed-forecasts.mjs';
 import { OPENROUTER_PROVIDER_ROUTING } from '../scripts/_llm-model-timeouts.mjs';
 import { CONFLICT_COUNT_SOURCE_FEED } from '../scripts/_forecast-resolution.mjs';
+import { assessFunnelDiversity } from '../scripts/_forecast-funnel.mjs';
 
 const originalForecastEnv = {
   FORECAST_LLM_PROVIDER_ORDER: process.env.FORECAST_LLM_PROVIDER_ORDER,
@@ -3430,6 +3432,134 @@ describe('forecast quality gating', () => {
     assert.ok(hard.publishSelectionScore > judged.publishSelectionScore);
   });
 
+  it('preserves five real domains through selection, hard rebalance, and publication', () => {
+    const candidates = [];
+    function add(domain, index, kind, priority) {
+      const pred = makePrediction(domain, `${domain} region ${index}`, `${domain} outlook ${index}`, 0.6, 0.6, '7d', [
+        { type: 'news_corroboration', value: `${domain} evidence ${index}`, weight: 0.4 },
+      ]);
+      pred.id = `${domain}-${index}`;
+      pred.resolution = { kind };
+      attachPublishSelectionContext(pred, { priority });
+      candidates.push(pred);
+      return pred;
+    }
+    for (let i = 0; i < 6; i++) add('market', i, 'judged', 0.9 - i * 0.01);
+    for (let i = 0; i < 6; i++) add('supply_chain', i, 'hard', 0.6 - i * 0.01);
+    for (let i = 0; i < 6; i++) add('political', i, 'hard', 0.5 - i * 0.01);
+    add('market', 6, 'hard', 0.2);
+    const conflict = add('conflict', 0, 'judged', 0.3);
+    const cyber = add('cyber', 0, 'hard', 0.01);
+    const run = input => {
+      const pool = selectPublishedForecastPool(structuredClone(input));
+      const artifacts = buildPublishedForecastArtifacts(pool, []);
+      const published = artifacts.publishedPredictions;
+      assert.equal(published.length, 14);
+      assert.deepEqual(assessFunnelDiversity(published).domains, ['conflict', 'cyber', 'market', 'political', 'supply_chain']);
+      assert.equal(assessFunnelDiversity(published).collapsed, false);
+      assert.ok(published.some(pred => pred.id === conflict.id));
+      assert.ok(published.some(pred => pred.id === cyber.id));
+      assert.ok(published.filter(pred => pred.resolution.kind === 'hard').length >= 12);
+      return published.map(pred => pred.id);
+    };
+    assert.deepEqual(run(candidates), run([...candidates].reverse()));
+  });
+
+  it('backfills an absent real domain before adding another represented hard forecast', () => {
+    const supply = { id: 'supply', domain: 'supply_chain', probability: 0.7, resolution: { kind: 'hard' } };
+    const cyber = { id: 'cyber', domain: 'cyber', probability: 0.5, resolution: { kind: 'hard' } };
+    const deferred = [supply, cyber];
+    const selected = selectDeferredForecastForPublishBackfill(deferred, [
+      { id: 'published-supply', domain: 'supply_chain', resolution: { kind: 'hard' } },
+    ], 3);
+    assert.equal(selected.id, 'cyber');
+    assert.deepEqual(deferred.map(pred => pred.id), ['supply']);
+  });
+
+  it('breaks equal selection scores by ID, independent of input order', () => {
+    const candidates = ['b', 'a'].map(id => {
+      const pred = makePrediction('cyber', id, 'Cyber concentration', 0.6, 0.6, '7d', []);
+      pred.id = id;
+      return attachPublishSelectionContext(pred);
+    });
+    for (const input of [candidates, [...candidates].reverse()]) {
+      assert.deepEqual(selectPublishedForecastPool(input, { targetCount: 1 }).map(pred => pred.id), ['a']);
+    }
+  });
+
+  it('continues past a protected cross-domain swap to allow a same-domain hard upgrade', () => {
+    const candidates = [
+      ['cyber', 'judged', 0.9], ['market', 'hard', 0.8],
+      ['political', 'hard', 0.2], ['cyber', 'hard', 0.01],
+    ].map(([domain, kind, priority], index) => {
+      const pred = makePrediction(domain, `Region ${index}`, `Outlook ${index}`, 0.6, 0.6, '7d', []);
+      pred.id = `upgrade-${index}`;
+      pred.resolution = { kind };
+      return attachPublishSelectionContext(pred, { priority });
+    });
+    const pool = selectPublishedForecastPool(candidates, { targetCount: 2 });
+    assert.deepEqual(pool.map(pred => pred.id), ['upgrade-1', 'upgrade-3']);
+    assert.deepEqual(summarizePublishFiltering(candidates, pool, pool).domainCoverage, {
+      eligible: ['cyber', 'market', 'political'], selected: ['cyber', 'market'],
+      published: ['cyber', 'market'], missing: ['political'],
+    });
+  });
+
+  it('reserves real domains without using weak or synthetic-only candidates as coverage', () => {
+    const real = ['market', 'cyber'].map(domain => attachPublishSelectionContext(
+      makePrediction(domain, domain, `${domain} outlook`, 0.6, 0.6, '7d', []), { priority: 0.3 },
+    ));
+    const synthetic = attachPublishSelectionContext(
+      makePrediction('political', 'France', 'Political outlook', 0.8, 0.8, '7d', []), { priority: 0.9 },
+    );
+    synthetic.generationOrigin = 'state_derived';
+    const weak = attachPublishSelectionContext(
+      makePrediction('conflict', 'Thinland', 'Thin outlook', 0.1, 0.3, '7d', []), { priority: 0.01, readiness: 0.2 },
+    );
+    weak.caseFile.counterEvidence = [{ type: 'coverage_gap' }, { type: 'confidence' }];
+    const candidates = [synthetic, weak, ...real];
+    const pool = selectPublishedForecastPool(candidates, { targetCount: 2 });
+    const published = buildPublishedForecastArtifacts(pool, []).publishedPredictions;
+    markDeferredFamilySelection(candidates, pool);
+    assert.deepEqual(new Set(published.map(pred => pred.id)), new Set(real.map(pred => pred.id)));
+    assert.equal(weak.publishDiagnostics.reason, 'weak_fallback');
+    const telemetry = summarizePublishFiltering(candidates, pool, published);
+    assert.deepEqual(telemetry.domainCoverage, {
+      eligible: ['cyber', 'market'], selected: ['cyber', 'market'], published: ['cyber', 'market'], missing: [],
+    });
+    assert.equal(telemetry.suppressedWeakFallback, 1);
+    assert.equal(assessFunnelDiversity(published).collapsed, true);
+  });
+
+  it('preserves real domain breadth under final situation and family caps without raising those caps', () => {
+    const candidates = ['market', 'market', 'political', 'political', 'cyber'].map((domain, index) => {
+      const pred = makePrediction(domain, `Region ${index}`, `Distinct outlook ${index}`, 0.6, 0.6, '7d', []);
+      return attachPublishSelectionContext(pred, { stateId: 'shared-state', familyId: 'shared-family' });
+    });
+    const situationPublished = filterPublishedForecasts(candidates);
+    assert.equal(situationPublished.length, 3);
+    assert.deepEqual(situationPublished.map(pred => pred.domain), ['market', 'political', 'cyber']);
+    const familyPublished = applySituationFamilyCaps(candidates, [{
+      id: 'shared-family', situationIds: candidates.map(pred => pred.situationContext.id),
+    }]);
+    assert.equal(familyPublished.length, 4);
+    assert.deepEqual(familyPublished.map(pred => pred.domain), ['market', 'market', 'political', 'cyber']);
+  });
+
+  it('does not let a higher-ranked synthetic or shadow duplicate erase real coverage', () => {
+    for (const generationOrigin of ['state_derived', 'bet_engine']) {
+      const real = attachPublishSelectionContext(
+        makePrediction('cyber', 'United States', 'Cyber concentration', 0.5, 0.6, '7d', []), { priority: 0.3 },
+      );
+      buildForecastCases([real]);
+      const synthetic = { ...structuredClone(real), id: 'synthetic-duplicate', generationOrigin, analysisPriority: 0.9 };
+      const pool = selectPublishedForecastPool([synthetic, real], { targetCount: 2 });
+      const published = buildPublishedForecastArtifacts(pool, []).publishedPredictions;
+      assert.ok(published.some(pred => pred.id === real.id), generationOrigin);
+      assert.deepEqual(summarizePublishFiltering([real, synthetic], pool, published).domainCoverage.missing, []);
+    }
+  });
+
   it('rebalances the freshest selected snapshot to >=80% hard when hard supply exists', () => {
     const deadline = Date.parse('2026-08-01T00:00:00Z');
     const forecasts = [];
@@ -3562,7 +3692,12 @@ describe('forecast quality gating', () => {
     const hardCount = pool.filter((pred) => pred.resolution?.kind === 'hard').length;
     assert.ok(poolIds.includes(military.id), poolIds.join(', '));
     assert.ok(poolIds.includes(supply.id), poolIds.join(', '));
-    assert.equal(hardCount, 8, poolIds.join(', '));
+    assert.ok(pool.some(pred => pred.domain === 'market'), poolIds.join(', '));
+    assert.equal(pool.length, 10);
+    assert.equal(hardCount, 7, poolIds.join(', '));
+    assert.deepEqual(summarizePublishFiltering([...rankedJudged, military, supply, ...hardCandidates], pool, pool).hardResolutionTarget, {
+      target: 8, actual: 7, met: false,
+    });
   });
 
   it('tops out hard rebalance at constrained hard supply', () => {
