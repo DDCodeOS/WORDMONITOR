@@ -201,7 +201,9 @@ test.describe('settings source live apply (#6380)', () => {
     expect(disabled).not.toContain('Guardian Pacific');
     expect(disabled).toContain('France 24 Asia Pacific');
     await page.locator('.sources-search input').fill('Guardian');
-    await testInfo.attach('Regional source choice after reload', { body: await page.screenshot(), contentType: 'image/png' });
+    const screenshotPath = testInfo.outputPath('regional-source-choice.png');
+    await page.screenshot({ path: screenshotPath });
+    await testInfo.attach('Regional source choice after reload', { path: screenshotPath, contentType: 'image/png' });
   });
 
   test('toggling sources and closing Settings reloads news once, without a reload', async ({ page }) => {
