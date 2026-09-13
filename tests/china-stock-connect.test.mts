@@ -147,8 +147,11 @@ describe('Stock Connect retry and last-good recovery', () => {
           throw new Error('timeout');
         }
         if (source !== 'calendar' && port === 30001) {
-          elapsed += source === '1837_xxpl' && count === 1
-            ? (date === '2026-08-04' ? 8_000 : 12_000) : 1_000;
+          let durationMs = 1_000;
+          if (source === '1837_xxpl' && count === 1) {
+            durationMs = date === '2026-08-04' ? 8_000 : 12_000;
+          }
+          elapsed += durationMs;
           throw Object.assign(new Error('Proxy CONNECT 522'), { code: 'HTTP_522', proxyConnect: true });
         }
       }
@@ -156,6 +159,7 @@ describe('Stock Connect retry and last-good recovery', () => {
       return fixtures(input, {});
     };
     const { snapshot } = await fetchWithFixtures({
+      now: NOW - 8 * 60 * 60_000,
       clock: () => elapsed,
       proxyUrl: 'http://fixture:fixture@cn.decodo.com:30001',
       fetchFn: (input: unknown) => request(input, null),
@@ -177,12 +181,51 @@ describe('Stock Connect retry and last-good recovery', () => {
 
   const failedMargin = [['CATALOGID=1837_xxpl', () => { throw new Error('timeout'); }]];
 
+  it('falls back when the winning exit fails without rotating past an account denial', async () => {
+    for (const directMarginWorks of [true, false]) {
+      const calls: Array<number | null> = [];
+      const fixtures = fixtureFetch([]);
+      const { snapshot } = await fetchWithFixtures({
+        now: NOW - 8 * 60 * 60_000,
+        proxyUrl: 'http://fixture:fixture@cn.decodo.com:30001',
+        fetchFn: async (input: unknown, init: RequestInit) => {
+          const url = String(input);
+          if (!url.includes('www.szse.cn')) return fixtures(input, init);
+          if (url.includes('CATALOGID=1837_xxpl')) {
+            calls.push(null);
+            if (directMarginWorks) return fixtures(input, init);
+          }
+          throw new Error('timeout');
+        },
+        proxyRequestFn: async (input: unknown, config: { port: number }) => {
+          const url = String(input);
+          if (url.includes('CATALOGID=1837_xxpl')) {
+            calls.push(config.port);
+            throw Object.assign(new Error('Proxy CONNECT 407'), { code: 'HTTP_407', proxyConnect: true });
+          }
+          if (url.includes('SGT_SGTJYRB') && config.port === 30001) {
+            throw Object.assign(new Error('Proxy CONNECT 522'), { code: 'HTTP_522', proxyConnect: true });
+          }
+          return { status: 200, contentType: 'application/json',
+            buffer: Buffer.from(await (await fixtures(input, {})).text()) };
+        },
+      });
+      const margin = snapshot.sources.find((source: { id: string }) => source.id === 'szse-margin');
+      assert.deepEqual(calls, directMarginWorks ? [30002, null, null] : [30002, null, 30001]);
+      assert.equal(margin.errorCode, directMarginWorks ? null : 'HTTP_407');
+      assert.equal(margin.requestCount, 3);
+    }
+  });
+
   it('publishes the intact last-good pair while the real coverage reader still reports failure', async () => {
     const { snapshot: previous } = await fetchWithFixtures();
+    const decisions: Array<Record<string, unknown>> = [];
     const snapshot = await buildChinaStockConnectSeedSnapshot({
       readSnapshot: async () => JSON.parse(JSON.stringify(previous)),
       fetchSnapshot: async ({ previousSnapshot }: { previousSnapshot: unknown }) => (await fetchWithFixtures({
-        previousSnapshot, now: NOW + 50 * 60_000, overrides: failedMargin,
+        previousSnapshot, now: NOW + 50 * 60_000,
+        onDecision: (entry: Record<string, unknown>) => decisions.push(entry),
+        overrides: [...failedMargin, ['queryMargin.do', { pageHelp: { data: [{ ...sseMarginFixture.result[0], opDate: '20260804' }] } }]],
       })).snapshot,
     });
     assert.deepEqual(snapshot.margin, { ...previous.margin, retained: true });
@@ -195,15 +238,17 @@ describe('Stock Connect retry and last-good recovery', () => {
     assert.equal(failed.errorCode, 'TIMEOUT');
     assert.equal(failed.lastSuccessAt, previous.generatedAt);
     assert.equal(failed.checkedAt, snapshot.generatedAt);
+    assert.equal(decisions[0].marginRetained, true);
+    assert.equal(decisions[0].marginVerifiedAt, previous.generatedAt);
     const entry = CHINA_COVERAGE_ENTRIES.find((entry: { id: string }) => entry.id === 'market.china-stock-connect');
     const coverage = evaluateChinaCoverage({
       entries: [entry],
       data: { [entry.content.key]: snapshot },
-      meta: { [entry.transport.key]: { lastSuccessAt: snapshot.generatedAt } },
+      meta: { [entry.transport.key]: { status: 'ok', fetchedAt: Date.parse(snapshot.generatedAt) } },
       now: NOW + 50 * 60_000,
     });
     assert.equal(coverage.status, 'degraded');
-    assert.ok(coverage.entries[0].reasonCodes.includes('CHINA_COVERAGE_PARTIAL'));
+    assert.deepEqual(coverage.entries[0].reasonCodes, ['CHINA_COVERAGE_PARTIAL']);
   });
 
   it('does not renew retention on repeated or alternating failures and replaces the whole pair on recovery', async () => {
@@ -238,7 +283,11 @@ describe('Stock Connect retry and last-good recovery', () => {
       (prior: typeof previous) => { prior.margin.exchanges.sse.financingBalanceCny = null; },
       (prior: typeof previous) => { prior.margin.verifiedAt = 'invalid'; },
       (prior: typeof previous) => { prior.margin.verifiedAt = new Date(NOW + 120_000).toISOString(); },
-      (prior: typeof previous) => { delete prior.margin.verifiedAt; prior.sources[0].lastSuccessAt = null; prior.sources.find((source: { id: string }) => source.id === 'szse-margin').transportStatus = 'error'; },
+      (prior: typeof previous) => {
+        delete prior.margin.verifiedAt;
+        prior.sources.find((source: { id: string }) => source.id === 'szse-margin').transportStatus = 'error';
+      },
+      (prior: typeof previous) => { delete prior.margin.verifiedAt; prior.sources = {}; },
     ]) {
       const prior = structuredClone(previous);
       mutate(prior);
@@ -253,7 +302,7 @@ describe('Stock Connect retry and last-good recovery', () => {
     for (const overrides of [
       [['CATALOGID=1837_xxpl', { unexpected: [] }]],
       [['CATALOGID=1837_xxpl', () => { throw new Error('timeout'); }], ['queryMargin.do', () => { throw new Error('timeout'); }]],
-      [['queryMargin.do', { result: [{ ...sseMarginFixture.result[0], opDate: '20260804' }] }]],
+      [['queryMargin.do', { pageHelp: { data: [{ ...sseMarginFixture.result[0], opDate: '20260804' }] } }]],
     ]) {
       const { snapshot } = await fetchWithFixtures({ previousSnapshot, now: NOW + 60_000, overrides });
       assert.equal(snapshot.margin.retained, false);
