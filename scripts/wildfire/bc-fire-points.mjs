@@ -527,7 +527,8 @@ export async function fetchBcFirePoints({ previousSnapshot, nowMs = Date.now(), 
       error._bcSnapshot = snapshot;
       throw error;
     }
-    console.warn(`[wildfire] BC wildfire failed: ${error.message}; retained source fetched at ${snapshot.fetchedAt}`);
+    console.warn(JSON.stringify({ event: 'bc_fire_source_failure',
+      errorCode: 'BC_WILDFIRE_SOURCE_FAILED', retainedFetchedAt: snapshot.fetchedAt }));
     return { fireDetections: snapshot.fireDetections, _bcCount: snapshot.fireDetections.length,
       _bcVia: null, _bcState: 'failed', _bcSnapshot: snapshot };
   }

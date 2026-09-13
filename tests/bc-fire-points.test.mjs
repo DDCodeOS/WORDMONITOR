@@ -630,6 +630,21 @@ describe('host allowlist, cache key, transport', () => {
     assert.doesNotMatch(logs.join(''), /SECRET/);
   });
 
+  it('omits malformed provider response text from retention warnings', async t => {
+    const logs = [];
+    t.mock.method(console, 'warn', value => logs.push(value));
+    const now = Date.parse('2026-09-13T02:20:00Z');
+    const previousSnapshot = { version: 1, fetchedAt: now - 600_000,
+      fireDetections: parseBcFireGeoJson(geojson).fireDetections };
+    const result = await fetchBcFirePoints({ previousSnapshot, nowMs: now, fetchFn: async url =>
+      new Response(new URL(url).pathname.includes('/kml/') ? '<kml/>' : 'SECRET_PROVIDER_BODY') });
+    assert.equal(result._bcState, 'failed');
+    assert.deepEqual(result.fireDetections, previousSnapshot.fireDetections);
+    assert.doesNotMatch(logs.join(''), /SECRET/);
+    assert.deepEqual(logs.map(value => JSON.parse(value)), [{ event: 'bc_fire_source_failure',
+      errorCode: 'BC_WILDFIRE_SOURCE_FAILED', retainedFetchedAt: previousSnapshot.fetchedAt }]);
+  });
+
   it('retains BC coverage and source clocks after WFS HTTP 400 while FIRMS updates', async () => {
     const now = Date.parse('2026-09-13T02:20:00Z');
     const rows = parseBcFireGeoJson(geojson).fireDetections;
