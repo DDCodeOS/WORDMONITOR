@@ -312,7 +312,10 @@ describe('Umami storage monitor', () => {
     // Only this workflow's own runs on the same branch may seed the history, so
     // a same-named artifact from another workflow or ref cannot skew the trend.
     assert.match(restoreStep.run, /actions\/workflows\/umami-storage-monitor\.yml\/runs/);
-    assert.match(restoreStep.run, /branch=\$\{?BRANCH\}?/);
+    // A branch name may contain `&`; interpolated into the URL it would add a
+    // query parameter. gh api encodes a GET field instead.
+    assert.match(restoreStep.run, /gh api --method GET "[^"?]*\/runs"/);
+    assert.match(restoreStep.run, /-f "branch=\$BRANCH"/);
     assert.equal(restoreStep.env.BRANCH, '${{ github.ref_name }}');
     assert.equal(restoreStep.env.GH_TOKEN, '${{ github.token }}');
     assert.deepEqual(workflow.permissions, { contents: 'read', actions: 'read' });
@@ -324,6 +327,9 @@ describe('Umami storage monitor', () => {
     assert.equal(saveStep.with.path, '.cache/umami-storage-state.json');
     // upload-artifact skips dot-directories unless told otherwise.
     assert.equal(saveStep.with['include-hidden-files'], true);
+    // A re-run keeps github.run_id, and upload-artifact rejects a second
+    // artifact with the same name in one run unless it may replace it.
+    assert.equal(saveStep.with.overwrite, true);
     assert.match(retentionSql, /LIMIT 10000/);
     assert.match(retentionSql, /64 \* 1024 \* 1024/);
     assert.doesNotMatch(executableRetentionSql, /\bTRUNCATE\b/);

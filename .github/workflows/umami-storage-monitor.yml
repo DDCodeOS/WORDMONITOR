@@ -47,7 +47,10 @@ jobs:
           mkdir -p .cache
           # A lost history only suspends the projection; the capacity check
           # itself must still run, so a GitHub API failure warns, not fails.
-          if ! run_ids=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/umami-storage-monitor.yml/runs?branch=${BRANCH}&per_page=20" \
+          # The branch goes in as a field so gh encodes it; a name containing
+          # `&` would otherwise add its own query parameter.
+          if ! run_ids=$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/umami-storage-monitor.yml/runs" \
+            -f "branch=$BRANCH" -F per_page=20 \
             --jq ".workflow_runs[] | select(.id != $GITHUB_RUN_ID) | .id"); then
             echo "::warning::Could not list earlier monitor runs; the growth trend starts over."
             exit 0
@@ -103,6 +106,9 @@ jobs:
           name: umami-storage-state
           path: .cache/umami-storage-state.json
           include-hidden-files: true
+          # A re-run keeps the run id, and a second artifact with this name in
+          # the same run is rejected unless it replaces the first attempt's.
+          overwrite: true
           if-no-files-found: warn
           retention-days: 7
 
