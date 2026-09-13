@@ -50,6 +50,8 @@ describe('widget data-tool contracts', () => {
     assert.match(description, /Endpoint not allowed\./);
     assert.match(description, /HTML.*error/i);
     assert.match(description, /Fetch failed:/);
+    assert.match(description, /credentials.*not.*send/);
+    assert.match(description, /authorization error.*text/);
     assert.doesNotMatch(description, /only pre-approved|allowlist/i);
     assert.doesNotMatch([...prompts, description, searchTool.description].join('\n'),
       /list_bootstrap_keys|(?:no|cannot return|lacks) historical series/i);
