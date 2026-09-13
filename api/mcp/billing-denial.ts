@@ -181,6 +181,7 @@ export async function extractSafeRpcViolations(
  * bodies with safe field violations become RpcValidationError; everything
  * else keeps the existing `<label> HTTP <status>` Error contract.
  *
+ * HTTP 401 bodies preserve only confirmed internal-signature rejection codes.
  * HTTP 400 response bodies are consumed only to classify violations. Callers
  * must await this helper — a forgotten await would let execution continue
  * and treat the 400 as success.
@@ -188,6 +189,19 @@ export async function extractSafeRpcViolations(
 export async function assertToolFetchOk(response: ToolFetchResponse, label: string): Promise<void> {
   if (response.ok) return;
   throwIfBillingDenial(response, label);
+  if (response.status === 401) {
+    const detail = await readBoundedResponseText(response, 4096);
+    let signatureRejected = false;
+    try {
+      const body = JSON.parse(detail) as { error?: unknown; code?: unknown } | null;
+      signatureRejected = (body?.code ?? body?.error) === 'invalid_internal_mcp_signature';
+    } catch {
+      // Unknown or malformed bodies retain the generic status-only error.
+    }
+    if (signatureRejected) {
+      throw new Error(`${label} HTTP 401: invalid_internal_mcp_signature`);
+    }
+  }
   if (response.status === 400) {
     const violations = await extractSafeRpcViolations(response);
     if (violations.length > 0) {

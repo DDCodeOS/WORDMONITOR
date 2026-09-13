@@ -16,23 +16,17 @@ describe('mcpErrorFingerprint', () => {
     );
   });
 
-  it('drops a trailing `: <reason>` so HTTP 401 variants coalesce', () => {
-    const plain = mcpErrorFingerprint(
-      'tool-execution',
-      'get_country_brief',
-      new Error('get-country-intel-brief HTTP 401'),
-    );
-    const withReason = mcpErrorFingerprint(
-      'tool-execution',
-      'get_country_brief',
-      new Error('get-country-intel-brief HTTP 401: invalid_internal_mcp_signature'),
-    );
-    assert.deepEqual(plain, withReason);
-    assert.deepEqual(plain, ['mcp-internal-auth-401']);
+  it('does not classify status-only or other 401 reasons as signature failures', () => {
+    for (const suffix of ['', ': insufficient_entitlement', ': invalid_api_key', ': unknown', ': invalid_internal_mcp_signature_extra']) {
+      assert.deepEqual(
+        mcpErrorFingerprint('tool-execution', 't', new Error(`feed-digest HTTP 401${suffix}`)),
+        ['mcp-tool-execution', 't', 'feed-digest:401'],
+      );
+    }
   });
 
   it('separates the same tool by status class (401 auth vs 502 upstream)', () => {
-    const four = mcpErrorFingerprint('tool-execution', 't', new Error('feed-digest HTTP 401'));
+    const four = mcpErrorFingerprint('tool-execution', 't', new Error('feed-digest HTTP 401: invalid_internal_mcp_signature'));
     const five = mcpErrorFingerprint('tool-execution', 't', new Error('feed-digest HTTP 502'));
     assert.notDeepEqual(four, five);
     assert.deepEqual(four, ['mcp-internal-auth-401']);
@@ -40,29 +34,23 @@ describe('mcpErrorFingerprint', () => {
   });
 
   it('separates different tools that hit the same inner endpoint', () => {
-    // Deliberately NOT 401 — that status is the one cross-cutting case, pinned
-    // by the internal-auth test below. Every other status still describes the
-    // endpoint, so per-tool separation must hold.
     const a = mcpErrorFingerprint('tool-execution', 'get_world_brief', new Error('summarize-article HTTP 502'));
     const b = mcpErrorFingerprint('tool-execution', 'get_country_brief', new Error('summarize-article HTTP 502'));
     assert.notDeepEqual(a, b);
   });
 
-  // An internal-MCP 401 is a property of the shared auth hop, not of the tool.
-  // Splitting it per tool turned one bug into a new small issue on every route
-  // it touched (WORLDMONITOR-XZ / WZ / WN / VK, five routes since July), each
-  // looking like noise and each getting resolved. These pin the coalescing.
+  // Only confirmed signature/replay failures share the cross-tool group.
   describe('internal-MCP 401 coalescing', () => {
     it('groups a 401 identically across different tools and endpoints', () => {
       const tenders = mcpErrorFingerprint(
-        'tool-execution', 'get_procurement_opportunities', new Error('list-global-tenders HTTP 401'),
+        'tool-execution', 'get_procurement_opportunities', new Error('list-global-tenders HTTP 401: invalid_internal_mcp_signature'),
       );
       const brief = mcpErrorFingerprint(
         'tool-execution', 'get_country_brief',
         new Error('get-country-intel-brief HTTP 401: invalid_internal_mcp_signature'),
       );
       const risk = mcpErrorFingerprint(
-        'tool-execution', 'get_country_risk', new Error('get-country-risk HTTP 401'),
+        'tool-execution', 'get_country_risk', new Error('get-country-risk HTTP 401: invalid_internal_mcp_signature'),
       );
       assert.deepEqual(tenders, ['mcp-internal-auth-401']);
       assert.deepEqual(brief, tenders);
@@ -71,7 +59,7 @@ describe('mcpErrorFingerprint', () => {
 
     it('carries no tool or endpoint token that could re-fragment the group', () => {
       const fp = mcpErrorFingerprint(
-        'tool-execution', 'get_procurement_opportunities', new Error('list-global-tenders HTTP 401'),
+        'tool-execution', 'get_procurement_opportunities', new Error('list-global-tenders HTTP 401: invalid_internal_mcp_signature'),
       );
       assert.equal(fp.length, 1, `a 401 fingerprint must be a single stable token, got ${fp.join(',')}`);
       assert.ok(
@@ -81,8 +69,8 @@ describe('mcpErrorFingerprint', () => {
     });
 
     it('coalesces a 401 across capture steps too', () => {
-      const exec = mcpErrorFingerprint('tool-execution', 't', new Error('feed-digest HTTP 401'));
-      const post = mcpErrorFingerprint('post-filter', 't', new Error('feed-digest HTTP 401'));
+      const exec = mcpErrorFingerprint('tool-execution', 't', new Error('feed-digest HTTP 401: invalid_internal_mcp_signature'));
+      const post = mcpErrorFingerprint('post-filter', 't', new Error('feed-digest HTTP 401: invalid_internal_mcp_signature'));
       assert.deepEqual(exec, post);
     });
 
