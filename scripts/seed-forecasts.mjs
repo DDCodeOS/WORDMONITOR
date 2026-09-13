@@ -6065,7 +6065,9 @@ function computeSituationSimilarity(currentCluster, priorCluster) {
     overlapCount(currentCluster.actors || [], priorCluster.actors || []) * 2 +
     overlapCount(currentCluster.domains || [], priorCluster.domains || []) * 1.5 +
     overlapCount(currentCluster.branchKinds || [], priorCluster.branchKinds || []) * 1 +
-    overlapCount(currentCluster.forecastIds || [], priorCluster.forecastIds || []) * 0.5
+    // Complete membership is unbounded; eight shared ids (4 points) alone still meet the
+    // continuity threshold but never outweigh a shared region plus actor.
+    Math.min(overlapCount(currentCluster.forecastIds || [], priorCluster.forecastIds || []), 8) * 0.5
   );
 }
 function buildSituationClusters(predictions) {
@@ -19535,6 +19537,7 @@ export {
   getMacroRegion,
   attachSituationContext,
   projectSituationClusters,
+  computeSituationSimilarity,
   refreshPublishedNarratives,
   loadCascadeRules,
   evaluateRuleConditions,

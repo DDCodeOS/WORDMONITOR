@@ -16,6 +16,7 @@ import {
   getMacroRegion,
   attachSituationContext,
   projectSituationClusters,
+  computeSituationSimilarity,
   refreshPublishedNarratives,
   selectPublishedForecastPool,
   deriveStateDrivenForecasts,
@@ -4874,6 +4875,16 @@ describe('forecast replay lifecycle helpers', () => {
     assert.equal(units.length, 1);
     assert.equal(units[0].forecastCount, 31);
     assert.deepEqual(units[0].forecastIds, ids);
+  });
+
+  it('caps shared forecast-id similarity so complete membership cannot outweigh region and actor evidence', () => {
+    const ids = count => Array.from({ length: count }, (_, i) => `fc-cyber-${String(i).padStart(3, '0')}`);
+    const current = { regions: ['United States'], actors: ['National CERT teams'], domains: [], branchKinds: [], forecastIds: ids(31) };
+    const idsOnly = count => ({ regions: [], actors: [], domains: [], branchKinds: [], forecastIds: ids(count) });
+    assert.equal(computeSituationSimilarity(current, idsOnly(8)), 4, 'eight shared ids still clear the continuity threshold alone');
+    assert.equal(computeSituationSimilarity(current, idsOnly(31)), 4, 'ids beyond eight add nothing');
+    const regionAndActor = { regions: ['United States'], actors: ['National CERT teams'], domains: [], branchKinds: [], forecastIds: [] };
+    assert.ok(computeSituationSimilarity(current, regionAndActor) > computeSituationSimilarity(current, idsOnly(31)));
   });
 
   it('carries every forecast through actor and simulation membership to trace context', () => {
