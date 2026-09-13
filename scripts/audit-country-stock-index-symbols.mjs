@@ -3,28 +3,37 @@
  * Audit every symbol declared in `marketCountryStockIndexes` against Yahoo
  * Finance, through the same helper and URL shape the seeder uses (#6240).
  *
- * Reports, per country, how many finite daily closes the 1-month chart carries.
- * `buildCountryStockIndexSnapshot` needs at least two, so anything below that
- * is a country the RPC can only ever answer `available: false`.
+ * Reports, per country, how many finite daily closes the 1-month chart carries
+ * and whether `buildCountryStockIndexSnapshot` — the builder the seeder publishes
+ * through — accepts the chart. A chart it rejects is a country the RPC can only
+ * ever answer `available: false`.
  *
- * Exit status is non-zero when the contract disagrees with Yahoo in either
- * direction:
- *   - a serviceable entry returned fewer than two closes (flag it, or fix the
- *     symbol), or
- *   - an `unavailable` entry now returns usable closes (lift the flag).
+ * Exit status:
+ *   1  the contract disagrees with Yahoo in either direction:
+ *        - a serviceable entry produced no snapshot (flag it, or fix the symbol), or
+ *        - an `unavailable` entry now produces one (lift the flag).
+ *   2  no disagreement, but at least one probe failed (rate limit, timeout,
+ *      proxy error). A failed probe says nothing about the symbol, so it never
+ *      counts toward either verdict above; re-run before changing a flag.
+ *   0  every probe succeeded and matched the contract.
  *
  * Network-bound, so it is not part of `npm run test:data`; run it by hand when
  * adding a country or revisiting a flag:
  *
  *   node scripts/audit-country-stock-index-symbols.mjs
  *
- * Yahoo rate-limits aggressively; the seeder's 150 ms stagger is reused here.
+ * Like the seeder, it loads `.env.local` so `fetchYahooJson` can fall back to the
+ * PROXY_URL curl path when Yahoo rate-limits the direct request.
  */
+import { pathToFileURL } from 'node:url';
+
 import { loadDeclaredCountryStockIndexes } from './_country-stock-index-registry.mjs';
 import { buildCountryStockIndexSnapshot } from './_country-stock-index.mjs';
+import { loadEnvFile } from './_seed-utils.mjs';
 import { fetchYahooJson } from './_yahoo-fetch.mjs';
 
-const YAHOO_DELAY_MS = 150;
+// Same stagger as YAHOO_DELAY_MS in scripts/seed-market-quotes.mjs.
+const YAHOO_DELAY_MS = 200;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export function chartUrl(symbol) {
@@ -40,12 +49,19 @@ export function countFiniteCloses(chart) {
  * Classify one declared entry against its probe result. Pure, so the decision
  * table is unit-testable without touching the network.
  *
- * @returns {'ok' | 'flagged-still-dead' | 'dead-but-serviceable' | 'flag-can-lift'}
+ * @returns {'ok' | 'flagged-still-dead' | 'dead-but-serviceable' | 'flag-can-lift' | 'probe-error'}
  */
-export function classify(index, { closes, error }) {
-  const usable = !error && closes >= 2;
-  if (index.unavailable) return usable ? 'flag-can-lift' : 'flagged-still-dead';
-  return usable ? 'ok' : 'dead-but-serviceable';
+export function classify(index, { snapshot, error }) {
+  if (error) return 'probe-error';
+  if (index.unavailable) return snapshot ? 'flag-can-lift' : 'flagged-still-dead';
+  return snapshot ? 'ok' : 'dead-but-serviceable';
+}
+
+/** @returns {0 | 1 | 2} see the exit status table in the file header. */
+export function exitCodeFor(rows) {
+  if (rows.some((row) => row.verdict === 'dead-but-serviceable' || row.verdict === 'flag-can-lift')) return 1;
+  if (rows.some((row) => row.verdict === 'probe-error')) return 2;
+  return 0;
 }
 
 export async function auditCountryStockIndexes({
@@ -75,25 +91,32 @@ function formatRow(row) {
   return `${row.code.padEnd(3)} ${row.symbol.padEnd(12)} ${detail.padEnd(28)} ${row.verdict.padEnd(22)} ${flag}`;
 }
 
+const codesWith = (rows, verdict) => rows.filter((row) => row.verdict === verdict).map((row) => row.code);
+
 async function main() {
+  loadEnvFile(import.meta.url);
   const rows = await auditCountryStockIndexes();
   for (const row of rows) console.log(formatRow(row));
-  const dead = rows.filter((row) => row.verdict === 'dead-but-serviceable');
-  const liftable = rows.filter((row) => row.verdict === 'flag-can-lift');
   console.log(
-    `\n${rows.length} declared, ${rows.filter((row) => row.verdict === 'ok').length} serving, `
+    `\n${rows.length} declared, ${codesWith(rows, 'ok').length} serving, `
     + `${rows.filter((row) => row.unavailable).length} flagged unavailable.`,
   );
+  const dead = codesWith(rows, 'dead-but-serviceable');
+  const liftable = codesWith(rows, 'flag-can-lift');
+  const inconclusive = codesWith(rows, 'probe-error');
   if (dead.length > 0) {
-    console.error(`\nServiceable entries Yahoo cannot serve — fix the symbol or flag them: ${dead.map((r) => r.code).join(', ')}`);
+    console.error(`\nServiceable entries Yahoo cannot serve — fix the symbol or flag them: ${dead.join(', ')}`);
   }
   if (liftable.length > 0) {
-    console.error(`\nFlagged entries that now return closes — lift the flag: ${liftable.map((r) => r.code).join(', ')}`);
+    console.error(`\nFlagged entries that now return closes — lift the flag: ${liftable.join(', ')}`);
   }
-  process.exitCode = dead.length > 0 || liftable.length > 0 ? 1 : 0;
+  if (inconclusive.length > 0) {
+    console.error(`\nProbes failed, no verdict — re-run before changing any flag: ${inconclusive.join(', ')}`);
+  }
+  process.exitCode = exitCodeFor(rows);
 }
 
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((err) => {
     console.error(err);
     process.exitCode = 1;

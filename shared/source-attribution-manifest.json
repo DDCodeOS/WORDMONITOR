@@ -7438,6 +7438,9 @@
           "path": "scripts/ais-relay.cjs"
         },
         {
+          "path": "scripts/audit-country-stock-index-symbols.mjs"
+        },
+        {
           "path": "scripts/seed-commodity-quotes.mjs"
         },
         {

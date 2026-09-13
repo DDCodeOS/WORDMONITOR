@@ -82,7 +82,7 @@ export async function getCountryStockIndex(
   // return the same `null` it has for months, so answer honestly and cheaply.
   if (index.unavailable) return notAvailable;
 
-  // Railway seeds every country in the enum and writes without the Vercel
+  // Railway seeds every serviceable country in the enum and writes without the Vercel
   // environment prefix. Prefer that raw last-good payload before serving the
   // RPC cache. The fallback cache below intentionally uses a separate key so a
   // failed request cannot replace a seed-owned record with a negative sentinel.

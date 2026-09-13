@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 // #6235: the country-index RPC took its Railway-seeded snapshot only for CN.
-// The input is a bounded 45-country enum, so all 45 are seedable; the other 44
+// The input is a bounded country enum, so the whole enum is seedable; the rest
 // were lazy-fetched from Yahoo at the edge with an in-memory-only fallback,
-// which means a cold isolate had no fallback at all.
+// which means a cold isolate had no fallback at all. #6240 later removed the
+// countries flagged `unavailable` from the seed work-list.
 
 const ORIGINAL_FETCH = globalThis.fetch;
 const ORIGINAL_ENV = {
