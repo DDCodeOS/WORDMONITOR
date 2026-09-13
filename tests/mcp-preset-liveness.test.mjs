@@ -45,6 +45,81 @@ describe('MCP preset catalog and probes', () => {
     }
   });
 
+  // The monitor's pass/fail must not be stricter than what api/mcp-proxy.ts can
+  // actually serve: it follows one method-preserving hop, so a vendor moving
+  // behind a stable front door is drift, not an outage. 301/302/303 stay
+  // failures because they permit a rewrite to GET, which kills the JSON-RPC
+  // handshake (#4938) and which the proxy refuses for the same reason.
+  describe('redirect handling mirrors the proxy', () => {
+    function hops(...responses) {
+      const seen = [];
+      const queue = [...responses];
+      return {
+        seen,
+        fetchImpl: async (url) => {
+          seen.push(String(url));
+          const next = queue.shift();
+          if (!next) throw new Error(`unexpected extra request to ${url}`);
+          return next;
+        },
+      };
+    }
+    const redirect = (status, location) => new Response('', { status, headers: { location } });
+
+    for (const status of [307, 308]) {
+      it(`follows a single ${status} and judges the resolved endpoint`, async () => {
+        const h = hops(redirect(status, 'https://moved.vendor.test/mcp'), new Response('', { status: 200 }));
+        const result = await probePreset(openPreset, { fetchImpl: h.fetchImpl });
+        assert.equal(result.ok, true);
+        assert.equal(result.observed, `HTTP ${status} -> HTTP 200 https://moved.vendor.test/mcp`);
+        assert.deepEqual(h.seen, [openPreset.serverUrl, 'https://moved.vendor.test/mcp']);
+      });
+    }
+
+    it('judges a keyed preset from the resolved status, not the hop', async () => {
+      const h = hops(redirect(308, 'https://moved.vendor.test/mcp'), new Response('', { status: 401 }));
+      const result = await probePreset(keyedPreset, { fetchImpl: h.fetchImpl });
+      assert.equal(result.ok, true, '401 behind a hop is still healthy for a keyed preset');
+      assert.match(result.observed, /HTTP 308 -> HTTP 401/);
+    });
+
+    it('reports a finding when the resolved endpoint is itself broken', async () => {
+      const h = hops(redirect(308, 'https://moved.vendor.test/mcp'), new Response('', { status: 404 }));
+      const result = await probePreset(openPreset, { fetchImpl: h.fetchImpl });
+      assert.equal(result.ok, false);
+      assert.equal(result.observed, 'HTTP 308 -> HTTP 404 https://moved.vendor.test/mcp');
+    });
+
+    for (const status of [301, 302, 303]) {
+      it(`refuses to follow a ${status}, which would rewrite the POST to GET`, async () => {
+        const h = hops(redirect(status, 'https://moved.vendor.test/mcp'));
+        const result = await probePreset(openPreset, { fetchImpl: h.fetchImpl });
+        assert.equal(result.ok, false);
+        assert.equal(result.observed, `HTTP ${status}`);
+        assert.deepEqual(h.seen, [openPreset.serverUrl], 'the redirect target must never be dispatched');
+      });
+    }
+
+    it('refuses a second hop rather than chasing a chain', async () => {
+      const h = hops(
+        redirect(308, 'https://one.vendor.test/mcp'),
+        redirect(308, 'https://two.vendor.test/mcp'),
+      );
+      const result = await probePreset(openPreset, { fetchImpl: h.fetchImpl });
+      assert.equal(result.ok, false);
+      assert.match(result.observed, /HTTP 308 -> HTTP 308 https:\/\/one\.vendor\.test/);
+      assert.ok(!h.seen.includes('https://two.vendor.test/mcp'), 'the second hop must never be dispatched');
+    });
+
+    it('refuses an http:// Location instead of downgrading the probe', async () => {
+      const h = hops(redirect(308, 'http://moved.vendor.test/mcp'));
+      const result = await probePreset(openPreset, { fetchImpl: h.fetchImpl });
+      assert.equal(result.ok, false);
+      assert.equal(result.observed, 'HTTP 308');
+      assert.deepEqual(h.seen, [openPreset.serverUrl]);
+    });
+  });
+
   it('names DNS failures instead of rejecting before the finding is recorded', async () => {
     const result = await probePreset(openPreset, { fetchImpl: async () => {
       throw new TypeError('fetch failed', { cause: Object.assign(new Error('getaddrinfo failed'), { code: 'ENOTFOUND' }) });
@@ -64,7 +139,11 @@ describe('MCP preset catalog and probes', () => {
     }
   });
 
-  it('does not follow a real redirect, releases streaming bodies, and bounds a stalled request', { timeout: 2_000 }, async (t) => {
+  // The redirect leg here is the http:// downgrade refusal, not a blanket
+  // no-follow rule: the server is plain http, so the Location resolves to an
+  // http target and the scheme guard rejects it. The follow path itself is
+  // covered against https targets in 'redirect handling mirrors the proxy'.
+  it('refuses an http redirect target, releases streaming bodies, and bounds a stalled request', { timeout: 2_000 }, async (t) => {
     const requests = [];
     const streamClosed = Promise.withResolvers();
     const server = createServer((req, res) => {

@@ -33,27 +33,72 @@ export function isTemplatePreset(preset) {
   return ['example.com', 'example.net', 'example.org'].some(domain => host === domain || host.endsWith(`.${domain}`));
 }
 
+// The monitor's verdict must not be STRICTER than what the proxy can actually
+// serve, or it reports an outage for traffic that works. api/mcp-proxy.ts
+// follows exactly one method-preserving hop, https-only, so this mirrors that
+// boundary rather than inventing its own.
+//
+// 301/302/303 stay failures on purpose: they permit a client to rewrite the
+// request to GET, which turns the JSON-RPC handshake into a bodyless GET —
+// the #4938 fingerprint. The proxy refuses them, so the monitor must too.
+//
+// Keeping `redirect: 'manual'` is what makes the hop visible at all: the hop is
+// still recorded in `observed`, so a vendor re-plumbing behind a stable front
+// door shows up as drift a human can read, not as silence.
+const METHOD_PRESERVING_REDIRECTS = new Set([307, 308]);
+const MAX_REDIRECT_HOPS = 1;
+
+function redirectTargetFor(response, fromUrl) {
+  const location = response.headers?.get?.('location');
+  if (!location) return null;
+  let next;
+  try {
+    next = new URL(location, fromUrl);
+  } catch {
+    return null;
+  }
+  // assertServerUrlSafe's scheme rule, mirrored: never downgrade to plaintext.
+  return next.protocol === 'https:' ? next : null;
+}
+
 export async function probePreset(preset, { fetchImpl = (...args) => globalThis.fetch(...args), timeoutMs = 15_000 } = {}) {
   const result = { name: preset.name, serverUrl: preset.serverUrl, ok: false };
   const controller = new AbortController();
+  // One deadline covers both hops, so a redirecting vendor cannot quietly take
+  // twice the budget every other preset gets.
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetchImpl(preset.serverUrl, {
-      method: 'POST',
-      redirect: 'manual',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json, text/event-stream',
-        'User-Agent': 'WorldMonitor-MCP-Proxy/1.0',
-      },
-      body: JSON.stringify({
-        jsonrpc: '2.0', id: 1, method: 'initialize',
-        params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'worldmonitor', version: '1.0' } },
-      }),
-      signal: controller.signal,
-    });
-    result.observed = `HTTP ${response.status}`;
-    result.ok = response.status === 200 || (Boolean(preset.authNote) && [401, 403].includes(response.status));
+    let target = preset.serverUrl;
+    let trail = '';
+    for (let hop = 0; ; hop++) {
+      const response = await fetchImpl(target, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+          'User-Agent': 'WorldMonitor-MCP-Proxy/1.0',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0', id: 1, method: 'initialize',
+          params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'worldmonitor', version: '1.0' } },
+        }),
+        signal: controller.signal,
+      });
+      const next = hop < MAX_REDIRECT_HOPS && METHOD_PRESERVING_REDIRECTS.has(response.status)
+        ? redirectTargetFor(response, target)
+        : null;
+      if (next) {
+        // Record the hop even when it resolves cleanly — a working redirect is
+        // still drift worth seeing.
+        trail += `HTTP ${response.status} -> `;
+        target = next.toString();
+        continue;
+      }
+      result.observed = trail ? `${trail}HTTP ${response.status} ${target}` : `HTTP ${response.status}`;
+      result.ok = response.status === 200 || (Boolean(preset.authNote) && [401, 403].includes(response.status));
+      break;
+    }
   } catch (error) {
     result.ok = false;
     result.observed = controller.signal.aborted
