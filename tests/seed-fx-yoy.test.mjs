@@ -1,7 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { computeYoy } from '../scripts/seed-fx-yoy.mjs';
+import { readFileSync } from 'node:fs';
+
+import { PER_CURRENCY_DELAY_MS, computeYoy } from '../scripts/seed-fx-yoy.mjs';
+
+const seedSource = readFileSync(new URL('../scripts/seed-fx-yoy.mjs', import.meta.url), 'utf8');
 
 // Build a synthetic monthly series with sequential timestamps. The bar values
 // represent the USD price of 1 unit of the foreign currency (e.g. ARSUSD=X)
@@ -56,5 +60,22 @@ describe('computeYoy — peak-to-trough drawdown', () => {
     // Latest = 100 - 24*2 = 52, yearAgo = 100 - 12*2 = 76
     // yoyChange = (52 - 76) / 76 * 100 = -31.578...
     assert.equal(r.yoyChange, -31.6);
+  });
+});
+
+describe('Yahoo request path', () => {
+  it('honours the 150 ms Yahoo stagger from AGENTS.md', () => {
+    // Ran at 120 ms until 2026-09: below the repo-wide floor every other Yahoo
+    // seeder keeps, on the one seeder that sweeps ~60 symbols back to back.
+    assert.ok(PER_CURRENCY_DELAY_MS >= 150, `stagger is ${PER_CURRENCY_DELAY_MS} ms`);
+  });
+
+  it('fetches Yahoo through the shared helper, never a bare fetch', () => {
+    // fetchYahooJson carries the retry/backoff and the curl proxy fallback;
+    // a bare fetch turned every 429 into a dropped currency for the run.
+    assert.match(seedSource, /import \{ fetchYahooJson \} from '\.\/_yahoo-fetch\.mjs'/);
+    assert.match(seedSource, /await fetchYahooJson\(url, \{ label: /);
+    assert.doesNotMatch(seedSource, /await fetch\(url/, 'no bare fetch to Yahoo may remain');
+    assert.doesNotMatch(seedSource, /\bCHROME_UA\b/, 'the helper owns the User-Agent now');
   });
 });
