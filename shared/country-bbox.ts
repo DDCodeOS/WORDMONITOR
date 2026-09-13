@@ -11,10 +11,10 @@ function usableBox(box: CountryBox): boolean {
   return Object.values(box).every(Number.isFinite)
     && box.south >= -90 && box.north <= 90 && box.south <= box.north
     && box.west >= -180 && box.west <= 180 && box.east >= -180 && box.east <= 180
-    && box.east - box.west < 360;
+    && (box.east - box.west < 360 || box.south === -90 || box.north === 90);
 }
 
-/** Full-longitude extents cannot safely scope country observation queries. */
+/** Polar full-longitude extents are valid for local containment. */
 export function countryBox(code: string): CountryBox | null {
   const bbox = COUNTRY_BBOXES[code.toUpperCase()];
   if (!bbox) return null;
@@ -33,7 +33,7 @@ export function inBox(box: CountryBox | null, lat: number | undefined, lon: numb
 
 /** Flight handlers expect ordinary intervals and can widen or invert wrapped ones. */
 export function splitCountryBox(box: CountryBox): CountryBox[] {
-  if (!usableBox(box)) return [];
+  if (!usableBox(box) || box.east - box.west >= 360) return [];
   return box.west > box.east
     ? [{ ...box, east: 180 }, { ...box, west: -180 }]
     : [box];

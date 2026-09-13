@@ -41,6 +41,7 @@ test('every represented Russian vertex fits the wrapped bounds, including both d
     { south: 41.21, west: -180, north: 81.29, east: -169.7 },
   ]);
   assert.deepEqual(splitCountryBox({ south: 41, west: -180, north: 82, east: 180 }), []);
+  assert.deepEqual(splitCountryBox(countryBox('AQ')!), [], 'polar containment must not enable globe-spanning flight queries');
 });
 
 test('the source has bounded FJ/NZ/US extents and no Kiribati geometry to invent', () => {

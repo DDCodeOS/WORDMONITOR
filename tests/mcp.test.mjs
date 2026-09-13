@@ -3005,10 +3005,10 @@ describe('api/mcp.ts — PRO MCP Server', () => {
       if (u.includes('/api/aviation/v1/track-aircraft')) {
         return new Response(JSON.stringify({
           positions: [
-            { callsign: 'UAE123', icao24: 'abc123', lat: 24.5, lon: 54.3, altitude_m: 11000, ground_speed_kts: 480, track_deg: 270, on_ground: false },
+            { callsign: 'UAE123', icao24: 'abc123', lat: 24.5, lon: 54.3, altitudeM: 11000, groundSpeedKts: 480, trackDeg: 270, onGround: false },
           ],
           source: 'wingbits',
-          updated_at: 1711620000000,
+          updatedAt: 1711620000000,
         }), { status: 200, headers: { 'Content-Type': 'application/json' } });
       }
       if (u.includes('/api/military/v1/list-military-flights')) {
@@ -3033,6 +3033,26 @@ describe('api/mcp.ts — PRO MCP Server', () => {
     assert.ok(data.bounding_box?.sw_lat !== undefined, 'bounding_box must be present');
     assert.equal(data.partial, undefined, 'no partial flag when both sources succeed');
     assert.equal(data.source, 'wingbits');
+    assert.deepEqual(data.civilian_flights, [{
+      callsign: 'UAE123', icao24: 'abc123', lat: 24.5, lon: 54.3,
+      altitude_m: 11000, speed_kts: 480, heading_deg: 270, on_ground: false,
+    }]);
+    assert.equal(data.updated_at, new Date(1711620000000).toISOString());
+  });
+
+  it('get_airspace retains multiple camelCase military records and their fields for an ordinary country', async () => {
+    globalThis.fetch = async () => Response.json({ flights: [
+      { callsign: 'FIRST', hexCode: 'abc123', aircraftType: 'MILITARY_AIRCRAFT_TYPE_TRANSPORT', aircraftModel: 'C-17', operatorCountry: 'US', isInteresting: true, source: 'wingbits' },
+      { callsign: 'SECOND', hexCode: 'def456', aircraftType: 'MILITARY_AIRCRAFT_TYPE_TANKER', aircraftModel: 'KC-135', operatorCountry: 'GB', isInteresting: false, source: 'wingbits' },
+    ] });
+    const res = await handler(makeReq('POST', callBody('get_airspace', { country_code: 'AE', type: 'military' })));
+    const body = await res.json();
+    const data = JSON.parse(body.result.content[0].text);
+    assert.equal(data.military_count, 2);
+    assert.deepEqual(data.military_flights.map(f => [f.hex_code, f.aircraft_type, f.aircraft_model, f.operator_country, f.is_interesting]), [
+      ['abc123', 'MILITARY_AIRCRAFT_TYPE_TRANSPORT', 'C-17', 'US', true],
+      ['def456', 'MILITARY_AIRCRAFT_TYPE_TANKER', 'KC-135', 'GB', false],
+    ]);
   });
 
   it('get_airspace excludes OpenSky observations even if a downstream response regresses', async () => {
@@ -3041,7 +3061,7 @@ describe('api/mcp.ts — PRO MCP Server', () => {
       if (u.includes('/api/aviation/v1/track-aircraft')) {
         return new Response(JSON.stringify({
           positions: [
-            { callsign: 'OSKY1', icao24: 'abc123', lat: 24.5, lon: 54.3, altitude_m: 11000, ground_speed_kts: 480, track_deg: 270, on_ground: false },
+            { callsign: 'OSKY1', icao24: 'abc123', lat: 24.5, lon: 54.3, altitudeM: 11000, groundSpeedKts: 480, trackDeg: 270, onGround: false },
           ],
           source: 'opensky',
         }), { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -3049,8 +3069,8 @@ describe('api/mcp.ts — PRO MCP Server', () => {
       if (u.includes('/api/military/v1/list-military-flights')) {
         return new Response(JSON.stringify({
           flights: [
-            { callsign: 'OSKY2', hex_code: 'def456', source: 'opensky-auth' },
-            { callsign: 'WING1', hex_code: 'fed654', source: 'wingbits' },
+            { callsign: 'OSKY2', hexCode: 'def456', source: 'opensky-auth' },
+            { callsign: 'WING1', hexCode: 'fed654', source: 'wingbits' },
           ],
         }), { status: 200, headers: { 'Content-Type': 'application/json' } });
       }
@@ -3086,8 +3106,8 @@ describe('api/mcp.ts — PRO MCP Server', () => {
       assert.ok(west <= east && east - west < 360);
       const positions = points.filter(p => p.lon >= west && p.lon <= east);
       return Response.json(parsed.pathname.includes('/military/')
-        ? { flights: positions.map(p => ({ callsign: p.callsign, hex_code: p.icao24, source: 'wingbits', location: { latitude: p.lat, longitude: p.lon } })) }
-        : { positions, source: 'wingbits', updated_at: 1711620000000 });
+        ? { flights: positions.map(p => ({ callsign: p.callsign, hexCode: p.icao24, source: 'wingbits', location: { latitude: p.lat, longitude: p.lon } })) }
+        : { positions, source: 'wingbits', updatedAt: 1711620000000 });
     };
     const res = await handler(makeReq('POST', callBody('get_airspace', { country_code: 'RU' })));
     const body = await res.json();
@@ -3116,7 +3136,7 @@ describe('api/mcp.ts — PRO MCP Server', () => {
       const parsed = new URL(url);
       if (!parsed.pathname.includes('/military/')) return Response.json({ positions: [], source: 'wingbits' });
       if (Number(parsed.searchParams.get('sw_lon')) < 0) return new Response('unavailable', { status: 503 });
-      return Response.json({ flights: [{ callsign: 'MOSCOW', hex_code: 'a', source: 'wingbits' }] });
+      return Response.json({ flights: [{ callsign: 'MOSCOW', hexCode: 'a', source: 'wingbits' }] });
     };
     const res = await handler(makeReq('POST', callBody('get_airspace', { country_code: 'RU' })));
     const body = await res.json();

@@ -28,7 +28,7 @@ GetCountryCoverage is a Pro RPC and Russia is in its Tier-1 country set. The cod
 | NZ | `[-46.68, 166.49, -35.01, 178.29]` | No collapse in this simplified source; outlying territory coverage remains limited by the geometry |
 | US | `[19.03, -168.08, 71.31, -66.98]` | No collapse in this simplified source; outlying territory coverage remains limited by the geometry |
 | KI | No box; GeoJSON feature has null geometry | Missing geometry, not a collapsed box; no bounds invented |
-| AQ | `[-90, -180, -64.38, 180]` | Valid polar extent, retained in generated data and maritime filtering; country flight queries explicitly unavailable |
+| AQ | `[-90, -180, -64.38, 180]` | Valid polar extent, retained in generated data, local event containment, and maritime filtering; country flight queries explicitly unavailable |
 
 Russia and Antarctica were the only generated extents wider than 180 degrees. The public hazard/airspace selectors already cap longitude spans at 60 degrees, so Russia stays excluded from those tools. CII scoring and its military seeder use a separate handwritten Russia extent, `19.6..180`; they do not consume the collapsed table. Their omission of negative-longitude Russian territory is a separate approximation and is unchanged here.
 
@@ -36,7 +36,11 @@ Bounding boxes remain coarser than polygons. The corrected Russia box still over
 
 ## Verification
 
-- 327 tests passed: generator/copy parity, country coverage, climate worker, military bounds, MCP behavior, and country-code resolution.
+PR #8104 review identified two regressions in the first patch. Military responses use generated camelCase fields; fixtures had repeated the incorrect snake_case assumption, hiding loss of all but one aircraft during deduplication. The repair imports generated response types, uses `hexCode`, and checks full civilian and military field projection. The polar guard also needed to preserve Antarctica for local event containment while rejecting its full-span flight query. Both review cases failed before correction and passed afterward.
+
+CI's `unit-shard (3)` failed two MCP weight assertions. Its source matcher counted one fetch statement inside a URL loop, while Russia can issue four requests. Airspace now declares a fixed maximum weight of 5 (one MCP request plus up to four downstream requests), measured with mocked HTTP requests for all 167 countries and both single-source modes. This raises API-plan airspace usage from 3 to 5 units per call; dedicated Pro MCP usage remains one unit per call. The published English and Chinese weight tables are updated. Other tools retain their source-based fan-out checks.
+
+- 345 tests passed after PR feedback: generator/copy parity, country coverage, climate worker, military bounds, MCP behavior, country-code resolution, and tool weights.
 - 144 crawlable-corpus tests passed, including rendered Russia Dataset metadata with two ordinary longitude boxes.
 - 489 API/sidecar tests passed. The first run was blocked by sandbox `listen EPERM`; the same suite passed with local listener access.
 - `npm run typecheck:api`, `npm run typecheck`, and `npm run lint:boundaries` passed.

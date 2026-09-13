@@ -381,8 +381,9 @@ async function collectMilitaryFlights(
 ): Promise<StructuredSourceResult> {
   const source = 'structured:military-flights';
   const deps = req.deps ?? defaultStructuredDependencies;
-  if (!box) {
-    return unavailable(source, `No bounding box for ${req.code}; military flights are matched geographically only.`);
+  const queryBoxes = box ? splitCountryBox(box) : [];
+  if (!queryBoxes.length) {
+    return unavailable(source, `No usable flight bounding box for ${req.code}; military flights are matched geographically only.`);
   }
   try {
     // The server bounds every flights response to a page, and the browser
@@ -390,7 +391,7 @@ async function collectMilitaryFlights(
     // fetchViaProto). Reading only page one would drop military-lane incidents
     // for exactly the busy countries where the lane matters most.
     const flights = new Map<string, MilitaryFlight>();
-    for (const bounds of splitCountryBox(box)) {
+    for (const bounds of queryBoxes) {
       let cursor = '';
       for (let page = 0; page < MAX_FLIGHT_PAGES; page++) {
         const response = await deps.listMilitaryFlights(req.ctx, {

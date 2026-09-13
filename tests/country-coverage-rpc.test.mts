@@ -536,7 +536,8 @@ describe('GetCountryCoverage — geographic containment', () => {
   it('rejects collapsed country boxes and invalid geographic coordinates', () => {
     assert.equal(inBox({ south: 41.21, west: -180, north: 81.29, east: 180 }, 52.52, 13.4), false);
     assert.equal(inBox({ south: 60, west: 170, north: 70, east: -170 }, 65, 540), false);
-    assert.equal(countryBox('AQ'), null, 'polar full-longitude coverage is not a usable country flight query');
+    assert.equal(inBox(countryBox('AQ'), -75, 0), true, 'full-longitude polar containment remains valid');
+    assert.equal(inBox(countryBox('AQ'), -75, 175), true);
   });
 
   it('reads the shared bounding box as [south, west, north, east]', () => {
@@ -695,10 +696,17 @@ describe('collectStructuredIncidents — producer status', () => {
     let calls = 0;
     const aq = await collectStructuredIncidents({
       ctx, code: 'AQ', countryName: 'Antarctica', cutoffMs: NOW_MS - DAY, now: NOW_MS,
-      deps: structuredDeps({ listMilitaryFlights: async () => { calls++; throw new Error('must not call'); } }),
+      deps: structuredDeps({
+        listMilitaryFlights: async () => { calls++; throw new Error('must not call'); },
+        listEarthquakes: async () => ({ earthquakes: [{
+          id: 'polar-quake', place: 'Southern Ocean', magnitude: 5, occurredAt: NOW_MS - HOUR,
+          location: { latitude: -75, longitude: 175 },
+        }] }),
+      } as Partial<StructuredDependencies>),
     });
     assert.equal(calls, 0);
     assert.equal(find(aq, 'structured:military-flights').state, 'unavailable');
+    assert.equal(find(aq, 'structured:earthquakes').incidents.length, 1);
   });
 
   it('always reports all six producers, in a stable order', async () => {
