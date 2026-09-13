@@ -420,6 +420,9 @@ export const FULL_FEEDS: Record<string, Feed[]> = {
     { name: 'UNHCR', url: rss('https://news.google.com/rss/search?q=site:unhcr.org+OR+UNHCR+refugees+when:3d&hl=en-US&gl=US&ceid=US:en') },
   ],
   africa: [
+    // Regional desks widen country grounding beyond the world-news feeds (#7748).
+    { name: 'Guardian Africa', url: rss('https://www.theguardian.com/world/africa/rss') },
+    { name: 'France 24 Africa', url: rss('https://www.france24.com/en/africa/rss') },
     { name: 'Africa News', url: rss('https://news.google.com/rss/search?q=(Africa+OR+Nigeria+OR+Kenya+OR+"South+Africa"+OR+Ethiopia)+when:2d&hl=en-US&gl=US&ceid=US:en') },
     { name: 'Sahel Crisis', url: rss('https://news.google.com/rss/search?q=(Sahel+OR+Mali+OR+Niger+OR+"Burkina+Faso"+OR+Wagner)+when:3d&hl=en-US&gl=US&ceid=US:en') },
     { name: 'News24', url: rss('https://feeds.news24.com/articles/news24/TopStories/rss') },
@@ -460,6 +463,7 @@ export const FULL_FEEDS: Record<string, Feed[]> = {
     { name: 'Radio Ndeke Luka', url: rss('https://www.radiondekeluka.org/feed/'), lang: 'fr' },
   ],
   latam: [
+    { name: 'Guardian Caribbean', url: rss('https://www.theguardian.com/world/caribbean/rss') },
     { name: 'Latin America', url: rss('https://news.google.com/rss/search?q=(Brazil+OR+Mexico+OR+Argentina+OR+Venezuela+OR+Colombia+OR+Haiti)+when:2d&hl=en-US&gl=US&ceid=US:en') },
     { name: 'BBC Latin America', url: rss('https://feeds.bbci.co.uk/news/world/latin_america/rss.xml') },
     { name: 'Reuters LatAm', url: rss('https://news.google.com/rss/search?q=site:reuters.com+(Brazil+OR+Mexico+OR+Argentina)+when:3d&hl=en-US&gl=US&ceid=US:en') },
@@ -525,6 +529,8 @@ export const FULL_FEEDS: Record<string, Feed[]> = {
     { name: 'ABC News Australia', url: rss('https://www.abc.net.au/news/feed/2942460/rss.xml') },
     { name: 'Guardian Australia', url: rss('https://www.theguardian.com/australia-news/rss') },
     // Pacific Islands
+    { name: 'Guardian Pacific', url: rss('https://www.theguardian.com/world/pacific-islands/rss') },
+    { name: 'France 24 Asia Pacific', url: rss('https://www.france24.com/en/asia-pacific/rss') },
     { name: 'Island Times (Palau)', url: rss('https://islandtimes.org/feed/') },
     // Central Asia (#5953) — Russia rear area, China BRI, sanctions leakage
     { name: 'Eurasianet', url: rss('https://eurasianet.org/rss') },
