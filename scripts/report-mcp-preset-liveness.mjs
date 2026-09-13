@@ -15,7 +15,7 @@ function ghJson(args, payload) {
 }
 
 function cell(value) {
-  return String(value).replace(/[\r\n]+/g, ' ').replace(/\|/g, '\\|').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(value).replace(/[\r\n]+/g, ' ').replace(/[\\|]/g, '\\$&').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 export function publishFindings(report, {

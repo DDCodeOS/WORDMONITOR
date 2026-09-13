@@ -54,8 +54,6 @@ export async function probePreset(preset, { fetchImpl = (...args) => globalThis.
     });
     result.observed = `HTTP ${response.status}`;
     result.ok = response.status === 200 || (Boolean(preset.authNote) && [401, 403].includes(response.status));
-    // SSE connections can stay open indefinitely; liveness needs only headers.
-    await response.body?.cancel();
   } catch (error) {
     result.ok = false;
     result.observed = controller.signal.aborted
@@ -63,6 +61,8 @@ export async function probePreset(preset, { fetchImpl = (...args) => globalThis.
       : `Request failed: ${error.cause?.code || error.code || error.name}: ${error.message}`;
   } finally {
     clearTimeout(timer);
+    // Liveness needs only headers; release SSE connections without changing the verdict.
+    controller.abort();
   }
   return result;
 }

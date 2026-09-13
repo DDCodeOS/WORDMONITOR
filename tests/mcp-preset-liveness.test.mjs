@@ -55,6 +55,15 @@ describe('MCP preset catalog and probes', () => {
     assert.equal(result.serverUrl, openPreset.serverUrl);
   });
 
+  it('preserves the HTTP result when response-body cleanup rejects', async () => {
+    for (const status of [200, 401, 403, 308]) {
+      const response = new Response(new ReadableStream({ cancel() { throw new Error('stream already aborted'); } }), { status });
+      const result = await probePreset(keyedPreset, { fetchImpl: async () => response });
+      assert.equal(result.observed, `HTTP ${status}`);
+      assert.equal(result.ok, status !== 308);
+    }
+  });
+
   it('does not follow a real redirect, releases streaming bodies, and bounds a stalled request', { timeout: 2_000 }, async (t) => {
     const requests = [];
     const streamClosed = Promise.withResolvers();
@@ -90,6 +99,14 @@ const failure = { ...openPreset, ok: false, observed: 'HTTP 308' };
 const report = { checkedAt: '2026-09-13T00:00:00Z', expectedCount: 1, results: [failure] };
 
 describe('MCP preset incident reporting', () => {
+  it('escapes existing backslashes before table delimiters', () => {
+    let payload;
+    publishFindings({ ...report, results: [{ ...failure, name: 'Vendor\\|extra' }] }, {
+      repository: 'owner/repo', gh: (_args, body) => { payload = body; return []; },
+    });
+    assert.ok(payload.body.includes('Vendor' + '\\'.repeat(3) + '|extra'));
+  });
+
   it('publishes through the CLI when paginated issue bodies exceed the default subprocess buffer', (t) => {
     const dir = mkdtempSync(join(tmpdir(), 'mcp-preset-gh-'));
     t.after(() => rmSync(dir, { recursive: true, force: true }));
