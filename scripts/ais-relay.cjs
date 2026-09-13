@@ -13748,7 +13748,9 @@ async function handleWidgetAgentRequest(req, res) {
         model,
         max_tokens: maxTokens,
         system: systemPrompt,
-        tools: finalizing ? [] : [WIDGET_FETCH_TOOL, WIDGET_SEARCH_TOOL],
+        // Keep schemas for tool blocks in history while prohibiting new calls.
+        tools: [WIDGET_FETCH_TOOL, WIDGET_SEARCH_TOOL],
+        tool_choice: { type: finalizing ? 'none' : 'auto' },
         messages: turnMessages,
       });
       if (cancelled) break;

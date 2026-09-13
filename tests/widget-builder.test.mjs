@@ -58,7 +58,6 @@ async function runWidgetAgent(responses, { tier = 'basic', failFetch = false, fa
     PRO_WIDGET_KEY: 'test', WIDGET_ANTHROPIC_KEY: 'test',
     WIDGET_PRO_MAX_HTML: 100000, WIDGET_MAX_HTML: 50000,
     WIDGET_PRO_SYSTEM_PROMPT: 'test', WIDGET_SYSTEM_PROMPT: 'test',
-    WIDGET_FETCH_TOOL: { name: 'fetch_worldmonitor_data' }, WIDGET_SEARCH_TOOL: { name: 'search_web' },
     isWidgetEndpointAllowed: endpoint => endpoint === '/api/test',
     performWidgetWebSearch: async query => {
       effects.push(`search:${query}`);
@@ -73,11 +72,24 @@ async function runWidgetAgent(responses, { tier = 'basic', failFetch = false, fa
     },
     importAnthropic: async () => ({ default: sdkTransport ? class extends Anthropic {
       constructor(options) {
-        super({ ...options, maxRetries: 0, fetch: async (_url, init) => new Response(JSON.stringify({
-          id: 'msg_fixture', type: 'message', role: 'assistant', model: 'fixture',
-          usage: { input_tokens: 1, output_tokens: 1 }, stop_sequence: null,
-          ...nextResponse(JSON.parse(init.body)),
-        }), { headers: { 'Content-Type': 'application/json' } }) });
+        super({ ...options, maxRetries: 0, fetch: async (_url, init) => {
+          const request = JSON.parse(init.body);
+          // The SDK serializes requests but does not enforce provider validation.
+          // A tool exchange in history must retain its tool definitions.
+          const hasToolHistory = request.messages.some(m => Array.isArray(m.content)
+            && m.content.some(b => b.type === 'tool_use' || b.type === 'tool_result'));
+          if (hasToolHistory && !request.tools?.length) {
+            requests.push(request);
+            return new Response(JSON.stringify({ type: 'error', error: {
+              type: 'invalid_request_error', message: 'Tools must be defined when including tool_use or tool_result blocks.',
+            } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+          }
+          return new Response(JSON.stringify({
+            id: 'msg_fixture', type: 'message', role: 'assistant', model: 'fixture',
+            usage: { input_tokens: 1, output_tokens: 1 }, stop_sequence: null,
+            ...nextResponse(request),
+          }), { headers: { 'Content-Type': 'application/json' } });
+        } });
       }
     } : class {
       messages = { create: async request => {
@@ -87,8 +99,13 @@ async function runWidgetAgent(responses, { tier = 'basic', failFetch = false, fa
   };
   // Include production constants when present, so tests also run against the old loop.
   const limit = relay.match(/const WIDGET_MAX_TOOL_CALLS = \d+;/)?.[0] ?? '';
+  const toolDefinitions = ['WIDGET_FETCH_TOOL', 'WIDGET_SEARCH_TOOL'].map(name => {
+    const match = relay.match(new RegExp(`const ${name} = \\{[^]*?\\n\\};`));
+    assert.ok(match, `Missing ${name}`);
+    return match[0];
+  }).join('\n');
   const handler = extract('handleWidgetAgentRequest').replace("import('@anthropic-ai/sdk')", 'importAnthropic()');
-  const run = vm.runInNewContext(`${limit}\n${extract('sendWidgetSSE')}\n${extract('sanitizeToolContent')}\n${extract('classifyWidgetAgentError')}\n${handler}\nhandleWidgetAgentRequest`, context);
+  const run = vm.runInNewContext(`${limit}\n${toolDefinitions}\n${extract('sendWidgetSSE')}\n${extract('sanitizeToolContent')}\n${extract('classifyWidgetAgentError')}\n${handler}\nhandleWidgetAgentRequest`, context);
   const res = {
     writableEnded: false, writeHead() {},
     write(frame) { frames.push(frame); },
@@ -125,7 +142,7 @@ describe('widget-agent relay — runtime tool budget and finalization', () => {
     assert.deepEqual(results.map(r => r.tool_use_id), ['1', '2', '3', '4']);
     assert.equal(results[3].is_error, true);
     assert.match(results[3].content, /budget.*exhausted/i);
-    assert.equal(result.requests[1].tools.length, 0);
+    assert.equal(result.requests[1].tool_choice.type, 'none');
     assertWidgetSuccess(result);
   });
 
@@ -170,14 +187,14 @@ describe('widget-agent relay — runtime tool budget and finalization', () => {
         ...Array.from({ length: maxTurns - 2 }, () => widgetResponse('pause_turn')),
         widgetResponse('max_tokens', partial), widgetResponse('end_turn'),
       ], { tier });
-      assert.deepEqual(result.requests.slice(-2).map(r => r.tools.length), [0, 0]);
+      assert.deepEqual(result.requests.slice(-2).map(r => r.tool_choice.type), ['none', 'none']);
       assert.ok(result.requests.at(-1).messages.some(m => m.role === 'assistant' && Array.isArray(m.content) && m.content[0]?.text === partial[0].text));
       assertWidgetSuccess(result);
     });
     it(`${tier}: pause_turn stays bounded and exhaustion cannot recover old history as success`, async () => {
       const result = await runWidgetAgent(Array.from({ length: maxTurns }, () => widgetResponse('pause_turn')), { tier });
       assert.equal(result.requests.length, maxTurns);
-      assert.ok(result.requests.slice(1).every(r => r.tools.length === 0));
+      assert.ok(result.requests.slice(1).every(r => r.tool_choice.type === 'none'));
       assertWidgetError(result, /exhausted/i);
     });
   }
@@ -187,7 +204,7 @@ describe('widget-agent relay — runtime tool budget and finalization', () => {
       widgetResponse('pause_turn'), widgetResponse('tool_use', [widgetTool('1')]), widgetResponse('end_turn'),
     ]);
     assert.equal(result.effects.length, 0);
-    assert.ok(result.requests.slice(1).every(r => r.tools.length === 0));
+    assert.ok(result.requests.slice(1).every(r => r.tool_choice.type === 'none'));
     assert.equal(toolResultsFor(result.requests[2])[0].is_error, true);
     assertWidgetSuccess(result);
   });
@@ -260,11 +277,13 @@ describe('widget-agent relay — runtime tool budget and finalization', () => {
     const result = await runWidgetAgent([
       widgetResponse('tool_use', [1, 2, 3, 4].map(n => widgetTool(String(n)))), widgetResponse('end_turn'),
     ], { sdkTransport: true });
+    assertWidgetSuccess(result);
     assert.equal(result.effects.length, 3);
-    assert.equal(result.requests[1].tools.length, 0);
+    assert.equal(result.requests[1].tool_choice?.type, 'none');
+    assert.deepEqual(result.requests[1].tools, result.requests[0].tools);
+    assert.ok(result.requests[1].tools.every(tool => tool.input_schema?.type === 'object'));
     assert.equal(toolResultsFor(result.requests[1]).length, 4);
     assert.equal(toolResultsFor(result.requests[1])[3].is_error, true);
-    assertWidgetSuccess(result);
   });
 
   for (const reason of ['refusal', 'stop_sequence', null, 'unexpected']) {
