@@ -367,16 +367,25 @@ describe('api/mcp-proxy', () => {
     const OLD = 'https://mcp.old.example.com';
     const NEW = 'https://mcp.new.example.com';
 
+    // Route the stub on the PARSED origin, never a string prefix:
+    // `startsWith('https://mcp.old.example.com')` also matches
+    // `https://mcp.old.example.com.attacker.test`, so a prefix check here would
+    // model the upstream less precisely than the code under test — which
+    // compares `url.origin`. Same reason CodeQL objects to it.
+    const originOf = (u) => { try { return new URL(String(u)).origin; } catch { return ''; } };
+    const hostOf = (u) => { try { return new URL(String(u)).host; } catch { return ''; } };
+    const protocolOf = (u) => { try { return new URL(String(u)).protocol; } catch { return ''; } };
+
     // Host OLD permanently redirects to host NEW; NEW speaks MCP. `status` and
     // `location` let a case reshape the redirect it emits.
     function redirectingServer({ status = 308, location = `${NEW}/mcp`, target = NEW } = {}) {
       const seen = { urls: [], headersAtTarget: null };
       globalThis.fetch = async (url, opts) => {
         seen.urls.push(String(url));
-        if (String(url).startsWith(OLD)) {
+        if (originOf(url) === OLD) {
           return new Response(null, { status, headers: location ? { location } : {} });
         }
-        if (String(url).startsWith(target)) {
+        if (originOf(url) === originOf(target)) {
           seen.headersAtTarget = opts?.headers ?? {};
           const body = opts?.body ? JSON.parse(opts.body) : {};
           const result = body.method === 'tools/list'
@@ -397,7 +406,7 @@ describe('api/mcp-proxy', () => {
       assert.equal(res.status, 200);
       const payload = await res.json();
       assert.deepEqual(payload.tools?.map((t) => t.name), ['moved_tool']);
-      assert.ok(seen.urls.some((u) => u.startsWith(NEW)), 'must have re-dispatched to the redirect target');
+      assert.ok(seen.urls.some((u) => originOf(u) === NEW), 'must have re-dispatched to the redirect target');
     });
 
     it('drops caller credentials when the hop crosses an origin', async () => {
@@ -446,7 +455,7 @@ describe('api/mcp-proxy', () => {
       const urls = [];
       globalThis.fetch = async (url) => {
         urls.push(String(url));
-        if (String(url).startsWith(OLD)) {
+        if (originOf(url) === OLD) {
           return new Response(null, { status: 308, headers: { location: `${NEW}/mcp` } });
         }
         return new Response(null, { status: 308, headers: { location: 'https://mcp.third.example.com/mcp' } });
@@ -454,7 +463,7 @@ describe('api/mcp-proxy', () => {
       const res = await handler(makePostRequest({ action: 'tools/list', serverUrl: `${OLD}/mcp` }));
       assert.notEqual(res.status, 200);
       assert.ok(
-        !urls.some((u) => u.includes('third.example.com')),
+        !urls.some((u) => hostOf(u) === 'mcp.third.example.com'),
         'the second hop must never be dispatched',
       );
     });
@@ -467,14 +476,14 @@ describe('api/mcp-proxy', () => {
       };
       const res = await handler(makePostRequest({ action: 'tools/list', serverUrl: `${OLD}/mcp` }));
       assert.notEqual(res.status, 200);
-      assert.ok(!urls.some((u) => u.startsWith('http://')), 'must never dispatch over plaintext');
+      assert.ok(!urls.some((u) => protocolOf(u) === 'http:'), 'must never dispatch over plaintext');
     });
 
     it('does not follow a 302, which would rewrite the JSON-RPC POST to GET', async () => {
       const seen = redirectingServer({ status: 302 });
       const res = await handler(makePostRequest({ action: 'tools/list', serverUrl: `${OLD}/mcp` }));
       assert.notEqual(res.status, 200);
-      assert.ok(!seen.urls.some((u) => u.startsWith(NEW)), '302 must not be followed');
+      assert.ok(!seen.urls.some((u) => originOf(u) === NEW), '302 must not be followed');
     });
 
     it('re-runs the SSRF guard on the redirect target', async () => {
@@ -486,7 +495,7 @@ describe('api/mcp-proxy', () => {
       const res = await handler(makePostRequest({ action: 'tools/list', serverUrl: `${OLD}/mcp` }));
       assert.notEqual(res.status, 200);
       assert.ok(
-        !seen.urls.some((u) => u.startsWith(NEW)),
+        !seen.urls.some((u) => originOf(u) === NEW),
         'a redirect onto a blocked address must be refused before dispatch',
       );
     });
