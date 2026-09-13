@@ -78,12 +78,14 @@ describe('cursor skill: sentry-triage', () => {
     assert.match(product, /Sentry WORLDMONITOR-12A/);
     assert.match(product, /Before creating or updating the PR, scan the proposed PR body/);
     for (const section of [product, done]) {
-      assert.match(section, /read(?:ing)? `statusDetails` back/);
+      assert.match(section, /read(?:ing)?(?: `status` and)? `statusDetails` back|reading back `status: resolved`/);
       for (const key of ['inRelease', 'inNextRelease', 'inCommit']) {
         assert.ok(section.includes('`' + key + '`'), `missing pin key: ${key}`);
       }
     }
-    assert.match(done, /shipped fix linked by the short ID with no resolving keyword beside it/);
+    assert.match(product, /when resolution is authorized and the fix is verified/);
+    assert.match(done, /status: resolved/);
+    assert.match(done, /shipped change linked by its Sentry short ID with no resolving keyword beside it/);
     assert.doesNotMatch(done, /(?:fix(?:es|ed)?|clos(?:e|es|ed)|resolv(?:e|es|ed))\s+WORLDMONITOR-/i);
     assert.match(markdown, /hosted acceptance.*pending/i);
     assert.doesNotMatch(markdown, /no browser event can ever outrank|browser events carry the static release/);

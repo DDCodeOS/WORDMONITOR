@@ -45,6 +45,14 @@ export class BillingDenialError extends Error {
   }
 }
 
+// Preserve transport backoff without exposing the downstream response body.
+export class ToolBackoffError extends Error {
+  constructor(readonly status: 429 | 503, readonly retryAfter: string | null, label: string) {
+    super(`${label} HTTP ${status}`);
+    this.name = 'ToolBackoffError';
+  }
+}
+
 // Structural subset of Response so test doubles that stub only {ok, status}
 // (several suites do) pass through the non-billing path instead of throwing
 // on a missing headers object. `body` / `text` are optional so those doubles
@@ -178,7 +186,8 @@ export async function extractSafeRpcViolations(
 /**
  * Standard non-ok handling for tool `_execute` gateway fetches: billing
  * denials become typed errors dispatch can re-emit faithfully; proto 400
- * bodies with safe field violations become RpcValidationError; everything
+ * bodies with safe field violations become RpcValidationError. With
+ * preserveBackoff, 429/503 retain transport backoff through ToolBackoffError; everything
  * else keeps the existing `<label> HTTP <status>` Error contract.
  *
  * HTTP 401 bodies preserve only confirmed internal-signature rejection codes.
@@ -186,7 +195,11 @@ export async function extractSafeRpcViolations(
  * must await this helper — a forgotten await would let execution continue
  * and treat the 400 as success.
  */
-export async function assertToolFetchOk(response: ToolFetchResponse, label: string): Promise<void> {
+export async function assertToolFetchOk(
+  response: ToolFetchResponse,
+  label: string,
+  { preserveBackoff = false }: { preserveBackoff?: boolean } = {},
+): Promise<void> {
   if (response.ok) return;
   throwIfBillingDenial(response, label);
   if (response.status === 401) {
@@ -201,6 +214,9 @@ export async function assertToolFetchOk(response: ToolFetchResponse, label: stri
     if (signatureRejected) {
       throw new Error(`${label} HTTP 401: invalid_internal_mcp_signature`);
     }
+  }
+  if (preserveBackoff && (response.status === 429 || response.status === 503)) {
+    throw new ToolBackoffError(response.status, response.headers?.get('Retry-After') ?? null, label);
   }
   if (response.status === 400) {
     const violations = await extractSafeRpcViolations(response);
