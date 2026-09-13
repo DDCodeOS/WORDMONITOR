@@ -1440,6 +1440,15 @@ export const CANADA_DEPTH_OPT_IN_SOURCES = [
   'Montreal Gazette',
 ] as const;
 
+/** New regional desks remain opt-in for returning denylist profiles (#7748). */
+export const CURATED_REGIONAL_OPT_IN_SOURCES = [
+  'Guardian Africa',
+  'France 24 Africa',
+  'Guardian Caribbean',
+  'Guardian Pacific',
+  'France 24 Asia Pacific',
+] as const;
+
 /** Chronological feed introductions used to reconstruct untouched cap states. */
 export const REGIONAL_FEED_ROLLOUT_STAGES = [
   {
@@ -1513,6 +1522,16 @@ export const REGIONAL_FEED_ROLLOUT_STAGES = [
     introducedNames: [
       ...CRISIS_DESK_ROLLOUT_SOURCES,
     ],
+    protectedNames: [
+      ...FRONTLINE_EUROPE_PROTECTED_SOURCES,
+      ...REGIONAL_FEED_ROLLOUT_DEFAULT_SOURCES,
+      ...CANADA_EN_DEFAULT_SOURCES,
+      ...CRISIS_FLOOR_EN_DEFAULT_SOURCES,
+      ...CRISIS_FLOOR_STRATEGIC_DEFAULT_SOURCES,
+    ],
+  },
+  {
+    introducedNames: [...CURATED_REGIONAL_OPT_IN_SOURCES],
     protectedNames: [
       ...FRONTLINE_EUROPE_PROTECTED_SOURCES,
       ...REGIONAL_FEED_ROLLOUT_DEFAULT_SOURCES,

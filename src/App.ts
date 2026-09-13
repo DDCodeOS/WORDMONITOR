@@ -124,6 +124,7 @@ import {
   CANADA_ARCTIC_OPT_IN_SOURCES,
   CANADA_DEPTH_OPT_IN_SOURCES,
   CRISIS_FLOOR_OPT_IN_SOURCES,
+  CURATED_REGIONAL_OPT_IN_SOURCES,
   computeDefaultDisabledSources,
   computeLegacyDefaultDisabledSources,
   FEEDS,
@@ -228,6 +229,7 @@ import {
   migrateCanadaArcticOptInsV6,
   migrateCanadaDepthOptInsV7,
   migrateCrisisDeskOptInsV8,
+  migrateCuratedRegionalOptInsV9,
 } from '@/utils/cloud-prefs-migrations';
 import {
   getConvexClient,
@@ -1459,6 +1461,26 @@ export class App {
           }
         }
         localStorage.setItem(crisisDeskOptInKey, 'done');
+      }
+      const curatedRegionalOptInKey = 'worldmonitor-curated-regional-optin-v1';
+      if (!localStorage.getItem(curatedRegionalOptInKey)) {
+        const current = loadFromStorage<string[]>(STORAGE_KEYS.disabledFeeds, []);
+        const migrated = migrateCuratedRegionalOptInsV9({
+          [STORAGE_KEYS.disabledFeeds]: JSON.stringify(current),
+        }, CURATED_REGIONAL_OPT_IN_SOURCES);
+        const rawUpdated = migrated[STORAGE_KEYS.disabledFeeds];
+        if (typeof rawUpdated === 'string') {
+          let updated: unknown;
+          try { updated = JSON.parse(rawUpdated); } catch { updated = null; }
+          if (
+            Array.isArray(updated)
+            && updated.every((name): name is string => typeof name === 'string')
+            && JSON.stringify(updated) !== JSON.stringify(current)
+          ) {
+            saveToStorage(STORAGE_KEYS.disabledFeeds, updated);
+          }
+        }
+        localStorage.setItem(curatedRegionalOptInKey, 'done');
       }
       // Locale boost: additively enable locale-matched sources (runs once per locale).
       // Reads the explicit-choice key (`wm-locale-explicit`, written by Settings →

@@ -12,6 +12,7 @@ import { isAllowedDomain } from '../api/_rss-allowed-domain-match.js';
 import { SOURCE_PROPAGANDA_RISK, SOURCE_TYPES } from '../shared/source-provenance';
 import { SOURCE_TIERS } from '../server/_shared/source-tiers';
 import { publisherFamilyFor } from '../shared/publisher-families.js';
+import { applyMigrationChain, buildMigrations } from '../src/utils/cloud-prefs-migrations';
 
 const REGIONAL_FEEDS = [
   { name: 'Guardian Africa', category: 'africa', path: 'https://www.theguardian.com/world/africa/rss', publisher: 'Guardian World', code: 'UG', title: 'Uganda announces changes to its cabinet' },
@@ -23,7 +24,11 @@ const REGIONAL_FEEDS = [
   { name: 'France 24 Asia Pacific', category: 'asia', path: 'https://www.france24.com/en/asia-pacific/rss', publisher: 'France 24', code: 'MY', title: 'Malaysia announces refugee policy review' },
 ] as const;
 
-type Client = { FULL_FEEDS: Record<string, { name: string; url: string }[]> };
+type Client = {
+  FULL_FEEDS: Record<string, { name: string; url: string }[]>;
+  CURATED_REGIONAL_OPT_IN_SOURCES: readonly string[];
+  computeDefaultDisabledSources: () => string[];
+};
 const tempDir = mkdtempSync(join(tmpdir(), 'regional-feeds-'));
 let client: Client;
 before(async () => {
@@ -32,6 +37,25 @@ before(async () => {
 after(() => rmSync(tempDir, { recursive: true, force: true }));
 
 describe('curated regional country coverage (#7748)', () => {
+  it('preserves opt-in preferences for fresh, returning, and already-migrated profiles', () => {
+    const names = REGIONAL_FEEDS.filter(row => !['France 24 LatAm', 'Mexico News Daily'].includes(row.name)).map(row => row.name);
+    assert.deepEqual(new Set(client.CURATED_REGIONAL_OPT_IN_SOURCES), new Set(names));
+    const defaults = new Set(client.computeDefaultDisabledSources());
+    for (const name of names) assert.ok(defaults.has(name), `${name} starts disabled`);
+    const migrations = buildMigrations({}, { curatedRegional: { optInSources: client.CURATED_REGIONAL_OPT_IN_SOURCES } });
+    const blob = { 'worldmonitor-disabled-feeds': JSON.stringify(['user-choice', names[0]]), 'unrelated': 'keep' };
+    const migrated = applyMigrationChain(blob, 8, 9, migrations);
+    assert.deepEqual(JSON.parse(migrated['worldmonitor-disabled-feeds'] as string), ['user-choice', ...names]);
+    assert.equal(migrated.unrelated, 'keep');
+    assert.equal(applyMigrationChain(migrated, 8, 9, migrations), migrated);
+    const chosen = { 'worldmonitor-disabled-feeds': JSON.stringify(['user-choice']) };
+    assert.equal(applyMigrationChain(chosen, 9, 9, migrations), chosen, 'later opt-ins survive sync');
+    for (const raw of ['[]', 'bad-json', '[42]', '{}']) {
+      const invalid = { 'worldmonitor-disabled-feeds': raw };
+      assert.equal(applyMigrationChain(invalid, 8, 9, migrations), invalid);
+    }
+  });
+
   it('acquires every regional feed in the English digest with matching browser routing', () => {
     const { batches } = __testing__.buildDigestFeedBatches('full', 'en');
     const scheduled = batches.flat();
