@@ -163,6 +163,18 @@ describe('MCP Presets — static validation', () => {
     assert.equal(wf.defaultTool, 'noaa_ncei_daily_weather_for_location_date');
   });
 
+  // This preset is the one that went dark, and it was the only one of the
+  // catalog's open endpoints with no URL assertion in the default CI run — the
+  // live suite is opt-in, so a silent re-point was invisible here. Pin the
+  // vendor's PUBLISHED address specifically: the backend it 308s to is an
+  // implementation detail, and recording that instead is the change this pin
+  // exists to catch.
+  it('WeatherForensics serverUrl is the vendor published domain, not its backend', () => {
+    const wf = presets.find(p => p.name === 'Weather Forensics');
+    assert.ok(wf, 'Weather Forensics preset not found');
+    assert.equal(wf.serverUrl, 'https://weatherforensics.dev/mcp/free');
+  });
+
   it('LunarCrush defaultTool is Cryptocurrencies (not List)', () => {
     const lc = presets.find(p => p.name === 'LunarCrush');
     assert.ok(lc, 'LunarCrush preset not found');
@@ -187,7 +199,7 @@ describe(`MCP Presets — live connectivity (${LIVE ? 'ENABLED' : 'SKIPPED — s
     { name: 'Parallel Search', url: 'https://search.parallel.ai/mcp' },
     { name: 'Robtex',          url: 'https://mcp.robtex.com/mcp' },
     { name: 'Pyth Price Feeds', url: 'https://mcp.pyth.network/mcp' },
-    { name: 'Weather Forensics', url: 'https://noaa-mcp-free-bly45pyigq-uk.a.run.app/mcp' },
+    { name: 'Weather Forensics', url: 'https://weatherforensics.dev/mcp/free' },
   ];
 
   // Auth-gated presets — expect 401 on initialize (not DNS failure / 404)
