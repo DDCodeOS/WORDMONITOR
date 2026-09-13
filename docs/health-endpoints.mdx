@@ -632,6 +632,35 @@ node scripts/check-seed-freshness.mjs \
 The command still exits nonzero when operational acceptance fails. It writes
 both reports from the same health observation before returning that verdict.
 
+### MCP preset liveness
+
+The **MCP Preset Liveness** workflow checks the Quick Connect catalog every
+Monday at 06:23 UTC and supports manual runs. It runs
+`LIVE_MCP_TESTS=1 node --test tests/mcp-presets.test.mjs`, deriving each endpoint
+and its authentication expectation from `MCP_PRESETS` in `src/services/mcp-store.ts`.
+Reserved example-domain templates, including the self-hosted PostgreSQL preset,
+are excluded. No vendor credentials are used.
+
+Open presets require HTTP 200. Keyed presets also accept HTTP 401 or 403,
+preserving the existing live suite's reachability contract. Redirects, other
+HTTP statuses, DNS errors and timeouts are findings. Probes do not follow
+redirects, stop after 15 seconds, and run at most four at once. This proves HTTP
+reachability only; it does not prove authenticated tool execution.
+
+Findings create or update one open issue titled **MCP preset liveness: endpoint
+findings**, with preset names, catalog URLs, observed results and a workflow-run
+link. Maintainers should recheck the finding, repair or remove the catalog entry,
+and close the issue after confirming recovery. Healthy runs create no issue and
+do not close an existing incident. The workflow summary reports the latest
+finding count. A successful run can therefore still have endpoint findings.
+
+This weekly workflow is separate from PR and deployment gates. Vendor failures
+are reported as issues; missing or incomplete probe reports and publishing
+failures fail the monitor itself. To inspect the same observation locally without
+publishing an issue, set `MCP_PRESET_REPORT=/tmp/mcp-presets.json` when running the
+live suite. After this workflow is merged, validate its first manual or scheduled
+run within one week; confirm the probe count, summary, and any incident issue.
+
 ### Example Requests
 
 ```bash
