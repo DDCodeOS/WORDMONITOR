@@ -12,7 +12,7 @@ const HULL_TYPE_MAP = {
 };
 
 // Theater and port centroids for every <h2> heading USNI has published in the
-// Fleet Tracker. Keep this table byte-identical to USNI_REGION_COORDINATES in
+// Fleet Tracker. Keep every key and coordinate identical to USNI_REGION_COORDINATES in
 // src/config/military.ts — tests/dom/usni-region-coords-parity.test.mts fails if
 // the two drift. An unmapped heading is not harmless: the client falls through
 // to a hash-derived position, which plots the vessel at an arbitrary point on
@@ -120,35 +120,37 @@ function usniNormalizeRegion(regionText) {
 }
 
 // Longest table key contained in `lower`, so "Eastern Mediterranean Sea" beats
-// "Mediterranean Sea" and "Sasebo, Japan" beats "Japan".
+// "Mediterranean Sea". Returns the matched key too, so callers can tell a key
+// that spans a comma ("Portsmouth, England") from a single-segment one.
 function usniLongestContainedKey(lower) {
   let best = null;
   for (const [key, coords] of Object.entries(USNI_REGION_COORDS)) {
     const normalizedKey = key.toLowerCase();
-    if (normalizedKey === lower) return coords;
+    if (normalizedKey === lower) return { key, coords };
     if (lower.includes(normalizedKey) && (!best || key.length > best.key.length)) {
       best = { key, coords };
     }
   }
-  return best?.coords ?? null;
+  return best;
 }
 
 function usniGetRegionCoords(regionText) {
   const norm = usniNormalizeRegion(regionText);
   if (USNI_REGION_COORDS[norm]) return USNI_REGION_COORDS[norm];
   const lower = norm.toLowerCase();
-  const contained = usniLongestContainedKey(lower);
-  if (contained) return contained;
-  // "City, Country" headings: resolve the most specific segment first, then
-  // fall back to the country ("Kure, Japan" -> Kure; "Bergen, Norway" -> Norway).
+  const whole = usniLongestContainedKey(lower);
+  // A key that itself contains a comma is more specific than any one segment.
+  if (whole?.key.includes(',')) return whole.coords;
+  // "City, Country" headings: the first segment naming a known place wins, so
+  // "Kure, Japan" lands on Kure even though "Japan" is the longer key.
   const segments = lower.split(',').map((part) => part.trim()).filter(Boolean);
   if (segments.length > 1) {
     for (const segment of segments) {
       const match = usniLongestContainedKey(segment);
-      if (match) return match;
+      if (match) return match.coords;
     }
   }
-  return null;
+  return whole?.coords ?? null;
 }
 
 function usniParseLeadingInt(text) {

@@ -543,7 +543,7 @@ if (import.meta.env.DEV) {
 
 /**
  * Theater and port centroids for every <h2> heading USNI has published in the
- * Fleet Tracker. Keep this table byte-identical to USNI_REGION_COORDS in
+ * Fleet Tracker. Keep every key and coordinate identical to USNI_REGION_COORDS in
  * scripts/lib/usni-fleet-parser.cjs — tests/dom/usni-region-coords-parity.test.mts
  * fails if the two drift. An unmapped heading is not harmless: the lookup falls
  * through to getUSNIRegionApproxCoords' hash-derived position, which plots the
@@ -642,8 +642,8 @@ export const USNI_REGION_COORDINATES: Record<string, { lat: number; lon: number 
   'Souda Bay': { lat: 35.49, lon: 24.08 },
   'Naples': { lat: 40.84, lon: 14.25 },
   'Split': { lat: 43.51, lon: 16.44 },
-  'Deveselu': { lat: 44.1, lon: 24.09 },
-  'Norway': { lat: 60.39, lon: 5.32 },
+  'Deveselu': { lat: 44.1, lon: 24.09 },           // NATO BMD site, Romania
+  'Norway': { lat: 60.39, lon: 5.32 },             // Bergen / Haakonsvern naval base
   'Kiel': { lat: 54.32, lon: 10.14 },
   'Zeebrugge': { lat: 51.33, lon: 3.2 },
   'Portsmouth, England': { lat: 50.8, lon: -1.09 },
@@ -651,20 +651,20 @@ export const USNI_REGION_COORDINATES: Record<string, { lat: number; lon: number 
   'San Diego': { lat: 32.68, lon: -117.15 },
   'Norfolk': { lat: 36.95, lon: -76.3 },
   'Mayport': { lat: 30.39, lon: -81.4 },
-  'Jacksonville': { lat: 30.39, lon: -81.4 },
+  'Jacksonville': { lat: 30.39, lon: -81.4 },      // NAS Jax / Mayport area
   'Kings Bay': { lat: 30.8, lon: -81.56 },
   'Pensacola': { lat: 30.35, lon: -87.3 },
-  'Pascagoula': { lat: 30.37, lon: -88.55 },
+  'Pascagoula': { lat: 30.37, lon: -88.55 },       // Ingalls shipbuilding
   'New Orleans': { lat: 29.95, lon: -90.07 },
   'Houston': { lat: 29.75, lon: -95.35 },
   'Corpus Christi': { lat: 27.8, lon: -97.4 },
-  'Newport News': { lat: 37.0, lon: -76.43 },
+  'Newport News': { lat: 37.0, lon: -76.43 },     // Huntington Ingalls / NNSY — carrier RCOH
   'New York City': { lat: 40.7, lon: -74.0 },
-  'Portsmouth': { lat: 43.07, lon: -70.76 },
-  'Groton': { lat: 41.35, lon: -72.09 },
+  'Portsmouth': { lat: 43.07, lon: -70.76 },       // Portsmouth Naval Shipyard (Kittery, ME — submarine)
+  'Groton': { lat: 41.35, lon: -72.09 },           // Naval Submarine Base New London
   'New London': { lat: 41.35, lon: -72.09 },
   'Bremerton': { lat: 47.57, lon: -122.63 },
-  'Puget Sound': { lat: 47.57, lon: -122.63 },
+  'Puget Sound': { lat: 47.57, lon: -122.63 },     // alias for Bremerton / PSNS
   'Naval Station Kitsap': { lat: 47.57, lon: -122.63 },
   'Kitsap': { lat: 47.57, lon: -122.63 },
   'Everett': { lat: 47.97, lon: -122.22 },
@@ -716,38 +716,42 @@ export function normalizeUSNIRegion(regionText: string): string {
     .trim();
 }
 
-function longestContainedUSNIRegion(lower: string): { lat: number; lon: number } | undefined {
+function longestContainedUSNIRegion(
+  lower: string,
+): { key: string; coords: { lat: number; lon: number } } | undefined {
   let best: { key: string; coords: { lat: number; lon: number } } | undefined;
   for (const [key, coords] of Object.entries(USNI_REGION_COORDINATES)) {
     const normalizedKey = key.toLowerCase();
-    if (normalizedKey === lower) return coords;
+    if (normalizedKey === lower) return { key, coords };
     if (lower.includes(normalizedKey) && (!best || key.length > best.key.length)) {
       best = { key, coords };
     }
   }
-  return best?.coords;
+  return best;
 }
 
 /**
- * Mirrors usniGetRegionCoords in scripts/lib/usni-fleet-parser.cjs: exact key,
- * then the longest key contained in the heading ("Eastern Mediterranean Sea"
- * resolves to Eastern Mediterranean, "Sasebo, Japan" to Sasebo rather than
- * Japan), then each comma-separated segment of a "City, Country" heading.
+ * Mirrors usniGetRegionCoords in scripts/lib/usni-fleet-parser.cjs: exact key;
+ * then a contained key that itself spans a comma ("Portsmouth, England"); then,
+ * for a "City, Country" heading, the first segment naming a known place
+ * ("Kure, Japan" resolves to Kure although "Japan" is the longer key); then the
+ * longest key contained anywhere ("Eastern Mediterranean Sea" resolves to
+ * Eastern Mediterranean).
  */
 export function getUSNIRegionCoords(regionText: string): { lat: number; lon: number } | undefined {
   const normalized = normalizeUSNIRegion(regionText);
   if (USNI_REGION_COORDINATES[normalized]) return USNI_REGION_COORDINATES[normalized];
   const lower = normalized.toLowerCase();
-  const contained = longestContainedUSNIRegion(lower);
-  if (contained) return contained;
+  const whole = longestContainedUSNIRegion(lower);
+  if (whole?.key.includes(',')) return whole.coords;
   const segments = lower.split(',').map((part) => part.trim()).filter(Boolean);
   if (segments.length > 1) {
     for (const segment of segments) {
       const match = longestContainedUSNIRegion(segment);
-      if (match) return match;
+      if (match) return match.coords;
     }
   }
-  return undefined;
+  return whole?.coords;
 }
 
 export function getUSNIRegionApproxCoords(regionText: string): { lat: number; lon: number } {

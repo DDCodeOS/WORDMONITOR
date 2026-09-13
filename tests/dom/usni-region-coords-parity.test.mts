@@ -60,7 +60,12 @@ const PUBLISHED_HEADINGS = [
 const EXPECTED_RESOLUTION: Array<[string, string]> = [
   ['In Sasebo, Japan', 'Sasebo'],
   ['In Okinawa, Japan', 'Okinawa'],
+  // The city is the shorter key here, so longest-match alone would pick the country.
+  ['In Kure, Japan', 'Kure'],
+  ['In Wellington, New Zealand', 'Wellington'],
   ['In Portsmouth, England', 'Portsmouth, England'],
+  ['Near Portsmouth, England', 'Portsmouth, England'],
+  ['Across the Sea of Japan, East China Sea and Philippine Sea', 'Sea of Japan'],
   ['In the Eastern Mediterranean Sea', 'Eastern Mediterranean'],
   ['In the Southern Pacific', 'Southern Pacific'],
   ['In the North Arabian Sea', 'North Arabian Sea'],
