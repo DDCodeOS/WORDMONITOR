@@ -451,6 +451,105 @@ describe('api/mcp-proxy', () => {
       assert.ok(lowerKeys.includes('authorization'), 'a same-origin hop must not strip the caller key');
     });
 
+    for (const status of [307, 308]) {
+      for (const action of ['tools/list', 'tools/call']) {
+        for (const targetOrigin of [OLD, NEW]) {
+          it(`keeps a stateful ${status} ${action} session at the ${targetOrigin === OLD ? 'same' : 'new'} origin`, async () => {
+            const targetUrl = `${targetOrigin}/mcp/v2`;
+            const seen = [];
+            const resolvedHosts = [];
+            const targetFetch = makeMcpFetch({
+              tools: [{ name: 'moved_tool' }],
+              callResult: { content: [{ type: 'text', text: 'moved result' }] },
+            });
+            setResolveHostnameForTest(async (hostname) => {
+              resolvedHosts.push(hostname);
+              return [PUBLIC_TEST_ADDRESS];
+            });
+            globalThis.fetch = async (url, opts) => {
+              const body = JSON.parse(opts.body);
+              const headers = new Headers(opts.headers);
+              seen.push({ url: String(url), method: body.method, headers });
+              if (String(url) === `${OLD}/mcp`) {
+                return new Response(null, { status, headers: { location: targetUrl } });
+              }
+              assert.equal(String(url), targetUrl);
+              if (body.method !== 'initialize' && headers.get('mcp-session-id') !== 'target-session') {
+                return new Response(null, { status: 400 });
+              }
+              const response = await targetFetch(url, opts);
+              if (body.method === 'initialize') response.headers.set('Mcp-Session-Id', 'target-session');
+              return response;
+            };
+
+            const res = await handler(makePostRequest({
+              action: action === 'tools/list' ? action : undefined,
+              serverUrl: `${OLD}/mcp`, toolName: 'moved_tool',
+              customHeaders: { Authorization: 'Bearer caller-key', 'X-Vendor-Key': 'vendor-key' },
+            }));
+            assert.equal(res.status, 200);
+            const payload = await res.json();
+            if (action === 'tools/list') assert.equal(payload.tools[0].name, 'moved_tool');
+            else assert.equal(payload.result.content[0].text, 'moved result');
+            assert.deepEqual(seen.map(({ url, method }) => [url, method]), [
+              [`${OLD}/mcp`, 'initialize'],
+              [targetUrl, 'initialize'],
+              [targetUrl, 'notifications/initialized'],
+              [targetUrl, action],
+            ]);
+            assert.equal(seen[0].headers.get('mcp-session-id'), null);
+            assert.equal(seen[0].headers.get('authorization'), 'Bearer caller-key');
+            for (const [index, request] of seen.slice(1).entries()) {
+              assert.equal(request.headers.get('mcp-session-id'), index === 0 ? null : 'target-session');
+              assert.equal(request.headers.get('authorization'), targetOrigin === OLD ? 'Bearer caller-key' : null);
+              assert.equal(request.headers.get('x-vendor-key'), targetOrigin === OLD ? 'vendor-key' : null);
+            }
+            assert.deepEqual(resolvedHosts, [hostOf(OLD), ...seen.map(({ url }) => hostOf(url))]);
+          });
+        }
+      }
+    }
+
+    it('aborts pending redirect DNS at the shared exchange deadline', { timeout: 5_000 }, async (t) => {
+      const exchange = new AbortController();
+      const originalTimeout = AbortSignal.timeout;
+      t.mock.method(AbortSignal, 'timeout', (ms) => ms === 15_000 ? exchange.signal : originalTimeout(ms));
+      setResolveHostnameForTest(null);
+      const targetDnsSignals = [];
+      const releaseDns = [];
+      const upstreamUrls = [];
+      let notifyDnsStarted;
+      const dnsStarted = new Promise((resolve) => { notifyDnsStarted = resolve; });
+      globalThis.fetch = async (url, opts) => {
+        const parsed = new URL(String(url));
+        if (parsed.origin === 'https://cloudflare-dns.com') {
+          const response = () => dnsJsonResponse(parsed.searchParams.get('type') === 'A'
+            ? [{ type: 1, data: PUBLIC_TEST_ADDRESS }] : []);
+          if (parsed.searchParams.get('name') !== hostOf(NEW)) return response();
+          return new Promise((resolve, reject) => {
+            targetDnsSignals.push(opts.signal);
+            releaseDns.push(() => resolve(response()));
+            opts.signal.addEventListener('abort', () => reject(opts.signal.reason), { once: true });
+            if (targetDnsSignals.length === 2) notifyDnsStarted();
+          });
+        }
+        upstreamUrls.push(String(url));
+        opts.signal.throwIfAborted();
+        return new Response(null, { status: 308, headers: { location: `${NEW}/mcp` } });
+      };
+      const pending = handler(makePostRequest({ action: 'tools/list', serverUrl: `${OLD}/mcp` }));
+      try {
+        await dnsStarted;
+        exchange.abort(new DOMException('The operation timed out', 'TimeoutError'));
+        assert.ok(targetDnsSignals.every((signal) => signal.aborted), 'both DNS lookups must abort with the exchange');
+        assert.equal((await pending).status, 504);
+        assert.deepEqual(upstreamUrls, [`${OLD}/mcp`]);
+      } finally {
+        for (const release of releaseDns) release();
+        await pending;
+      }
+    });
+
     it('refuses a second hop rather than chasing a redirect chain', async () => {
       const urls = [];
       globalThis.fetch = async (url) => {

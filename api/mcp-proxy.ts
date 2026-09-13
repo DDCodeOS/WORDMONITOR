@@ -291,16 +291,17 @@ function throwBlockedAddress(blockedAddress) {
   throw new McpProxySsrfError(SSRF_BLOCKED_PUBLIC_MESSAGE);
 }
 
-async function resolveDnsJson(hostname, recordType) {
+async function resolveDnsJson(hostname, recordType, signal) {
   const url = new URL(DNS_JSON_ENDPOINT);
   url.searchParams.set('name', hostname);
   url.searchParams.set('type', recordType);
+  const dnsTimeout = AbortSignal.timeout(DNS_RESOLUTION_TIMEOUT_MS);
   const response = await fetch(url.toString(), {
     headers: {
       Accept: 'application/dns-json',
       'User-Agent': 'WorldMonitor-MCP-Proxy/1.0',
     },
-    signal: AbortSignal.timeout(DNS_RESOLUTION_TIMEOUT_MS),
+    signal: signal ? AbortSignal.any([signal, dnsTimeout]) : dnsTimeout,
   });
   if (!response.ok) {
     throw new Error(`DNS ${recordType} lookup failed: HTTP ${response.status}`);
@@ -315,17 +316,18 @@ async function resolveDnsJson(hostname, recordType) {
     .map(answer => answer.data);
 }
 
-async function defaultResolveHostname(hostname) {
+async function defaultResolveHostname(hostname, signal) {
   const resolveHostnameForTest = getResolveHostnameForTest();
-  if (resolveHostnameForTest) return resolveHostnameForTest(hostname);
+  if (resolveHostnameForTest) return resolveHostnameForTest(hostname, signal);
   const records = await Promise.all([
-    resolveDnsJson(hostname, 'A'),
-    resolveDnsJson(hostname, 'AAAA'),
+    resolveDnsJson(hostname, 'A', signal),
+    resolveDnsJson(hostname, 'AAAA', signal),
   ]);
   return records.flat();
 }
 
-async function assertServerUrlSafe(url) {
+async function assertServerUrlSafe(url, signal) {
+  signal?.throwIfAborted();
   const hostname = url.hostname.toLowerCase();
   if (BLOCKED_HOSTNAMES.has(hostname)) {
     throw new McpProxySsrfError('serverUrl hostname is blocked');
@@ -336,10 +338,12 @@ async function assertServerUrlSafe(url) {
 
   let resolvedAddresses;
   try {
-    resolvedAddresses = await defaultResolveHostname(hostname);
+    resolvedAddresses = await defaultResolveHostname(hostname, signal);
   } catch (error) {
+    signal?.throwIfAborted();
     throw new McpProxySsrfError('serverUrl DNS resolution failed', { cause: error });
   }
+  signal?.throwIfAborted();
 
   if (!resolvedAddresses.length) {
     throw new McpProxySsrfError('serverUrl DNS resolution returned no addresses');
@@ -361,8 +365,8 @@ async function assertServerUrlSafe(url) {
 // dispatch NARROWS that DNS-rebinding window but does not close it. The
 // residual rebind window is an ACCEPTED limitation of the Edge runtime (no
 // socket-level pin available) — documented, not fixed here (P2, issue #5061).
-async function revalidateBeforeFetch(url) {
-  await assertServerUrlSafe(url);
+async function revalidateBeforeFetch(url, signal) {
+  await assertServerUrlSafe(url, signal);
 }
 
 function buildInitPayload() {
@@ -497,7 +501,8 @@ async function postJson(url, body, headers, sessionId) {
   // dispatch gets.
   const signal = AbortSignal.timeout(TIMEOUT_MS);
   for (let hop = 0; ; hop++) {
-    await revalidateBeforeFetch(target);
+    await revalidateBeforeFetch(target, signal);
+    signal.throwIfAborted();
     const resp = await fetchMcpUpstream(target.toString(), {
       method: 'POST',
       headers: outboundHeaders,
@@ -505,12 +510,14 @@ async function postJson(url, body, headers, sessionId) {
       redirect: 'manual',
       signal,
     });
-    if (hop >= MAX_REDIRECT_HOPS || !METHOD_PRESERVING_REDIRECTS.has(resp.status)) return resp;
+    if (hop >= MAX_REDIRECT_HOPS || !METHOD_PRESERVING_REDIRECTS.has(resp.status)) {
+      return { response: resp, url: target, headers: outboundHeaders };
+    }
     const next = redirectTargetFor(resp, target);
     // An unfollowable redirect (no Location, unparseable, or an http://
     // downgrade) is returned as-is so the caller still reports the upstream
     // status it actually got, exactly as before this hop existed.
-    if (!next) return resp;
+    if (!next) return { response: resp, url: target, headers: outboundHeaders };
     await cancelResponseBody(resp);
     if (next.origin !== target.origin) outboundHeaders = stripToCrossOriginSafeHeaders(outboundHeaders);
     target = next;
@@ -552,7 +559,7 @@ async function parseJsonRpcResponse(resp) {
 
 async function sendInitialized(serverUrl, headers, sessionId) {
   try {
-    const response = await postJson(serverUrl, {
+    const { response } = await postJson(serverUrl, {
       jsonrpc: '2.0',
       method: 'notifications/initialized',
       params: {},
@@ -565,14 +572,15 @@ async function sendInitialized(serverUrl, headers, sessionId) {
 }
 
 async function mcpListTools(serverUrl, customHeaders) {
-  const headers = buildHeaders(customHeaders);
-  const initResp = await postJson(serverUrl, buildInitPayload(), headers, null);
+  const { response: initResp, url: sessionUrl, headers } = await postJson(
+    serverUrl, buildInitPayload(), buildHeaders(customHeaders), null,
+  );
   if (!initResp.ok) throw new McpProxyUpstreamError(`Initialize failed: HTTP ${initResp.status}`);
   const sessionId = initResp.headers.get('Mcp-Session-Id') || initResp.headers.get('mcp-session-id');
   const initData = await parseJsonRpcResponse(initResp);
   if (initData.error) throw new McpProxyUpstreamError('Initialize error: MCP server rejected request');
-  await sendInitialized(serverUrl, headers, sessionId);
-  const listResp = await postJson(serverUrl, {
+  await sendInitialized(sessionUrl, headers, sessionId);
+  const { response: listResp } = await postJson(sessionUrl, {
     jsonrpc: '2.0', id: 2, method: 'tools/list', params: {},
   }, headers, sessionId);
   if (!listResp.ok) throw new McpProxyUpstreamError(`tools/list failed: HTTP ${listResp.status}`);
@@ -582,14 +590,15 @@ async function mcpListTools(serverUrl, customHeaders) {
 }
 
 async function mcpCallTool(serverUrl, toolName, toolArgs, customHeaders) {
-  const headers = buildHeaders(customHeaders);
-  const initResp = await postJson(serverUrl, buildInitPayload(), headers, null);
+  const { response: initResp, url: sessionUrl, headers } = await postJson(
+    serverUrl, buildInitPayload(), buildHeaders(customHeaders), null,
+  );
   if (!initResp.ok) throw new McpProxyUpstreamError(`Initialize failed: HTTP ${initResp.status}`);
   const sessionId = initResp.headers.get('Mcp-Session-Id') || initResp.headers.get('mcp-session-id');
   const initData = await parseJsonRpcResponse(initResp);
   if (initData.error) throw new McpProxyUpstreamError('Initialize error: MCP server rejected request');
-  await sendInitialized(serverUrl, headers, sessionId);
-  const callResp = await postJson(serverUrl, {
+  await sendInitialized(sessionUrl, headers, sessionId);
+  const { response: callResp } = await postJson(sessionUrl, {
     jsonrpc: '2.0', id: 3, method: 'tools/call',
     params: { name: toolName, arguments: toolArgs || {} },
   }, headers, sessionId);
