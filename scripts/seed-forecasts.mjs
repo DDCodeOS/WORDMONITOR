@@ -14001,7 +14001,7 @@ function summarizePublishFiltering(predictions, selectedPredictions = [], publis
       .map((pred) => pred.publishDiagnostics?.reason)
       .filter(Boolean),
   );
-  const eligible = predictions.filter(pred => (pred.probability || 0) > PUBLISH_MIN_PROBABILITY && !isWeakForecastFallback(pred));
+  const eligible = predictions.filter(pred => isPublishEligibleForecast(pred));
   const realDomains = items => [...new Set(items.filter(isRealForecastForDomainCoverage).map(pred => pred.domain))].sort();
   const eligibleDomains = realDomains(eligible);
   const selectedDomains = realDomains(selectedPredictions);
@@ -14080,6 +14080,10 @@ function isWeakForecastFallback(pred) {
     && counterEvidenceTypes.has('confidence');
 }
 
+function isPublishEligibleForecast(pred, minProbability = PUBLISH_MIN_PROBABILITY) {
+  return (pred?.probability || 0) > minProbability && !isWeakForecastFallback(pred);
+}
+
 function summarizeResolutionHardCoverage(predictions = []) {
   const items = Array.isArray(predictions) ? predictions : [];
   const total = items.length;
@@ -14096,7 +14100,7 @@ function selectDeferredForecastForPublishBackfill(deferredCandidates, publishedP
   if (!Array.isArray(deferredCandidates) || deferredCandidates.length === 0) return null;
   const publishedDomains = new Set(publishedPredictions.filter(isRealForecastForDomainCoverage).map(pred => pred.domain));
   const isMissingDomain = pred => isRealForecastForDomainCoverage(pred)
-    && !publishedDomains.has(pred.domain) && (pred.probability || 0) > PUBLISH_MIN_PROBABILITY && !isWeakForecastFallback(pred);
+    && !publishedDomains.has(pred.domain) && isPublishEligibleForecast(pred);
   const publishedCoverage = summarizeResolutionHardCoverage(publishedPredictions);
   const deferredHardCount = deferredCandidates.filter(isHardResolvableForecast).length;
   const projectedTotal = Math.max(targetCount || 0, publishedCoverage.total + 1);
@@ -14321,8 +14325,7 @@ function canCoexistAsDistinctStrategicFollowOn(pred, selected = []) {
 }
 
 function selectPublishedForecastPool(predictions, options = {}) {
-  const eligible = (predictions || []).filter((pred) => (pred?.probability || 0) > (options.minProbability ?? PUBLISH_MIN_PROBABILITY)
-    && !isWeakForecastFallback(pred));
+  const eligible = (predictions || []).filter((pred) => isPublishEligibleForecast(pred, options.minProbability ?? PUBLISH_MIN_PROBABILITY));
   const targetCount = options.targetCount ?? getPublishSelectionTarget(eligible);
   const memoryIndex = options.memoryIndex || null;
   const selected = [];
@@ -14514,7 +14517,7 @@ function selectPublishedForecastPool(predictions, options = {}) {
     if (canSelect(pred, 'backfill')) take(pred);
   }
   for (const pred of stateAnchors) {
-    if (selected.length >= Math.min(targetCount, stateAnchors.length)) break;
+    if (selected.length >= targetCount) break;
     if (canSelect(pred, 'state_anchor')) take(pred);
   }
   // These anchor passes intentionally stay in state-anchor mode, so once a state is already
@@ -14574,9 +14577,9 @@ function selectPublishedForecastPool(predictions, options = {}) {
     if (canSelect(pred, 'backfill')) take(pred);
   }
 
-  // Domain guarantee: data-driven detectors (military) structurally can't match LLM-enriched
-  // readiness scores, so they get buried in ranking. If no military forecast was selected
-  // and we have room below the hard cap, inject the best-scoring eligible one.
+  // Domain guarantee: the real-domain reservation above already takes a real military or
+  // supply-chain forecast when one fits within targetCount. This pass adds one above
+  // targetCount (up to the hard cap), or a synthetic one the reservation does not count.
   if (selected.length < MAX_TARGET_PUBLISHED_FORECASTS) {
     for (const guaranteedDomain of ['military']) {
       if (selected.some((p) => p.domain === guaranteedDomain)) continue;
@@ -14675,9 +14678,8 @@ function filterPublishedForecasts(predictions, minProbability = PUBLISH_MIN_PROB
       continue;
     }
 
-    const bestDuplicate = kept.find((item) => {
+    const isStrongerDuplicate = (item) => {
       if (item.domain !== pred.domain) return false;
-      if (isRealForecastForDomainCoverage(pred) && !isRealForecastForDomainCoverage(item)) return false;
       if (item.familyContext?.id && pred.familyContext?.id && item.familyContext.id !== pred.familyContext.id) return false;
       const duplicateScore = computeSituationDuplicateScore(pred, item);
       if (!shouldSuppressAsSituationDuplicate(pred, item, duplicateScore)) return false;
@@ -14693,8 +14695,22 @@ function filterPublishedForecasts(predictions, minProbability = PUBLISH_MIN_PROB
         readinessGap >= 0.08 ||
         probabilityGap >= 0.08
       );
-    });
+    };
+    const bestDuplicate = isRealForecastForDomainCoverage(pred)
+      ? kept.find(item => isRealForecastForDomainCoverage(item) && isStrongerDuplicate(item)) || kept.find(isStrongerDuplicate)
+      : kept.find(isStrongerDuplicate);
 
+    if (bestDuplicate && isRealForecastForDomainCoverage(pred) && !isRealForecastForDomainCoverage(bestDuplicate)) {
+      // Real coverage displaces its synthetic or shadow twin instead of publishing beside it.
+      overlapSuppressedCount++;
+      bestDuplicate.publishDiagnostics = {
+        reason: 'situation_overlap',
+        keptForecastId: pred.id,
+        situationId: getForecastSelectionStateContext(bestDuplicate)?.id || '',
+      };
+      kept[kept.indexOf(bestDuplicate)] = pred;
+      continue;
+    }
     if (bestDuplicate) {
       overlapSuppressedCount++;
       pred.publishDiagnostics = {

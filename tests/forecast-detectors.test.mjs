@@ -3518,6 +3518,7 @@ describe('forecast quality gating', () => {
     );
     weak.caseFile.counterEvidence = [{ type: 'coverage_gap' }, { type: 'confidence' }];
     const candidates = [synthetic, weak, ...real];
+    assert.ok(!selectPublishedForecastPool(candidates, { targetCount: 3 }).some(pred => pred.id === weak.id));
     const pool = selectPublishedForecastPool(candidates, { targetCount: 2 });
     const published = buildPublishedForecastArtifacts(pool, []).publishedPredictions;
     markDeferredFamilySelection(candidates, pool);
@@ -3556,8 +3557,73 @@ describe('forecast quality gating', () => {
       const pool = selectPublishedForecastPool([synthetic, real], { targetCount: 2 });
       const published = buildPublishedForecastArtifacts(pool, []).publishedPredictions;
       assert.ok(published.some(pred => pred.id === real.id), generationOrigin);
+      assert.ok(!published.some(pred => pred.id === synthetic.id), generationOrigin);
+      assert.deepEqual(synthetic.publishDiagnostics, {
+        reason: 'situation_overlap', keptForecastId: real.id, situationId: real.stateContext.id,
+      }, generationOrigin);
       assert.deepEqual(summarizePublishFiltering([real, synthetic], pool, published).domainCoverage.missing, []);
     }
+  });
+
+  it('keeps every state anchor and real domain when reserved representatives share a busy state', () => {
+    const candidates = [
+      ['market', 'Gulf', 0.95, 'S1'], ['supply_chain', 'Gulf', 0.94, 'S1'],
+      ['political', 'France', 0.6, 'S2'], ['conflict', 'Sahel', 0.55, 'S3'],
+      ['cyber', 'US', 0.5, 'S4'], ['political', 'Germany', 0.45, 'S5'],
+      ['political', 'Italy', 0.44, 'S6'], ['political', 'Rome', 0.3, 'S7'],
+      ['market', 'Paris', 0.2, 'S2'],
+    ].map(([domain, region, priority, stateId]) => {
+      const pred = makePrediction(domain, region, `${domain} outlook ${region}`, 0.6, 0.6, '7d', []);
+      pred.id = `${domain}-${region}`;
+      pred.resolution = { kind: 'judged' };
+      return attachPublishSelectionContext(pred, {
+        priority, stateId, situationId: `sit-${stateId}`, familyId: stateId === 'S1' ? 'F1' : `fam-${region}`,
+      });
+    });
+    candidates.at(-1).marketSelectionContext = { confirmationScore: 0.6, transmissionEdgeCount: 2 };
+    const pool = selectPublishedForecastPool(candidates, { targetCount: 8 });
+    assert.equal(pool.length, 8);
+    assert.deepEqual([...new Set(pool.map(pred => pred.stateContext.id))].sort(), ['S1', 'S2', 'S3', 'S4', 'S5', 'S6', 'S7']);
+    assert.deepEqual([...new Set(pool.map(pred => pred.domain))].sort(), ['conflict', 'cyber', 'market', 'political', 'supply_chain']);
+  });
+
+  it('backfills an absent real judged domain before a represented hard forecast, ignoring synthetic absent domains', () => {
+    const supply = { id: 'supply', domain: 'supply_chain', probability: 0.7, resolution: { kind: 'hard' } };
+    const syntheticCyber = { id: 'synthetic-cyber', domain: 'cyber', probability: 0.7, generationOrigin: 'state_derived', resolution: { kind: 'judged' } };
+    const cyber = { id: 'cyber', domain: 'cyber', probability: 0.5, resolution: { kind: 'judged' } };
+    const deferred = [supply, syntheticCyber, cyber];
+    const selected = selectDeferredForecastForPublishBackfill(deferred, [
+      { id: 'published-supply', domain: 'supply_chain', resolution: { kind: 'judged' } },
+    ], 3);
+    assert.equal(selected.id, 'cyber');
+    assert.deepEqual(deferred.map(pred => pred.id), ['supply', 'synthetic-cyber']);
+  });
+
+  it('does not let a synthetic same-domain hard forecast replace a sole real representative', () => {
+    const candidates = [
+      ['cyber', 'judged', 0.9, undefined], ['market', 'hard', 0.8, undefined], ['cyber', 'hard', 0.01, 'state_derived'],
+    ].map(([domain, kind, priority, generationOrigin], index) => {
+      const pred = makePrediction(domain, `Region ${index}`, `Outlook ${index}`, 0.6, 0.6, '7d', []);
+      pred.id = `swap-${index}`;
+      pred.resolution = { kind };
+      if (generationOrigin) pred.generationOrigin = generationOrigin;
+      return attachPublishSelectionContext(pred, { priority });
+    });
+    const pool = selectPublishedForecastPool(candidates, { targetCount: 2 });
+    assert.deepEqual(pool.map(pred => pred.id).sort(), ['swap-0', 'swap-1']);
+  });
+
+  it('lets a strategic supply-chain hard forecast replace the sole strategic supply-chain representative', () => {
+    const candidates = [
+      ['supply_chain', 'judged', 0.9], ['market', 'hard', 0.8], ['supply_chain', 'hard', 0.01],
+    ].map(([domain, kind, priority], index) => {
+      const pred = makePrediction(domain, `Region ${index}`, `Outlook ${index}`, 0.6, 0.6, '7d', []);
+      pred.id = `strategic-${index}`;
+      pred.resolution = { kind };
+      return attachPublishSelectionContext(pred, { priority, stateKind: domain === 'supply_chain' ? 'maritime_disruption' : '' });
+    });
+    const pool = selectPublishedForecastPool(candidates, { targetCount: 2 });
+    assert.deepEqual(pool.map(pred => pred.id).sort(), ['strategic-1', 'strategic-2']);
   });
 
   it('rebalances the freshest selected snapshot to >=80% hard when hard supply exists', () => {
