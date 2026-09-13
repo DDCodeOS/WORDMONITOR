@@ -16,6 +16,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
+import Anthropic from '@anthropic-ai/sdk';
 import widgetResponseParser from '../scripts/_widget-response-parser.cjs';
 
 const { parseWidgetAgentResponse } = widgetResponseParser;
@@ -26,6 +27,262 @@ const root = resolve(__dirname, '..');
 function src(relPath) {
   return readFileSync(resolve(root, relPath), 'utf-8');
 }
+
+// Execute the production handler without the relay's unconditional server startup.
+// Only the SDK import is substituted; requests, tool results and SSE use real code.
+async function runWidgetAgent(responses, { tier = 'basic', failFetch = false, failSearch = false, sdkTransport = false, expireDuringFetch = false } = {}) {
+  const relay = src('scripts/ais-relay.cjs');
+  const extract = name => {
+    const match = relay.match(new RegExp(`(?:async )?function ${name}\\([^]*?\\n\\}`));
+    assert.ok(match, `Missing relay function ${name}`);
+    return match[0];
+  };
+  const requests = [], effects = [], logs = [], frames = [];
+  let ended = 0;
+  let expire;
+  const nextResponse = request => {
+    requests.push(structuredClone(request));
+    const response = responses[requests.length - 1];
+    assert.ok(response, 'Unexpected extra model request');
+    if (response instanceof Error) throw response;
+    return structuredClone(response);
+  };
+  const context = {
+    URL, AbortSignal, clearTimeout, parseWidgetAgentResponse,
+    setTimeout: (callback, ms) => { expire = callback; return setTimeout(callback, ms); },
+    console: { error: (...args) => logs.push(args) },
+    requireWidgetAgentAccess: () => ({ anthropicConfigured: true, admittedAs: tier }),
+    readRequestBody: async () => JSON.stringify({ prompt: 'Show earthquake data', tier }),
+    checkProWidgetRateLimit: () => false, checkWidgetRateLimit: () => false,
+    isWidgetInjectionAttempt: () => false,
+    PRO_WIDGET_KEY: 'test', WIDGET_ANTHROPIC_KEY: 'test',
+    WIDGET_PRO_MAX_HTML: 100000, WIDGET_MAX_HTML: 50000,
+    WIDGET_PRO_SYSTEM_PROMPT: 'test', WIDGET_SYSTEM_PROMPT: 'test',
+    WIDGET_FETCH_TOOL: { name: 'fetch_worldmonitor_data' }, WIDGET_SEARCH_TOOL: { name: 'search_web' },
+    isWidgetEndpointAllowed: endpoint => endpoint === '/api/test',
+    performWidgetWebSearch: async query => {
+      effects.push(`search:${query}`);
+      if (failSearch) throw new Error('Search fixture failure');
+      return { results: [{ title: 'Fixture' }] };
+    },
+    fetch: async url => {
+      effects.push(url);
+      if (expireDuringFetch) expire();
+      if (failFetch) throw new Error('Fetch fixture failure');
+      return { text: async () => '{"value":42}' };
+    },
+    importAnthropic: async () => ({ default: sdkTransport ? class extends Anthropic {
+      constructor(options) {
+        super({ ...options, maxRetries: 0, fetch: async (_url, init) => new Response(JSON.stringify({
+          id: 'msg_fixture', type: 'message', role: 'assistant', model: 'fixture',
+          usage: { input_tokens: 1, output_tokens: 1 }, stop_sequence: null,
+          ...nextResponse(JSON.parse(init.body)),
+        }), { headers: { 'Content-Type': 'application/json' } }) });
+      }
+    } : class {
+      messages = { create: async request => {
+        return nextResponse(request);
+      } };
+    } }),
+  };
+  // Include production constants when present, so tests also run against the old loop.
+  const limit = relay.match(/const WIDGET_MAX_TOOL_CALLS = \d+;/)?.[0] ?? '';
+  const handler = extract('handleWidgetAgentRequest').replace("import('@anthropic-ai/sdk')", 'importAnthropic()');
+  const run = vm.runInNewContext(`${limit}\n${extract('sendWidgetSSE')}\n${extract('sanitizeToolContent')}\n${extract('classifyWidgetAgentError')}\n${handler}\nhandleWidgetAgentRequest`, context);
+  const res = {
+    writableEnded: false, writeHead() {},
+    write(frame) { frames.push(frame); },
+    end() { ended++; this.writableEnded = true; },
+  };
+  await run({ headers: {}, on() {}, socket: {} }, res);
+  const events = frames.map(frame => JSON.parse(frame.match(/data: (.*)/)[1]));
+  return { requests, effects, logs, events, ended };
+}
+
+const widgetText = '<!-- title: Quakes --><!-- widget-html --><div>42</div><!-- /widget-html -->';
+const widgetResponse = (stop_reason, content = [{ type: 'text', text: widgetText }]) => ({ stop_reason, content });
+const widgetTool = (id, name = 'fetch_worldmonitor_data', input = { endpoint: '/api/test' }) => ({ type: 'tool_use', id, name, input });
+const toolResultsFor = request => request.messages.flatMap(m => Array.isArray(m.content) ? m.content.filter(b => b.type === 'tool_result') : []);
+function assertWidgetSuccess(result) {
+  assert.deepEqual(result.events.filter(e => ['html_complete', 'done', 'error'].includes(e.type)).map(e => e.type), ['html_complete', 'done']);
+  assert.equal(result.ended, 1);
+}
+function assertWidgetError(result, pattern) {
+  const terminal = result.events.filter(e => ['html_complete', 'done', 'error'].includes(e.type));
+  assert.equal(terminal.length, 1);
+  assert.equal(terminal[0].type, 'error');
+  assert.match(terminal[0].message, pattern);
+  assert.equal(result.ended, 1);
+}
+
+describe('widget-agent relay — runtime tool budget and finalization', () => {
+  it('executes only three of four calls in one response and returns every tool result', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('tool_use', [1, 2, 3, 4].map(n => widgetTool(String(n)))), widgetResponse('end_turn'),
+    ]);
+    assert.equal(result.effects.length, 3);
+    const results = toolResultsFor(result.requests[1]);
+    assert.deepEqual(results.map(r => r.tool_use_id), ['1', '2', '3', '4']);
+    assert.equal(results[3].is_error, true);
+    assert.match(results[3].content, /budget.*exhausted/i);
+    assert.equal(result.requests[1].tools.length, 0);
+    assertWidgetSuccess(result);
+  });
+
+  it('shares the budget across responses and both tools', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('tool_use', [widgetTool('1'), widgetTool('2', 'search_web', { query: 'quakes' })]),
+      widgetResponse('tool_use', [widgetTool('3', 'search_web', { query: 'today' }), widgetTool('4')]),
+      widgetResponse('end_turn'),
+    ]);
+    assert.equal(result.effects.length, 3);
+    assert.equal(result.effects.filter(e => e.startsWith('search:')).length, 2);
+    assert.equal(toolResultsFor(result.requests[2]).at(-1).is_error, true);
+    assertWidgetSuccess(result);
+  });
+
+  it('counts rejected, failed and unknown attempts without allowing extra probing', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('tool_use', [widgetTool('1', 'fetch_worldmonitor_data', { endpoint: '/blocked' }), widgetTool('2'), widgetTool('3', 'search_web', { query: 'fail' }), widgetTool('4', 'unknown'), widgetTool('5')]),
+      widgetResponse('end_turn'),
+    ], { failFetch: true, failSearch: true });
+    assert.equal(result.effects.length, 2);
+    const results = toolResultsFor(result.requests[1]);
+    assert.equal(results.length, 5);
+    assert.ok(results.every(r => r.is_error === true));
+    assertWidgetSuccess(result);
+  });
+
+  it('returns an error result for unknown tools and counts their attempts', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('tool_use', [widgetTool('1', 'unknown'), widgetTool('2'), widgetTool('3'), widgetTool('4')]), widgetResponse('end_turn'),
+    ]);
+    assert.equal(result.effects.length, 2);
+    assert.match(toolResultsFor(result.requests[1])[0].content, /unknown tool/i);
+    assertWidgetSuccess(result);
+  });
+
+  for (const tier of ['basic', 'pro']) {
+    const maxTurns = tier === 'pro' ? 10 : 6;
+    it(`${tier}: penultimate truncation preserves partial output and never restores tools`, async () => {
+      const partial = [{ type: 'text', text: '<!-- widget-html --><div>partial' }];
+      const result = await runWidgetAgent([
+        ...Array.from({ length: maxTurns - 2 }, () => widgetResponse('pause_turn')),
+        widgetResponse('max_tokens', partial), widgetResponse('end_turn'),
+      ], { tier });
+      assert.deepEqual(result.requests.slice(-2).map(r => r.tools.length), [0, 0]);
+      assert.ok(result.requests.at(-1).messages.some(m => m.role === 'assistant' && Array.isArray(m.content) && m.content[0]?.text === partial[0].text));
+      assertWidgetSuccess(result);
+    });
+    it(`${tier}: pause_turn stays bounded and exhaustion cannot recover old history as success`, async () => {
+      const result = await runWidgetAgent(Array.from({ length: maxTurns }, () => widgetResponse('pause_turn')), { tier });
+      assert.equal(result.requests.length, maxTurns);
+      assert.ok(result.requests.slice(1).every(r => r.tools.length === 0));
+      assertWidgetError(result, /exhausted/i);
+    });
+  }
+
+  it('does not execute tool requests after entering finalization', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('pause_turn'), widgetResponse('tool_use', [widgetTool('1')]), widgetResponse('end_turn'),
+    ]);
+    assert.equal(result.effects.length, 0);
+    assert.ok(result.requests.slice(1).every(r => r.tools.length === 0));
+    assert.equal(toolResultsFor(result.requests[2])[0].is_error, true);
+    assertWidgetSuccess(result);
+  });
+
+  it('rejects a second truncation with one terminal error', async () => {
+    const result = await runWidgetAgent([widgetResponse('max_tokens'), widgetResponse('max_tokens')]);
+    assert.equal(result.requests.length, 2);
+    assertWidgetError(result, /truncat|token limit/i);
+  });
+
+  it('returns errors for truncated tool blocks without executing them', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('max_tokens', [widgetTool('partial', 'fetch_worldmonitor_data', {})]), widgetResponse('end_turn'),
+    ]);
+    assert.equal(result.effects.length, 0);
+    assert.equal(toolResultsFor(result.requests[1])[0].is_error, true);
+    assertWidgetSuccess(result);
+  });
+
+  it('malformed input still consumes an attempt and receives a result', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('tool_use', [widgetTool('1', 'search_web', null), widgetTool('2'), widgetTool('3'), widgetTool('4')]), widgetResponse('end_turn'),
+    ]);
+    assert.equal(result.effects.length, 2);
+    const results = toolResultsFor(result.requests[1]);
+    assert.equal(results.length, 4);
+    assert.equal(results[0].is_error, true);
+    assert.equal(results[3].is_error, true);
+    assertWidgetSuccess(result);
+  });
+
+  it('invalid search query cannot interrupt results for later tool blocks', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('tool_use', [widgetTool('1', 'search_web', { query: { toString: 'invalid' } }), widgetTool('2')]), widgetResponse('end_turn'),
+    ]);
+    assert.equal(result.effects.length, 1);
+    assert.equal(toolResultsFor(result.requests[1]).length, 2);
+    assert.equal(toolResultsFor(result.requests[1])[0].is_error, true);
+    assertWidgetSuccess(result);
+  });
+
+  it('rejects a tool_use stop without any tool blocks', async () => {
+    const result = await runWidgetAgent([widgetResponse('tool_use', [])]);
+    assert.equal(result.requests.length, 1);
+    assertWidgetError(result, /incomplete.*tool/i);
+  });
+
+  it('records requested and executed counts without logging SDK response bodies or secrets', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('tool_use', [1, 2, 3, 4].map(n => widgetTool(String(n)))),
+      new Error('private prompt and sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'),
+    ]);
+    const log = JSON.parse(result.logs.find(args => args[0] === '[widget-agent] Error:')[1]);
+    assert.equal(log.toolCallCount, 4);
+    assert.equal(log.toolExecutionCount, 3);
+    assert.doesNotMatch(JSON.stringify(result.logs), /private prompt|sk-ant-api03/);
+    assertWidgetError(result, /private prompt/);
+  });
+
+  it('stops side effects at the deadline and emits exactly one terminal error', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('tool_use', [widgetTool('1'), widgetTool('2')]),
+    ], { expireDuringFetch: true });
+    assert.equal(result.effects.length, 1);
+    assert.equal(result.requests.length, 1);
+    assertWidgetError(result, /timeout/i);
+  });
+
+  it('serializes the capped tool exchange and finalization through the installed SDK', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('tool_use', [1, 2, 3, 4].map(n => widgetTool(String(n)))), widgetResponse('end_turn'),
+    ], { sdkTransport: true });
+    assert.equal(result.effects.length, 3);
+    assert.equal(result.requests[1].tools.length, 0);
+    assert.equal(toolResultsFor(result.requests[1]).length, 4);
+    assert.equal(toolResultsFor(result.requests[1])[3].is_error, true);
+    assertWidgetSuccess(result);
+  });
+
+  for (const reason of ['refusal', 'stop_sequence', null, 'unexpected']) {
+    it(`terminates explicitly on ${reason}`, async () => {
+      const result = await runWidgetAgent([widgetResponse(reason)]);
+      assert.equal(result.requests.length, 1);
+      assertWidgetError(result, /refus|stop|incomplete/i);
+    });
+  }
+  for (const calls of [[], [widgetTool('1')]]) {
+    it(`preserves successful ${calls.length}-call generation`, async () => {
+      const result = await runWidgetAgent([...(calls.length ? [widgetResponse('tool_use', calls)] : []), widgetResponse('end_turn')]);
+      assertWidgetSuccess(result);
+      assert.equal(result.effects.length, calls.length);
+      assert.equal(result.events.find(e => e.type === 'html_complete').html, '<div>42</div>');
+    });
+  }
+});
 
 // ---------------------------------------------------------------------------
 // 1. Relay security
@@ -385,9 +642,9 @@ describe('widget-store — constants and logic', () => {
 describe('widget-agent relay — response parsing', () => {
   const relay = src('scripts/ais-relay.cjs');
 
-  it('relay delegates completed and recovered responses to the shared parser', () => {
+  it('relay delegates completed responses to the shared parser', () => {
     const calls = relay.match(/parseWidgetAgentResponse\(/g) ?? [];
-    assert.equal(calls.length, 2);
+    assert.equal(calls.length, 1);
   });
 
   it('parses hyphenated titles through the production parser', () => {
