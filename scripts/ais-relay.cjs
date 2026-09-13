@@ -13751,7 +13751,11 @@ async function handleWidgetAgentRequest(req, res) {
       if (response.stop_reason === 'end_turn') {
         const textBlock = response.content.find(b => b.type === 'text');
         const text = textBlock?.text ?? '';
-        const { html, title } = parseWidgetAgentResponse(text, maxHtml);
+        const { html, title, isComplete } = parseWidgetAgentResponse(text, maxHtml);
+        if (!isComplete) {
+          sendWidgetSSE(res, 'error', { message: 'Widget generation incomplete: expected nonempty HTML inside complete widget-html markers.' });
+          return;
+        }
         sendWidgetSSE(res, 'html_complete', { html });
         sendWidgetSSE(res, 'done', { title });
         completed = true;
@@ -13823,7 +13827,7 @@ async function handleWidgetAgentRequest(req, res) {
           ? msg.content.filter(b => b.type === 'text').map(b => b.text).join('')
           : String(msg.content ?? '');
         const parsed = parseWidgetAgentResponse(text, maxHtml);
-        if (parsed.hasHtmlMarkers && parsed.html.trim()) {
+        if (parsed.isComplete) {
           sendWidgetSSE(res, 'html_complete', { html: parsed.html });
           sendWidgetSSE(res, 'done', { title: parsed.title });
           recovered = true;

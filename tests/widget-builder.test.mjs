@@ -416,12 +416,104 @@ describe('widget-agent relay — response parsing', () => {
     assert.ok(!result.html.includes('widget-html'));
   });
 
-  it('falls back to full text when HTML markers are missing', () => {
+  it('does not expose unmarked text as completed HTML', () => {
     const text = '<div>fallback</div>';
     const result = parseWidgetAgentResponse(text, 50_000);
     assert.equal(result.hasHtmlMarkers, false);
-    assert.equal(result.html, text);
+    assert.equal(result.html, '');
+    assert.equal(result.isComplete, false);
   });
+});
+
+describe('widget-agent relay — completion contract', () => {
+  const relay = src('scripts/ais-relay.cjs');
+  // Exercise the production handler without starting the relay's background workers.
+  // Only the SDK import and external request dependencies are replaced.
+  const handler = relay.slice(
+    relay.indexOf('async function handleWidgetAgentRequest('),
+    relay.indexOf('// Map a thrown error from the agent loop'),
+  ).replace("await import('@anthropic-ai/sdk')", '({ default: AnthropicStub })');
+  const sendSSE = relay.slice(relay.indexOf('function sendWidgetSSE('), relay.indexOf('async function readRequestBody('));
+
+  async function runResponse(tier, text, recovery = false) {
+    let calls = 0;
+    let ends = 0;
+    const chunks = [];
+    const context = {
+      parseWidgetAgentResponse,
+      requireWidgetAgentAccess: () => ({ anthropicConfigured: true, admittedAs: tier }),
+      readRequestBody: async () => JSON.stringify({ prompt: 'Show market data', tier }),
+      PRO_WIDGET_KEY: 'test-pro-key',
+      checkProWidgetRateLimit: () => false,
+      checkWidgetRateLimit: () => false,
+      isWidgetInjectionAttempt: () => false,
+      WIDGET_PRO_MAX_HTML: 100_000,
+      WIDGET_MAX_HTML: 50_000,
+      WIDGET_PRO_SYSTEM_PROMPT: 'pro prompt',
+      WIDGET_SYSTEM_PROMPT: 'basic prompt',
+      WIDGET_ANTHROPIC_KEY: 'test-key',
+      WIDGET_FETCH_TOOL: {},
+      WIDGET_SEARCH_TOOL: {},
+      setTimeout,
+      clearTimeout,
+      console,
+      AnthropicStub: class {
+        messages = {
+          create: async () => {
+            calls++;
+            assert.ok(calls <= 10, 'generation must remain bounded');
+            return {
+              stop_reason: recovery ? 'tool_use' : 'end_turn',
+              content: [{ type: 'text', text }],
+            };
+          },
+        };
+      },
+    };
+    const res = {
+      writableEnded: false,
+      writeHead(status) { assert.equal(status, 200); },
+      write(chunk) { chunks.push(chunk); },
+      end() { this.writableEnded = true; ends++; },
+    };
+    vm.runInNewContext(`${sendSSE}\n${handler}\nthis.run = handleWidgetAgentRequest;`, context);
+    await context.run({ headers: {}, on() {} }, res);
+    assert.equal(ends, 1, 'stream must end exactly once');
+    if (!recovery) assert.equal(calls, 1, 'invalid completion must not retry');
+    return chunks.flatMap(chunk => chunk.split('\n').filter(line => line.startsWith('data: ')))
+      .map(line => JSON.parse(line.slice(6)));
+  }
+
+  const invalidCases = [
+    ['plain prose', 'plain prose'],
+    ['markdown', '```html\n<div>Unmarked</div>\n```'],
+    ['empty response', ''],
+    ['empty markers', '<!-- widget-html --><!-- /widget-html -->'],
+    ['whitespace markers', '<!-- widget-html --> \n\t <!-- /widget-html -->'],
+    ['unclosed markers', '<!-- widget-html --><div>Incomplete</div>'],
+  ];
+  for (const tier of ['basic', 'pro']) {
+    for (const recovery of [false, true]) {
+      const path = `${tier} ${recovery ? 'mid-loop recovery' : 'end_turn'}`;
+      for (const [name, text] of invalidCases) {
+        it(`${path}: rejects ${name} with one terminal error`, async () => {
+          const events = await runResponse(tier, text, recovery);
+          assert.deepEqual(events.map(event => event.type), ['error']);
+          assert.match(events[0].message, /Widget generation (?:incomplete|invalid)/);
+        });
+      }
+      for (const title of ['Market-Tracker', null]) {
+        it(`${path}: accepts marked HTML ${title ? 'with a title' : 'with the fallback title'}`, async () => {
+          const html = tier === 'pro' ? '<div>Chart</div><script>renderChart()</script>' : '<div>Market</div>';
+          const text = `Outside text\n${title ? `<!-- title: ${title} -->` : ''}<!-- widget-html -->${html}<!-- /widget-html -->\nMore text`;
+          assert.deepEqual(await runResponse(tier, text, recovery), [
+            { type: 'html_complete', html },
+            { type: 'done', title: title ?? 'Custom Widget' },
+          ]);
+        });
+      }
+    }
+  }
 });
 
 // ---------------------------------------------------------------------------
