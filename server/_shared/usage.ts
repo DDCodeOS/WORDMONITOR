@@ -99,6 +99,7 @@ export type RequestReason =
   // identical. Split, a week of rows names the cause.
   | 'internal_mcp_no_user'
   | 'internal_mcp_malformed_sig'
+  | 'internal_mcp_bad_nonce'
   | 'internal_mcp_ts_window'
   | 'internal_mcp_bad_request'
   | 'internal_mcp_sig_mismatch'

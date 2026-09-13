@@ -177,6 +177,7 @@ function internalMcpReasonFor(failure: InternalMcpVerifyFailure): RequestReason 
     case 'no_user_id': return 'internal_mcp_no_user';
     case 'missing_signature':
     case 'malformed_signature': return 'internal_mcp_malformed_sig';
+    case 'invalid_nonce': return 'internal_mcp_bad_nonce';
     case 'timestamp_window': return 'internal_mcp_ts_window';
     case 'malformed_request': return 'internal_mcp_bad_request';
     case 'signature_mismatch': return 'internal_mcp_sig_mismatch';

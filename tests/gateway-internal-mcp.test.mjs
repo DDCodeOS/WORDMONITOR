@@ -918,6 +918,7 @@ describe('gateway internal-MCP HMAC verify — error paths', () => {
         'Content-Type': 'application/json',
         [INTERNAL_MCP_SIG_HEADER]: 'notanumber.AAAA',
         [INTERNAL_MCP_USER_ID_HEADER]: PRO_USER_ID,
+        [INTERNAL_MCP_NONCE_HEADER]: 'malformed_signature_nonce',
       },
       body: JSON.stringify({ x: 1 }),
     });
@@ -1014,6 +1015,7 @@ describe('gateway internal-MCP — usage telemetry reasons', () => {
         'Content-Type': 'application/json',
         [INTERNAL_MCP_SIG_HEADER]: 'notanumber.AAAA',
         [INTERNAL_MCP_USER_ID_HEADER]: PRO_USER_ID,
+        [INTERNAL_MCP_NONCE_HEADER]: 'malformed_signature_nonce',
       },
       body: JSON.stringify({ x: 1 }),
     });
@@ -1439,6 +1441,13 @@ describe('gateway internal-MCP HMAC verify — failure-mode telemetry', () => {
         extraHeaders: { [INTERNAL_MCP_SIG_HEADER]: 'not-a-dot-separated-signature' },
       }));
     }
+    if (mode === 'missing_nonce' || mode === 'invalid_nonce') {
+      const signedReq = await buildSignedRequest({ url: URL_UNDER_TEST });
+      const headers = new Headers(signedReq.headers);
+      if (mode === 'missing_nonce') headers.delete(INTERNAL_MCP_NONCE_HEADER);
+      else headers.set(INTERNAL_MCP_NONCE_HEADER, 'invalid-nonce!');
+      return send(new Request(URL_UNDER_TEST, { method: 'POST', headers, body: BODY }));
+    }
     if (mode === 'ts_window') {
       // Signed well outside the ±30s acceptance span.
       const staleNow = Math.floor(Date.now() / 1000) - 600;
@@ -1477,6 +1486,8 @@ describe('gateway internal-MCP HMAC verify — failure-mode telemetry', () => {
   const MODES = [
     ['no_user', 'internal_mcp_no_user'],
     ['malformed_sig', 'internal_mcp_malformed_sig'],
+    ['missing_nonce', 'internal_mcp_bad_nonce'],
+    ['invalid_nonce', 'internal_mcp_bad_nonce'],
     ['ts_window', 'internal_mcp_ts_window'],
     ['sig_mismatch', 'internal_mcp_sig_mismatch'],
     ['bad_request', 'internal_mcp_bad_request'],
@@ -1504,7 +1515,7 @@ describe('gateway internal-MCP HMAC verify — failure-mode telemetry', () => {
         contentType: res.headers.get('Content-Type'),
         // Anything that varies per mode would be the oracle, including a
         // header a future branch adds only to one path.
-        headerNames: [...res.headers.keys()].sort().join(','),
+        headers: [...res.headers.entries()].sort(([a], [b]) => a.localeCompare(b)),
       });
     }
     const [first, ...rest] = seen;
@@ -1513,7 +1524,7 @@ describe('gateway internal-MCP HMAC verify — failure-mode telemetry', () => {
       assert.equal(other.status, first.status, `${other.mode} status must match ${first.mode}`);
       assert.equal(other.body, first.body, `${other.mode} body must match ${first.mode}`);
       assert.equal(other.contentType, first.contentType, `${other.mode} content-type must match ${first.mode}`);
-      assert.equal(other.headerNames, first.headerNames, `${other.mode} header set must match ${first.mode}`);
+      assert.deepEqual(other.headers, first.headers, `${other.mode} headers must match ${first.mode}`);
     }
   });
 
@@ -1523,6 +1534,7 @@ describe('gateway internal-MCP HMAC verify — failure-mode telemetry', () => {
       await runMode(mode);
       reasons.push(lastRequestEvent()?.reason);
     }
-    assert.equal(new Set(reasons).size, MODES.length, `reasons collapsed: ${reasons.join(', ')}`);
+    const expectedReasons = new Set(MODES.map(([, reason]) => reason));
+    assert.equal(new Set(reasons).size, expectedReasons.size, `reasons collapsed: ${reasons.join(', ')}`);
   });
 });

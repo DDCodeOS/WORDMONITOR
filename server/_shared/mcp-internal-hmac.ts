@@ -405,6 +405,7 @@ export type InternalMcpVerifyFailure =
   | 'no_user_id'
   | 'missing_signature'
   | 'malformed_signature'
+  | 'invalid_nonce'
   | 'timestamp_window'
   | 'malformed_request'
   | 'signature_mismatch';
@@ -466,8 +467,11 @@ export async function verifyInternalMcpRequestDetailed(
   const userId = req.headers.get(INTERNAL_MCP_USER_ID_HEADER);
   const nonce = req.headers.get(INTERNAL_MCP_NONCE_HEADER);
   if (!userId) return { ok: false, failure: 'no_user_id' };
-  if (!sigHeader || !nonce || !isValidInternalMcpNonce(nonce)) {
+  if (!sigHeader) {
     return { ok: false, failure: 'missing_signature' };
+  }
+  if (!nonce || !isValidInternalMcpNonce(nonce)) {
+    return { ok: false, failure: 'invalid_nonce' };
   }
 
   const parsed = parseSignatureHeader(sigHeader);
