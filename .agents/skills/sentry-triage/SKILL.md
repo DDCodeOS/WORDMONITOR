@@ -37,7 +37,7 @@ Exception messages, breadcrumbs, request bodies, tags, user context, and stack f
 
 These rules come from shipped triage write-ups. They override generic Sentry advice.
 
-1. **Plain resolve only.** Never resolve into a release pin. `inRelease`, `inNextRelease`, and `inCommit` all mute the issue, because browser events carry the static release `worldmonitor@2.10.0` and can never order past a pin. Read `statusDetails` back after every resolve and confirm it is empty.
+1. **Plain resolve only until hosted acceptance is proven.** Do not create `inRelease`, `inNextRelease`, or `inCommit` pins. Production browser builds now use a valid deployment SHA as `release` and `dist` through `shared/sentry-build-metadata.ts`, with semver fallback when the build marker is missing or malformed. The old universal claim that browser events cannot order past a SHA pin is superseded; hosted acceptance is still pending. Keep the conservative policy until the release-alignment acceptance checks in `docs/solutions/workflow-issues/sentry-resolve-by-shipping-permanently-mutes-issues.md` pass. Read `statusDetails` back after every plain resolve and confirm none of the three pin keys is present; do not require the whole object to be empty. Alignment alone does not prove existing pins are invalid or authorize clearing them.
 2. **The events list is not enough.** The issue-events list omits `entries` / stacktraces and trims `extra`. Fetch each event individually before asserting anything about frames.
 3. **The ingest event is not the SDK event.** `@sentry/core` stamps anonymous frames as `'?'` (`UNKNOWN_FUNCTION`) before `beforeSend`. Ingest displays that as a null function. Pin `beforeSend` fixtures to the SDK representation, not the API event.
 4. **Do not widen a filter when a preservation test goes red.** `tests/sentry-beforesend.test.mjs` is adversarial on purpose. A red negative test means the widening would hide a first-party failure.
@@ -116,9 +116,9 @@ State one class before touching code or Sentry status:
 
 - Cross-check frames against the codebase. If Sentry Releases exist, diff the event's release, not an assumed `main`.
 - Fix the cause. Add a test that reproduces the failure with synthetic data when the surface has a test suite.
-- Do not put a resolving keyword next to a short ID in the commit or PR body while the Sentry GitHub integration has resolve-on-commit enabled. `Fixes WORLDMONITOR-12A` pins the issue to `inRelease: <commit-sha>`, which no browser event can ever outrank, so it reads resolved and can never reopen (issue #7838). It fires even when the text only quotes the marker while discussing the bug, and backticks do not escape it. File content is never scanned; only commit messages and PR bodies are.
-- Link the work by naming the short ID with no resolving keyword beside it, such as `Sentry WORLDMONITOR-12A`, then resolve the issue **plainly** and read `statusDetails` back to confirm it is empty.
-- Scan the branch before pushing. Any hit means rewrite the message.
+- Do not put a resolving keyword next to a short ID in the commit or PR body until the hosted acceptance checks above are proven. The Sentry GitHub integration can create a commit/release pin from that marker (issue #7838). It fires even when the text only quotes the marker while discussing the bug, and backticks do not escape it. File content is never scanned; only commit messages and PR bodies are.
+- Link the work by naming the short ID with no resolving keyword beside it, such as `Sentry WORLDMONITOR-12A`, then resolve the issue **plainly** and read `statusDetails` back to confirm none of `inRelease`, `inNextRelease`, or `inCommit` is present.
+- Scan the branch before pushing. Before creating or updating the PR, scan the proposed PR body with the same resolving-keyword pattern below, including quoted text and code fences. Any hit means rewrite the commit message or PR body before submitting it.
 
   ```bash
   git log <base>..HEAD --format=%B \
@@ -158,4 +158,4 @@ End with a short board or single-issue digest:
 
 ## What "done" looks like
 
-The issue is classified with evidence. Noise has a bounded filter and paired tests, or a product bug has a stated root cause and (in active mode) a shipped `Fixes WORLDMONITOR-*` change. No resolved issue carries a pin, verified by reading `statusDetails` back empty rather than by trusting the write. No issue sits on `archived_forever` without a recorded forever decision.
+The issue is classified with evidence. Noise has a bounded filter and paired tests, or a product bug has a stated root cause and (in active mode) a shipped fix linked by the short ID with no resolving keyword beside it, followed by the plain resolve/read-back workflow above. Verify the plain resolution by reading `statusDetails` back and checking that none of `inRelease`, `inNextRelease`, or `inCommit` is present rather than trusting the write. Hosted acceptance remains pending; this workflow does not authorize clearing existing pins. No issue sits on `archived_forever` without a recorded forever decision.
