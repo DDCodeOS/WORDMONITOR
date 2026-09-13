@@ -584,7 +584,7 @@ describe('widget-agent relay — completion contract', () => {
   ).replace("await import('@anthropic-ai/sdk')", '({ default: AnthropicStub })');
   const sendSSE = relay.slice(relay.indexOf('function sendWidgetSSE('), relay.indexOf('async function readRequestBody('));
 
-  async function runResponse(tier, text, recovery = false) {
+  async function runResponse(tier, responses) {
     let calls = 0;
     let ends = 0;
     const chunks = [];
@@ -603,6 +603,7 @@ describe('widget-agent relay — completion contract', () => {
       WIDGET_ANTHROPIC_KEY: 'test-key',
       WIDGET_FETCH_TOOL: {},
       WIDGET_SEARCH_TOOL: {},
+      performWidgetWebSearch: async () => null,
       setTimeout,
       clearTimeout,
       console,
@@ -610,11 +611,8 @@ describe('widget-agent relay — completion contract', () => {
         messages = {
           create: async () => {
             calls++;
-            assert.ok(calls <= 10, 'generation must remain bounded');
-            return {
-              stop_reason: recovery ? 'tool_use' : 'end_turn',
-              content: [{ type: 'text', text }],
-            };
+            assert.ok(calls <= responses.length, 'generation must not request another response');
+            return responses[calls - 1];
           },
         };
       },
@@ -628,7 +626,7 @@ describe('widget-agent relay — completion contract', () => {
     vm.runInNewContext(`${sendSSE}\n${handler}\nthis.run = handleWidgetAgentRequest;`, context);
     await context.run({ headers: {}, on() {} }, res);
     assert.equal(ends, 1, 'stream must end exactly once');
-    if (!recovery) assert.equal(calls, 1, 'invalid completion must not retry');
+    assert.equal(calls, responses.length, 'generation must consume the expected responses');
     return chunks.flatMap(chunk => chunk.split('\n').filter(line => line.startsWith('data: ')))
       .map(line => JSON.parse(line.slice(6)));
   }
@@ -644,9 +642,13 @@ describe('widget-agent relay — completion contract', () => {
   for (const tier of ['basic', 'pro']) {
     for (const recovery of [false, true]) {
       const path = `${tier} ${recovery ? 'mid-loop recovery' : 'end_turn'}`;
+      const responses = text => Array.from({ length: recovery ? (tier === 'pro' ? 10 : 6) : 1 }, () => ({
+        stop_reason: recovery ? 'tool_use' : 'end_turn',
+        content: [{ type: 'text', text }],
+      }));
       for (const [name, text] of invalidCases) {
         it(`${path}: rejects ${name} with one terminal error`, async () => {
-          const events = await runResponse(tier, text, recovery);
+          const events = await runResponse(tier, responses(text));
           assert.deepEqual(events.map(event => event.type), ['error']);
           assert.match(events[0].message, /Widget generation (?:incomplete|invalid)/);
         });
@@ -655,10 +657,34 @@ describe('widget-agent relay — completion contract', () => {
         it(`${path}: accepts marked HTML ${title ? 'with a title' : 'with the fallback title'}`, async () => {
           const html = tier === 'pro' ? '<div>Chart</div><script>renderChart()</script>' : '<div>Market</div>';
           const text = `Outside text\n${title ? `<!-- title: ${title} -->` : ''}<!-- widget-html -->${html}<!-- /widget-html -->\nMore text`;
-          assert.deepEqual(await runResponse(tier, text, recovery), [
+          assert.deepEqual(await runResponse(tier, responses(text)), [
             { type: 'html_complete', html },
             { type: 'done', title: title ?? 'Custom Widget' },
           ]);
+        });
+      }
+    }
+    for (const finalText of ['', '<!-- widget-html --><div>Unfinished</div>']) {
+      for (const recoverable of [true, false]) {
+        it(`${tier}: ${recoverable ? 'recovers earlier HTML' : 'errors once without valid earlier HTML'} after ${finalText ? 'malformed' : 'empty'} end_turn`, async () => {
+          const html = '<div>Earlier result</div>';
+          const events = await runResponse(tier, [
+            {
+              stop_reason: 'tool_use',
+              content: [
+                { type: 'text', text: recoverable ? `<!-- title: Earlier --><!-- widget-html -->${html}<!-- /widget-html -->` : '<!-- widget-html --> <!-- /widget-html -->' },
+                { type: 'tool_use', id: 'search-1', name: 'search_web', input: { query: 'market data' } },
+              ],
+            },
+            { stop_reason: 'end_turn', content: finalText ? [{ type: 'text', text: finalText }] : [] },
+          ]);
+          assert.deepEqual(events[0], { type: 'tool_call', endpoint: 'search:market data' });
+          if (recoverable) {
+            assert.deepEqual(events.slice(1), [{ type: 'html_complete', html }, { type: 'done', title: 'Earlier' }]);
+          } else {
+            assert.deepEqual(events.slice(1).map(event => event.type), ['error']);
+            assert.match(events[1].message, /Widget generation incomplete/);
+          }
         });
       }
     }

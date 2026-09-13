@@ -13752,10 +13752,7 @@ async function handleWidgetAgentRequest(req, res) {
         const textBlock = response.content.find(b => b.type === 'text');
         const text = textBlock?.text ?? '';
         const { html, title, isComplete } = parseWidgetAgentResponse(text, maxHtml);
-        if (!isComplete) {
-          sendWidgetSSE(res, 'error', { message: 'Widget generation incomplete: expected nonempty HTML inside complete widget-html markers.' });
-          return;
-        }
+        if (!isComplete) break;
         sendWidgetSSE(res, 'html_complete', { html });
         sendWidgetSSE(res, 'done', { title });
         completed = true;
@@ -13818,8 +13815,7 @@ async function handleWidgetAgentRequest(req, res) {
       }
     }
     if (!completed && !cancelled) {
-      // Partial recovery: scan all assistant messages for any widget-html markers
-      // emitted mid-loop (e.g. model tried to output but was truncated).
+      // Recover complete HTML emitted mid-loop after an invalid end turn or exhaustion.
       let recovered = false;
       for (const msg of messages) {
         if (msg.role !== 'assistant') continue;
@@ -13835,7 +13831,7 @@ async function handleWidgetAgentRequest(req, res) {
         }
       }
       if (!recovered) {
-        sendWidgetSSE(res, 'error', { message: `Widget generation incomplete: tool loop exhausted (${maxTurns} turns)` });
+        sendWidgetSSE(res, 'error', { message: 'Widget generation incomplete: expected nonempty HTML inside complete widget-html markers.' });
       }
     }
   } catch (err) {
