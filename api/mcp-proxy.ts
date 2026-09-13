@@ -434,18 +434,87 @@ function buildHeaders(customHeaders) {
 
 // --- Streamable HTTP transport (MCP 2025-03-26) ---
 
+// Bounded redirect follow. `redirect: 'manual'` below stays load-bearing: the
+// Edge runtime cannot pin a TLS connection to a vetted address, so every
+// dispatch re-resolves the host through assertServerUrlSafe. Letting `fetch()`
+// follow a redirect on its own would hand an upstream a way to bounce this
+// proxy onto an internal address without that re-check. So we follow at most
+// ONE hop by hand, and only after the Location clears the same guard the
+// original serverUrl did.
+//
+// Vendors do move a published MCP endpoint and leave a permanent redirect
+// behind (a shipped preset went dark this way — every call died on the 308
+// rather than the one-line move the vendor intended).
+const MAX_REDIRECT_HOPS = 1;
+
+// Only method-preserving redirects are followed. 301/302/303 permit a client to
+// rewrite the request to GET, which is meaningless for JSON-RPC and would
+// silently turn a tools/call into a bodyless GET.
+const METHOD_PRESERVING_REDIRECTS = new Set([307, 308]);
+
+// Headers that may cross an origin boundary. Everything else this proxy is
+// carrying is caller-supplied credential material (the Alpha Vantage, Datadog
+// and Slack presets all send a Bearer token; Mcp-Session-Id is a session
+// credential minted by the *previous* origin), and an upstream chooses the
+// redirect target — forwarding those to whatever host it names in a Location
+// header would hand the caller's key to a third party. This is an allowlist on
+// purpose: a denylist of known-sensitive header names is exactly the
+// name-shaped trampoline that cannot match the spelling it has not seen.
+const CROSS_ORIGIN_SAFE_HEADERS = new Set(['content-type', 'accept', 'user-agent']);
+
+function redirectTargetFor(response, fromUrl) {
+  const location = response.headers.get('location');
+  if (!location) return null;
+  let next;
+  try {
+    next = new URL(location, fromUrl);
+  } catch {
+    return null;
+  }
+  // assertServerUrlSafe vets the host but not the scheme, and the entry-point
+  // https check in validateServerUrl never sees a redirect target — so a
+  // downgrade to http:// has to be refused right here.
+  if (next.protocol !== 'https:') return null;
+  return next;
+}
+
+function stripToCrossOriginSafeHeaders(headers) {
+  const out = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (CROSS_ORIGIN_SAFE_HEADERS.has(key.toLowerCase())) out[key] = value;
+  }
+  return out;
+}
+
 async function postJson(url, body, headers, sessionId) {
   const h = { ...headers };
   if (sessionId) h['Mcp-Session-Id'] = sessionId;
-  await revalidateBeforeFetch(url);
-  const resp = await fetchMcpUpstream(url.toString(), {
-    method: 'POST',
-    headers: h,
-    body: JSON.stringify(body),
-    redirect: 'manual',
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  });
-  return resp;
+  const payload = JSON.stringify(body);
+  let target = url;
+  let outboundHeaders = h;
+  // ONE deadline for the whole exchange, not one per hop — a per-hop signal
+  // would quietly hand a redirecting upstream twice the budget every other
+  // dispatch gets.
+  const signal = AbortSignal.timeout(TIMEOUT_MS);
+  for (let hop = 0; ; hop++) {
+    await revalidateBeforeFetch(target);
+    const resp = await fetchMcpUpstream(target.toString(), {
+      method: 'POST',
+      headers: outboundHeaders,
+      body: payload,
+      redirect: 'manual',
+      signal,
+    });
+    if (hop >= MAX_REDIRECT_HOPS || !METHOD_PRESERVING_REDIRECTS.has(resp.status)) return resp;
+    const next = redirectTargetFor(resp, target);
+    // An unfollowable redirect (no Location, unparseable, or an http://
+    // downgrade) is returned as-is so the caller still reports the upstream
+    // status it actually got, exactly as before this hop existed.
+    if (!next) return resp;
+    await cancelResponseBody(resp);
+    if (next.origin !== target.origin) outboundHeaders = stripToCrossOriginSafeHeaders(outboundHeaders);
+    target = next;
+  }
 }
 
 async function cancelResponseBody(response) {

@@ -115,7 +115,11 @@ export const MCP_PRESETS: McpPreset[] = [
     name: 'Weather Forensics',
     icon: '🌦️',
     description: 'Free historical and current weather data — hourly, daily, and severe events',
-    serverUrl: 'https://weatherforensics.dev/mcp/free',
+    // weatherforensics.dev/mcp/free now answers 308 to this address. The proxy
+    // follows one method-preserving hop, so the vanity domain would still work
+    // — this points at the settled target so every call skips that extra
+    // round trip.
+    serverUrl: 'https://noaa-mcp-free-bly45pyigq-uk.a.run.app/mcp',
     defaultTool: 'noaa_ncei_daily_weather_for_location_date',
     defaultArgs: { latitude: 33.8938, longitude: 35.5018, date: '2026-03-19' },
     defaultTitle: 'Weather',

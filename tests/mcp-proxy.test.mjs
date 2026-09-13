@@ -358,6 +358,140 @@ describe('api/mcp-proxy', () => {
     });
   });
 
+  // A vendor moved a shipped preset's endpoint and left a 308 behind, which
+  // `redirect: 'manual'` turned into a hard "Initialize failed: HTTP 308" for
+  // every caller. The proxy now follows one method-preserving hop — but the
+  // manual mode is an SSRF control, so each of these pins a way the follow
+  // must NOT become a bypass.
+  describe('bounded redirect follow', () => {
+    const OLD = 'https://mcp.old.example.com';
+    const NEW = 'https://mcp.new.example.com';
+
+    // Host OLD permanently redirects to host NEW; NEW speaks MCP. `status` and
+    // `location` let a case reshape the redirect it emits.
+    function redirectingServer({ status = 308, location = `${NEW}/mcp`, target = NEW } = {}) {
+      const seen = { urls: [], headersAtTarget: null };
+      globalThis.fetch = async (url, opts) => {
+        seen.urls.push(String(url));
+        if (String(url).startsWith(OLD)) {
+          return new Response(null, { status, headers: location ? { location } : {} });
+        }
+        if (String(url).startsWith(target)) {
+          seen.headersAtTarget = opts?.headers ?? {};
+          const body = opts?.body ? JSON.parse(opts.body) : {};
+          const result = body.method === 'tools/list'
+            ? { tools: [{ name: 'moved_tool', description: 'd', inputSchema: { type: 'object' } }] }
+            : { protocolVersion: '2025-03-26', capabilities: {}, serverInfo: { name: 't', version: '1' } };
+          return new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id, result }), {
+            status: 200, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      };
+      return seen;
+    }
+
+    it('follows one 308 hop and serves the moved server', async () => {
+      const seen = redirectingServer();
+      const res = await handler(makePostRequest({ action: 'tools/list', serverUrl: `${OLD}/mcp` }));
+      assert.equal(res.status, 200);
+      const payload = await res.json();
+      assert.deepEqual(payload.tools?.map((t) => t.name), ['moved_tool']);
+      assert.ok(seen.urls.some((u) => u.startsWith(NEW)), 'must have re-dispatched to the redirect target');
+    });
+
+    it('drops caller credentials when the hop crosses an origin', async () => {
+      const seen = redirectingServer();
+      const res = await handler(makePostRequest({
+        action: 'tools/list',
+        serverUrl: `${OLD}/mcp`,
+        customHeaders: { Authorization: 'Bearer caller-api-key' },
+      }));
+      assert.equal(res.status, 200);
+      const lowerKeys = Object.keys(seen.headersAtTarget || {}).map((k) => k.toLowerCase());
+      assert.ok(
+        !lowerKeys.includes('authorization'),
+        'Authorization must NOT reach a host the upstream chose via Location',
+      );
+      assert.ok(lowerKeys.includes('accept'), 'transport headers must survive the hop');
+    });
+
+    it('keeps caller credentials when the hop stays on the same origin', async () => {
+      const seen = redirectingServer({ location: `${OLD}/mcp/v2`, target: `${OLD}/mcp/v2` });
+      globalThis.fetch = async (url, opts) => {
+        seen.urls.push(String(url));
+        if (String(url) === `${OLD}/mcp`) {
+          return new Response(null, { status: 308, headers: { location: `${OLD}/mcp/v2` } });
+        }
+        seen.headersAtTarget = opts?.headers ?? {};
+        const body = opts?.body ? JSON.parse(opts.body) : {};
+        const result = body.method === 'tools/list'
+          ? { tools: [] }
+          : { protocolVersion: '2025-03-26', capabilities: {}, serverInfo: { name: 't', version: '1' } };
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id, result }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        });
+      };
+      const res = await handler(makePostRequest({
+        action: 'tools/list',
+        serverUrl: `${OLD}/mcp`,
+        customHeaders: { Authorization: 'Bearer caller-api-key' },
+      }));
+      assert.equal(res.status, 200);
+      const lowerKeys = Object.keys(seen.headersAtTarget || {}).map((k) => k.toLowerCase());
+      assert.ok(lowerKeys.includes('authorization'), 'a same-origin hop must not strip the caller key');
+    });
+
+    it('refuses a second hop rather than chasing a redirect chain', async () => {
+      const urls = [];
+      globalThis.fetch = async (url) => {
+        urls.push(String(url));
+        if (String(url).startsWith(OLD)) {
+          return new Response(null, { status: 308, headers: { location: `${NEW}/mcp` } });
+        }
+        return new Response(null, { status: 308, headers: { location: 'https://mcp.third.example.com/mcp' } });
+      };
+      const res = await handler(makePostRequest({ action: 'tools/list', serverUrl: `${OLD}/mcp` }));
+      assert.notEqual(res.status, 200);
+      assert.ok(
+        !urls.some((u) => u.includes('third.example.com')),
+        'the second hop must never be dispatched',
+      );
+    });
+
+    it('refuses an http:// Location instead of downgrading the hop', async () => {
+      const urls = [];
+      globalThis.fetch = async (url) => {
+        urls.push(String(url));
+        return new Response(null, { status: 308, headers: { location: 'http://mcp.new.example.com/mcp' } });
+      };
+      const res = await handler(makePostRequest({ action: 'tools/list', serverUrl: `${OLD}/mcp` }));
+      assert.notEqual(res.status, 200);
+      assert.ok(!urls.some((u) => u.startsWith('http://')), 'must never dispatch over plaintext');
+    });
+
+    it('does not follow a 302, which would rewrite the JSON-RPC POST to GET', async () => {
+      const seen = redirectingServer({ status: 302 });
+      const res = await handler(makePostRequest({ action: 'tools/list', serverUrl: `${OLD}/mcp` }));
+      assert.notEqual(res.status, 200);
+      assert.ok(!seen.urls.some((u) => u.startsWith(NEW)), '302 must not be followed');
+    });
+
+    it('re-runs the SSRF guard on the redirect target', async () => {
+      // OLD resolves public; the host it redirects to resolves to link-local.
+      setResolveHostnameForTest(async (hostname) => (
+        hostname === 'mcp.old.example.com' ? [PUBLIC_TEST_ADDRESS] : ['169.254.169.254']
+      ));
+      const seen = redirectingServer();
+      const res = await handler(makePostRequest({ action: 'tools/list', serverUrl: `${OLD}/mcp` }));
+      assert.notEqual(res.status, 200);
+      assert.ok(
+        !seen.urls.some((u) => u.startsWith(NEW)),
+        'a redirect onto a blocked address must be refused before dispatch',
+      );
+    });
+  });
+
   // ── CORS / method guards ──────────────────────────────────────────────────
 
   describe('CORS and method handling', () => {

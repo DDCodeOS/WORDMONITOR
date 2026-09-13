@@ -187,7 +187,7 @@ describe(`MCP Presets — live connectivity (${LIVE ? 'ENABLED' : 'SKIPPED — s
     { name: 'Parallel Search', url: 'https://search.parallel.ai/mcp' },
     { name: 'Robtex',          url: 'https://mcp.robtex.com/mcp' },
     { name: 'Pyth Price Feeds', url: 'https://mcp.pyth.network/mcp' },
-    { name: 'Weather Forensics', url: 'https://weatherforensics.dev/mcp/free' },
+    { name: 'Weather Forensics', url: 'https://noaa-mcp-free-bly45pyigq-uk.a.run.app/mcp' },
   ];
 
   // Auth-gated presets — expect 401 on initialize (not DNS failure / 404)
