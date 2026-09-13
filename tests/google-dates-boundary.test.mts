@@ -278,13 +278,14 @@ test('unsigned trusted-marker spoof cannot create a verified MCP admission', asy
 
 // Execute the relay's real Google functions without starting its daemon or live feeds.
 function installCalendarRelay(provider: typeof fetch) {
+  const outcomes: string[] = [];
   const source = readFileSync(new URL('../scripts/ais-relay.cjs', import.meta.url), 'utf8');
   const start = source.indexOf('const GF_SHOPPING_URL =');
   const end = source.indexOf('// ─── Widget Agent', start);
   assert.ok(start >= 0 && end > start);
   const handle = runInNewContext(source.slice(start, end) + '\nhandleGoogleFlightsDates;', {
     URL, AbortSignal, process: { env: {} }, console: { warn() {}, error() {} },
-    fetch: provider, incrementRelayMetric() {}, recordRelayOutcome() {},
+    fetch: provider, incrementRelayMetric() {}, recordRelayOutcome(_route: string, outcome: string) { outcomes.push(outcome); },
     classifyUpstreamOutcome: () => 'timeout',
   });
   globalThis.fetch = (async (input, init) => {
@@ -300,6 +301,7 @@ function installCalendarRelay(provider: typeof fetch) {
     });
     return new Response(body, { status, headers });
   }) as typeof fetch;
+  return { outcomes };
 }
 
 function calendarResponse(init?: RequestInit) {
@@ -415,7 +417,7 @@ test('malformed successful calendar bodies are degraded, not cached, and recover
 test('a malformed successful single-chunk calendar body is degraded, not cached, and recovers', async () => {
   let count = 0;
   let malformed = true;
-  installCalendarRelay((async (_input, init) => {
+  const relay = installCalendarRelay((async (_input, init) => {
     count++;
     return malformed
       ? new Response(JSON.stringify([[null, null, JSON.stringify([[[null, '', [[null, 100]]]]])]]))
@@ -424,6 +426,8 @@ test('a malformed successful single-chunk calendar body is degraded, not cached,
   const failed = await read();
   assert.equal(failed.degraded, true);
   assert.deepEqual(failed.dates, []);
+  assert.equal(relay.outcomes.filter(outcome => outcome === 'terminalFailure').length, 1);
+  assert.equal(relay.outcomes.filter(outcome => outcome === 'success').length, 0);
   assert.equal([...redis.redis.keys()].filter(key => key.startsWith('aviation:gf-dates:')).length, 0);
   malformed = false;
   assert.equal((await read()).dates.length, 31);

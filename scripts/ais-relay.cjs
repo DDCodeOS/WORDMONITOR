@@ -13097,7 +13097,10 @@ async function handleGoogleFlightsDates(req, res) {
       }
       const text = await gfResp.text();
       const dates = parseGfDates(text, isRoundTrip);
-      if (dates === null) throw new Error('Google Flights returned an invalid calendar response');
+      if (dates === null) {
+        recordRelayOutcome('googleFlights', 'terminalFailure');
+        throw new Error('Google Flights returned an invalid calendar response');
+      }
       allDates.push(...dates);
       recordRelayOutcome('googleFlights', 'success');
       incrementRelayMetric('googleFlightsServed');
