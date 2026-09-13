@@ -1447,6 +1447,15 @@ describe('gateway internal-MCP HMAC verify — failure-mode telemetry', () => {
     if (mode === 'sig_mismatch') {
       return send(await buildSignedRequest({ url: URL_UNDER_TEST, secret: `${HMAC_SECRET}-WRONG` }));
     }
+    if (mode === 'bad_request') {
+      const signedReq = await buildSignedRequest({ url: URL_UNDER_TEST });
+      const body = new ReadableStream({
+        start(controller) { controller.error(new Error('synthetic body read failure')); },
+      });
+      return send(new Request(URL_UNDER_TEST, {
+        method: 'POST', headers: signedReq.headers, body, duplex: 'half',
+      }));
+    }
     if (mode === 'replay') {
       const signed = await signInternalMcpRequest({
         method: 'POST', url: URL_UNDER_TEST, body: BODY,
@@ -1470,6 +1479,7 @@ describe('gateway internal-MCP HMAC verify — failure-mode telemetry', () => {
     ['malformed_sig', 'internal_mcp_malformed_sig'],
     ['ts_window', 'internal_mcp_ts_window'],
     ['sig_mismatch', 'internal_mcp_sig_mismatch'],
+    ['bad_request', 'internal_mcp_bad_request'],
     ['replay', 'internal_mcp_replay'],
   ];
 

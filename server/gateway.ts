@@ -1258,11 +1258,8 @@ export function createDomainGateway(
         try {
           bodyBytes = await request.clone().arrayBuffer();
         } catch {
-          emitRequest(401, 'auth_401', null);
-          return new Response(
-            JSON.stringify({ error: 'invalid_internal_mcp_signature' }),
-            { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-          );
+          emitRequest(401, 'internal_mcp_bad_request', null);
+          return internalMcpSignatureDenial(corsHeaders);
         }
         if (bodyBytes.byteLength > MAX_INTERNAL_MCP_BODY) {
           emitRequest(413, 'malformed_request', null);
