@@ -72,7 +72,7 @@ import type { ParsedMapUrlState } from '@/utils';
 import { BreakingNewsBanner } from '@/components/BreakingNewsBanner';
 import { initBreakingNewsAlerts, destroyBreakingNewsAlerts } from '@/services/breaking-news-alerts';
 import { markLcpDebug } from '@/utils/lcp-debug';
-import { safeStorageGet } from '@/utils/safe-storage';
+import { safeStorageGet, safeStorageSet } from '@/utils/safe-storage';
 import type { ServiceStatusPanel } from '@/components/ServiceStatusPanel';
 import type { MonitorPanel } from '@/components/MonitorPanel';
 import type { StablecoinPanel } from '@/components/StablecoinPanel';
@@ -1463,12 +1463,13 @@ export class App {
         localStorage.setItem(crisisDeskOptInKey, 'done');
       }
       const curatedRegionalOptInKey = 'worldmonitor-curated-regional-optin-v1';
-      if (!localStorage.getItem(curatedRegionalOptInKey)) {
+      if (!safeStorageGet(curatedRegionalOptInKey)) {
         const current = loadFromStorage<string[]>(STORAGE_KEYS.disabledFeeds, []);
         const migrated = migrateCuratedRegionalOptInsV9({
           [STORAGE_KEYS.disabledFeeds]: JSON.stringify(current),
         }, CURATED_REGIONAL_OPT_IN_SOURCES);
         const rawUpdated = migrated[STORAGE_KEYS.disabledFeeds];
+        let persisted = true;
         if (typeof rawUpdated === 'string') {
           let updated: unknown;
           try { updated = JSON.parse(rawUpdated); } catch { updated = null; }
@@ -1477,10 +1478,10 @@ export class App {
             && updated.every((name): name is string => typeof name === 'string')
             && JSON.stringify(updated) !== JSON.stringify(current)
           ) {
-            saveToStorage(STORAGE_KEYS.disabledFeeds, updated);
+            persisted = saveToStorage(STORAGE_KEYS.disabledFeeds, updated);
           }
         }
-        localStorage.setItem(curatedRegionalOptInKey, 'done');
+        if (persisted) safeStorageSet(curatedRegionalOptInKey, 'done');
       }
       // Locale boost: additively enable locale-matched sources (runs once per locale).
       // Reads the explicit-choice key (`wm-locale-explicit`, written by Settings →
