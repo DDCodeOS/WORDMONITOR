@@ -25,12 +25,11 @@
  * Like the seeder, it loads `.env.local` so `fetchYahooJson` can fall back to the
  * PROXY_URL curl path when Yahoo rate-limits the direct request.
  */
-import { pathToFileURL } from 'node:url';
-
 import { loadDeclaredCountryStockIndexes } from './_country-stock-index-registry.mjs';
 import { buildCountryStockIndexSnapshot } from './_country-stock-index.mjs';
 import { loadEnvFile } from './_seed-utils.mjs';
 import { fetchYahooJson } from './_yahoo-fetch.mjs';
+import { isMainModule } from './lib/main-module.mjs';
 
 // Same stagger as YAHOO_DELAY_MS in scripts/seed-market-quotes.mjs.
 const YAHOO_DELAY_MS = 200;
@@ -116,7 +115,7 @@ async function main() {
   process.exitCode = exitCodeFor(rows);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url, process.argv[1])) {
   main().catch((err) => {
     console.error(err);
     process.exitCode = 1;
