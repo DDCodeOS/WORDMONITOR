@@ -293,7 +293,7 @@ async function seedProcess(initial, now, mode, activeFixture, bcFixture) {
   await import(new URL('../scripts/seed-fire-detections.mjs', process.env.TEST_MODULE_URL));
 }
 
-test('BC HTTP 400 keeps source records and clocks through the real seeder and RPC reader', () => {
+test('BC failures and unconfirmed empty results keep source coverage through the real seeder and RPC reader', () => {
   let previous = [];
   let goodSnapshot;
   for (const [minute, mode] of [[0, 'bc-ok'], [10, 'bc-fail'], [20, 'bc-fail'], [30, 'bc-empty-fail'], [40, 'bc-empty-fail'], [120, 'bc-fail'], [130, 'bc-ok'], [135, 'bc-read-fail'], [140, 'bc-write-fail'], [145, 'bc-meta-fail'], [150, 'bc-empty-recovered'], [160, 'bc-empty'], [170, 'bc-fail']]) {
@@ -314,14 +314,18 @@ test('BC HTTP 400 keeps source records and clocks through the real seeder and RP
     assert.equal(sourceMeta.fetchedAt, snapshot.fetchedAt);
     assert.equal(sourceMeta.lastAttemptAt, now);
     assert.equal(sourceMeta.errorCode, snapshot.errorCode);
+    assert.equal(sourceMeta.recordCount, snapshot.fireDetections.length);
+    assert.equal(sourceMeta.sourceState, snapshot.errorCode ? 'degraded' : 'ok');
     if (mode === 'bc-ok' || mode === 'bc-empty' || mode === 'bc-empty-recovered') goodSnapshot = snapshot;
     const sourceFailed = mode === 'bc-fail' || mode === 'bc-empty-fail';
     const expired = minute === 120;
+    assert.equal(snapshot.fireDetections.length, expired || minute >= 160 ? 0 : 4);
     assert.equal(snapshot.fetchedAt, expired ? null : goodSnapshot.fetchedAt);
     assert.equal(snapshot.lastAttemptAt, now);
     assert.deepEqual(snapshot.fireDetections, expired ? [] : goodSnapshot.fireDetections);
     assert.equal(captured.calls.bc, mode.startsWith('bc-empty') ? 2 : 1, captured.output);
     assert.equal(captured.calls.firms, 27);
+    assert.equal(JSON.parse(store.get('wildfire:cwfis-source:v1')).fetchedAt, now);
     for (const key of ['wildfire:fires:v1', 'wildfire:fires-bootstrap:v1']) {
       const payload = JSON.parse(store.get(key)).data;
       assert.equal('_bcSnapshot' in payload, false);
