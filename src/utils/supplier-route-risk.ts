@@ -36,9 +36,9 @@ interface CountryPortClustersJson {
 const clusters: CountryPortClustersJson = COUNTRY_PORT_CLUSTERS;
 const regions: Record<string, string> = COUNTRY_REGIONS;
 
-// Endpoint regions of the existing TRADE_ROUTES corridors. A nearby corridor
-// is not a connecting route when both countries are at the same end. This is a
-// necessary geography check, not evidence of a shipment or its transport mode.
+// Regional ends of the existing TRADE_ROUTES corridors and their country clusters.
+// A nearby corridor is not a connecting route when both countries are at the same
+// end. This is a geography check, not evidence of a shipment or its transport mode.
 const CORRIDOR_REGIONS: Record<string, readonly [string, string]> = {
   'china-europe-suez': ['east-asia', 'europe'],
   'china-us-west': ['east-asia', 'north-america'],
@@ -57,7 +57,7 @@ const CORRIDOR_REGIONS: Record<string, readonly [string, string]> = {
   'asia-europe-cape': ['east-asia', 'europe'],
   'india-europe': ['south-asia', 'europe'],
   'india-se-asia': ['south-asia', 'east-asia'],
-  'china-africa': ['east-asia', 'mena'],
+  'china-africa': ['east-asia', 'sub-saharan-africa'],
   'cpec-route': ['south-asia', 'east-asia'],
   'transatlantic': ['north-america', 'europe'],
 };
