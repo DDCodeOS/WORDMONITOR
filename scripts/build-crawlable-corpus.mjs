@@ -169,7 +169,7 @@ export const COMPARISON_PAGE_LASTMOD_PATHS = Object.freeze([
 // families take the later of this version and their own committed source date,
 // so template changes are reflected without pretending every deploy is fresh.
 export const CORPUS_GENERATOR_CONTENT_VERSION = '2026-09-01';
-export const COUNTRY_PAGE_CONTENT_VERSION = '2026-09-12';
+export const COUNTRY_PAGE_CONTENT_VERSION = '2026-09-13';
 export const CII_COUNTRY_PAGE_CONTENT_VERSION = '2026-09-12';
 // Exported so the #7533 guard test can recompute every family clock without
 // re-implementing the version constants themselves.
@@ -944,7 +944,9 @@ function countrySpatialCoverage(country, bbox) {
   };
   if (Array.isArray(bbox) && bbox.length === 4 && bbox.every((value) => Number.isFinite(Number(value)))) {
     const [south, west, north, east] = bbox.map(Number);
-    place.geo = geoShapeBox(south, west, north, east);
+    place.geo = west > east
+      ? [geoShapeBox(south, west, north, 180), geoShapeBox(south, -180, north, east)]
+      : geoShapeBox(south, west, north, east);
   }
   return place;
 }

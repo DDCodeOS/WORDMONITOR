@@ -3070,6 +3070,76 @@ describe('api/mcp.ts — PRO MCP Server', () => {
     assert.equal(data.partial, true);
   });
 
+  it('get_airspace splits Russia into ordinary flight queries on both sides of the dateline', async () => {
+    const queries = [];
+    const points = [
+      { callsign: 'MOSCOW', icao24: 'a', lat: 55.75, lon: 37.62 },
+      { callsign: 'CHUKOTKA', icao24: 'b', lat: 65, lon: -175 },
+      { callsign: 'BERLIN', icao24: 'c', lat: 52.52, lon: 13.4 },
+    ];
+    globalThis.fetch = async url => {
+      const parsed = new URL(url);
+      if (!/\/api\/(aviation|military)\//.test(parsed.pathname)) return Response.json({});
+      const west = Number(parsed.searchParams.get('sw_lon'));
+      const east = Number(parsed.searchParams.get('ne_lon'));
+      queries.push([parsed.pathname, west, east]);
+      assert.ok(west <= east && east - west < 360);
+      const positions = points.filter(p => p.lon >= west && p.lon <= east);
+      return Response.json(parsed.pathname.includes('/military/')
+        ? { flights: positions.map(p => ({ callsign: p.callsign, hex_code: p.icao24, source: 'wingbits', location: { latitude: p.lat, longitude: p.lon } })) }
+        : { positions, source: 'wingbits', updated_at: 1711620000000 });
+    };
+    const res = await handler(makeReq('POST', callBody('get_airspace', { country_code: 'RU' })));
+    const body = await res.json();
+    const data = JSON.parse(body.result.content[0].text);
+    assert.deepEqual(data.civilian_flights.map(f => f.callsign), ['MOSCOW', 'CHUKOTKA']);
+    assert.deepEqual(data.military_flights.map(f => f.callsign), ['MOSCOW', 'CHUKOTKA']);
+    assert.equal(queries.length, 4);
+    assert.deepEqual(queries.map(q => q.slice(1)).sort(), [[-180, -169.7], [-180, -169.7], [19.6, 180], [19.6, 180]].sort());
+    assert.equal(data.updated_at, new Date(1711620000000).toISOString());
+  });
+
+  it('get_airspace rejects full-longitude country queries before fetching', async () => {
+    let calls = 0;
+    globalThis.fetch = async url => {
+      if (/\/api\/(aviation|military)\//.test(new URL(url).pathname)) calls++;
+      return Response.json({});
+    };
+    const res = await handler(makeReq('POST', callBody('get_airspace', { country_code: 'AQ' })));
+    const body = await res.json();
+    assert.match(JSON.parse(body.result.content[0].text).error, /full-longitude/);
+    assert.equal(calls, 0);
+  });
+
+  it('get_airspace reports a failed Russia half as unavailable military coverage', async () => {
+    globalThis.fetch = async url => {
+      const parsed = new URL(url);
+      if (!parsed.pathname.includes('/military/')) return Response.json({ positions: [], source: 'wingbits' });
+      if (Number(parsed.searchParams.get('sw_lon')) < 0) return new Response('unavailable', { status: 503 });
+      return Response.json({ flights: [{ callsign: 'MOSCOW', hex_code: 'a', source: 'wingbits' }] });
+    };
+    const res = await handler(makeReq('POST', callBody('get_airspace', { country_code: 'RU' })));
+    const body = await res.json();
+    const data = JSON.parse(body.result.content[0].text);
+    assert.equal(data.partial, true);
+    assert.match(data.warnings.join(' '), /military/);
+    assert.deepEqual(data.military_flights, [], 'one successful half must not appear to be complete coverage');
+  });
+
+  it('get_airspace preserves a billing denial when the other Russia half fails first', async () => {
+    globalThis.fetch = async url => {
+      if (Number(new URL(url).searchParams.get('sw_lon')) > 0) return new Response('unavailable', { status: 500 });
+      await Promise.resolve();
+      return Response.json({ error: 'Renewal verification pending', code: 'renewal_verification_pending' }, {
+        status: 503, headers: { 'Retry-After': '21', 'X-Billing-Verification': 'renewal_verification_pending' },
+      });
+    };
+    const res = await handler(makeReq('POST', callBody('get_airspace', { country_code: 'RU', type: 'civilian' })));
+    assert.equal(res.status, 503);
+    assert.equal(res.headers.get('Retry-After'), '21');
+    assert.equal((await res.json()).error.data.code, 'renewal_verification_pending');
+  });
+
   it('get_airspace returns error for unknown country code', async () => {
     const res = await handler(makeReq('POST', {
       jsonrpc: '2.0', id: 11, method: 'tools/call',
@@ -3304,6 +3374,20 @@ describe('api/mcp.ts — PRO MCP Server', () => {
     const data = JSON.parse(body.result.content[0].text);
     const names = data.density_zones.map((z) => z.name).sort();
     assert.deepEqual(names, ['Across the dateline', 'West of Fiji in-box'], 'dateline-adjacent point must match; far-Pacific point must not');
+  });
+
+  it('get_maritime_activity excludes the North Sea from Russia and keeps the dateline', async () => {
+    globalThis.fetch = async () => Response.json({ snapshot: {
+      densityZones: [
+        { name: 'North Sea', location: { latitude: 55, longitude: 5 } },
+        { name: 'Dateline east', location: { latitude: 65, longitude: 179 } },
+        { name: 'Dateline west', location: { latitude: 65, longitude: -175 } },
+      ], disruptions: [],
+    } });
+    const res = await handler(makeReq('POST', callBody('get_maritime_activity', { country_code: 'RU' })));
+    const body = await res.json();
+    const data = JSON.parse(body.result.content[0].text);
+    assert.deepEqual(data.density_zones.map(z => z.name), ['Dateline east', 'Dateline west']);
   });
 
   it('get_maritime_activity matches every longitude for full-span bboxes (AQ stored as -180..180)', async () => {
