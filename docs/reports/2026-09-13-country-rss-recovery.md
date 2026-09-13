@@ -24,7 +24,7 @@ The RSS caches and digest were written at different times. These figures measure
 
 ## Implemented recovery
 
-`GET /api/news/v1/list-country-headlines?country_codes=PW&country_codes=VU` reads the existing full English RSS caches in one batch. It never fetches a publisher, writes a new index or generates prose. It returns up to five distinct URLs per requested country, selecting distinct publisher families before filling remaining slots. It applies the digest's shared age limit and future-date tolerance, checks headline country mentions and HTTPS URLs, and fails closed when URL revocations cannot be read. Regional editions retain their parent publisher identity.
+`GET /api/news/v1/list-country-headlines?country_codes=PW&country_codes=VU` reads the existing full English RSS caches in one batch. It never fetches a publisher, writes a new index or generates prose. It returns up to five distinct URLs per requested country, selecting distinct publisher families before filling remaining slots. It applies the digest's shared age limit and future-date tolerance, checks headline country mentions and verifiable HTTPS article URLs, and fails closed when URL revocations cannot be read. Opaque aggregator redirects are excluded before selection. Trusted origin publisher names replace aggregator feed labels, while ordinary feeds keep their registered names. Regional editions retain their parent publisher identity.
 
 `state`, `feedTotal` and `feedCached` distinguish complete cache availability from partial or unavailable reads. A cached empty feed counts as available, not as country reporting. Missing or malformed caches do not claim complete coverage. A country omitted from `countries` has no matching accepted article in the available pool.
 
@@ -34,20 +34,22 @@ The freeze keeps its existing digest headlines, adds recovered curated rows befo
 
 The initial Palau regression failed with zero headlines before the change and passes with the recovered article. Registered RPC tests exercise the real RSS parser, generated query parsing and validation, Redis readers and country matching with controlled Redis responses. They cover stale, future, malformed, wrong-country, duplicate and revoked articles; missing caches; a revocation outage; request bounds; and publisher-family selection. Capture tests verify that one publisher still withholds a brief, while recovered curated reporting plus independent GDELT reporting can produce a cited brief.
 
-Replaying the captured cache data through the new handler at **10:58:28 UTC** produced 94 countries, and combining it with the recorded digest produced the same 97-country union. The replay used an empty controlled revocation set; it does not establish the production revocation state. No production cache, corpus snapshot or generated brief was written.
+Replaying the captured cache data through the final handler at **11:25:17 UTC** produced 84 countries with accepted RSS articles. Combining it with the recorded digest produced **92 countries**, recovering **39** absent from that digest. The broader 97-country audit pool above included aggregator redirects that the final reader rejects. The replay used an empty controlled revocation set; it does not establish the production revocation state. No production cache, corpus snapshot or generated brief was written.
+
+CI also caught the new operation crossing the public OpenAPI byte budget. Shortening the repeated inline JMESPath summary preserves its input/output limits, HTTP error status and full-contract reference, while reducing the served JSON to 948,236 bytes under the unchanged 950,000-byte cap. The existing low-reserve warning remains. Generated contracts expose the required 1-250-country input and five-headline output bound. Capture selection preserves existing digest rows and gives remaining slots to independent recovered publishers first.
 
 ## Remaining acquisition gap
 
-The combined recorded pool still had no accepted headline for **99 countries**. This is a new observation window, not a subtraction from the September 9 snapshot's 123-country register. Other variants, publisher cadence, cache availability and matching can all affect the result.
+The final replay's combined pool still had no accepted headline for **104 countries**. This is a new observation window, not a subtraction from the September 9 snapshot's 123-country register. Other variants, publisher cadence, cache availability and matching can all affect the result.
 
 | Region | Countries without a match in the recorded combined pool |
 |---|---|
-| Europe | AD, AL, AT, BE, CY, CZ, DK, GR, HR, IS, LI, LU, MC, MD, ME, PT, SI, SK, SM, TJ, TM |
+| Europe | AD, AL, AT, BE, CY, CZ, DK, GR, HR, IS, IT, LI, LU, MC, MD, ME, NL, PT, SI, SK, SM, TJ, TM |
 | Middle East / North Africa | BH, DJ, JO, MA, MT, QA |
 | South Asia | BT, LK, MV |
 | Latin America / Caribbean | AG, BB, BS, BZ, CR, CU, DM, DO, GD, GT, GY, HN, KN, LC, NI, PA, PY, SR, SV, TT, UY, VC |
 | Sub-Saharan Africa | AO, BF, BI, BW, CF, CG, CM, CV, ER, GA, GN, GQ, GW, KM, LR, LS, MG, MR, MU, MW, MZ, NA, RW, SC, SL, ST, SZ, TD, TG, ZM, ZW |
-| East Asia / Pacific | BN, FJ, FM, KI, MH, MM, MN, MO, NR, PG, SB, SG, TL, TO, TV, WS |
+| East Asia / Pacific | BN, FJ, FM, JP, KI, MH, MM, MN, MO, NR, NZ, PG, SB, SG, TH, TL, TO, TV, WS |
 
 ## Production acceptance
 

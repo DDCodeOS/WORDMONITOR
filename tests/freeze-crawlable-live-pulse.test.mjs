@@ -22,7 +22,7 @@ import {
   selectCountryIndexHeadlines,
 } from '../scripts/crawlable-country-index.mjs';
 import { GDELT_COUNTRY_INDEX_WINDOW_MS } from '../scripts/_gdelt-bulk-materializer.mjs';
-import { COUNTRY_INDEX_ORIGIN, developmentsHasDatedItem } from '../scripts/crawlable-developments.mjs';
+import { briefGroundingGap, COUNTRY_INDEX_ORIGIN, developmentsHasDatedItem } from '../scripts/crawlable-developments.mjs';
 import { SCORECARD_DECLARED_FIELDS, classifyAccuracyState } from '../scripts/build-accuracy-page.mjs';
 
 describe('freeze crawlable live pulse API base routing', () => {
@@ -1397,6 +1397,19 @@ describe('freeze per-country developments capture', () => {
     assert.ok(palau.brief.sources.slice(1).every(source => source.origin === COUNTRY_INDEX_ORIGIN));
     assert.equal(snapshot.coverage.briefEligibleCount, 1);
     assert.equal(snapshot.coverage.briefCountryCount, 1);
+  });
+
+  it('uses the final slot for an independent recovered publisher', async () => {
+    const existing = Array.from({ length: 4 }, (_, i) => digestItem({ source: 'Guardian World', link: `https://theguardian.com/sudan-${i}` }));
+    const duplicatePublisher = digestItem({ source: 'Guardian Africa', link: 'https://theguardian.com/sudan-more' });
+    const independent = digestItem({ source: 'BBC News', link: 'https://bbc.com/sudan-report', publishedAt: Date.now() - 2 * 3600_000 });
+    stubFetch({ digestItems: existing, countryHeadlines: { SD: { items: [duplicatePublisher, independent] } } });
+    const { snapshot } = await runFreeze({ serviceKey: '' });
+    const rows = snapshot.countries.SD.developments.headlines;
+    assert.equal(rows.length, 5);
+    assert.deepEqual(rows.slice(0, 4).map(row => row.url), existing.map(row => row.link));
+    assert.equal(rows[4].source, 'BBC News');
+    assert.equal(briefGroundingGap(rows), null);
   });
 
   it('retains digest reporting and records a failed curated-cache capture explicitly', async () => {

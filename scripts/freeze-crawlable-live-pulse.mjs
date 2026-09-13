@@ -34,6 +34,7 @@ import { loadEnvFile } from './_seed-utils.mjs';
 import {
   briefCitationGroundingGap,
   briefGroundingGap,
+  briefGroundingPublisherCount,
   COUNTRY_INDEX_ORIGIN,
   developmentsHasDatedItem,
   hasBriefGrounding,
@@ -1029,9 +1030,15 @@ export async function freezeCrawlableLivePulse({
     if (payload.state === 'unavailable') throw new Error('country headline caches or revocation controls unavailable');
     for (const code of Object.keys(countries)) {
       const existing = headlinesByCode.get(code);
-      const rows = selectCountryHeadlines(payload.countries[code]?.items, code)
-        .filter(row => !existing.some(headline => headline.url === row.url))
-        .slice(0, COUNTRY_HEADLINE_LIMIT - existing.length);
+      const candidates = selectCountryHeadlines(payload.countries[code]?.items, code)
+        .filter(row => !existing.some(headline => headline.url === row.url));
+      const rows = [];
+      while (existing.length + rows.length < COUNTRY_HEADLINE_LIMIT && candidates.length) {
+        const selected = [...existing, ...rows];
+        const publishers = briefGroundingPublisherCount(selected);
+        const independent = candidates.findIndex(row => briefGroundingPublisherCount([...selected, row]) > publishers);
+        rows.push(candidates.splice(Math.max(0, independent), 1)[0]);
+      }
       if (rows.length === 0) continue;
       if (existing.length === 0) curatedFeeds.recoveredCountryCount++;
       curatedFeeds.addedHeadlineCount += rows.length;

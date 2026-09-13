@@ -24240,15 +24240,17 @@ paths:
                 - name: country_codes
                   in: query
                   description: ISO 3166-1 alpha-2 codes. Repeated query parameter, at most 250 countries.
-                  required: false
+                  required: true
                   style: form
                   explode: true
                   example:
                       - "US"
                   schema:
                     type: array
+                    maxItems: 250
+                    minItems: 1
                     items:
-                        type: string
+                      type: string
                 - name: jmespath
                   in: query
                   description: |-
@@ -51087,11 +51089,11 @@ components:
                     type: array
                     items:
                         type: string
-                        maxItems: 250
-                        minItems: 1
                         description: ISO 3166-1 alpha-2 codes. Repeated query parameter, at most 250 countries.
                     maxItems: 250
                     minItems: 1
+            required:
+                - countryCodes
             description: ListCountryHeadlinesRequest selects countries from the full English RSS pool.
         worldmonitor_news_v1_ListCountryHeadlinesResponse:
             type: object
@@ -51130,13 +51132,14 @@ components:
                     type: array
                     items:
                         $ref: '#/components/schemas/worldmonitor_news_v1_CountryHeadline'
+                    maxItems: 5
             description: CountryHeadlineBucket contains at most five distinct article URLs.
         worldmonitor_news_v1_CountryHeadline:
             type: object
             properties:
                 source:
                     type: string
-                    description: Registered source feed name.
+                    description: 'Publisher name: trusted origin publisher or registered feed name.'
                 title:
                     type: string
                     description: Headline that names the requested country.

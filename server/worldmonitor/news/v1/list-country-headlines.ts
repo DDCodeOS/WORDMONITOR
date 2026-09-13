@@ -9,6 +9,7 @@ import { readRevokedUrlSet } from '../../../_shared/digest-revocations';
 import { markNoCacheResponse } from '../../../_shared/response-headers';
 import { countryMentionTerms, mentionsCountry } from '../../../../shared/country-mention.js';
 import { publisherFamilyFor } from '../../../../shared/publisher-families.js';
+import { isVerifiableArticleUrl } from '../../../../shared/article-url.js';
 import { INTEL_SOURCES, isServerFeedReachableForLanguage, VARIANT_FEEDS } from './_feeds';
 import { FUTURE_DATE_TOLERANCE_MS, resolveMaxAgeMs, rssFeedCacheKey } from './_rss-cache';
 
@@ -18,14 +19,18 @@ function headlineFromCache(value: unknown, source: string, now: number, cutoff: 
   if (!value || typeof value !== 'object') return null;
   const row = value as Record<string, unknown>;
   if (row.source !== source || typeof row.title !== 'string' || typeof row.link !== 'string') return null;
+  const publisher = row.originPublisherTrusted === true
+    ? (typeof row.originPublisher === 'string' ? row.originPublisher.trim() : '')
+    : source;
+  if (!publisher || publisher.length > 200) return null;
   const title = row.title.replace(/\s+/g, ' ').trim();
   if (!title || title.length > 1000 || title.includes('**') || row.link.length > 2048) return null;
   if (typeof row.publishedAt !== 'number' || !Number.isFinite(row.publishedAt)
     || row.publishedAt <= 0 || row.publishedAt < cutoff || row.publishedAt > now + FUTURE_DATE_TOLERANCE_MS) return null;
   try {
     const url = new URL(row.link);
-    if (url.protocol !== 'https:' || url.username || url.password || revoked.has(row.link) || revoked.has(url.href)) return null;
-    return { source, title, link: url.href, publishedAt: row.publishedAt };
+    if (!isVerifiableArticleUrl(url.href) || url.username || url.password || revoked.has(row.link) || revoked.has(url.href)) return null;
+    return { source: publisher, title, link: url.href, publishedAt: row.publishedAt };
   } catch {
     return null;
   }

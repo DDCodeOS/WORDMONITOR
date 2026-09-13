@@ -142,6 +142,28 @@ describe('country headlines from existing curated RSS caches', () => {
     assert.equal(briefGroundingGap(selectCountryHeadlines(payload.countries.PW.items, 'PW')), null);
   });
 
+  it('retains trusted newsroom identity across aggregator feeds and ignores forged origins', async () => {
+    for (const [name, host] of [['Africa News', 'wire-one.example'], ['Sahel Crisis', 'wire-two.example']]) {
+      const source = feed(name!);
+      const xml = `<rss><channel><item><title>Mali agrees peace talks</title><source>Reuters</source><link>https://${host}/mali-talks</link><pubDate>${new Date(Date.now() - 3600_000).toUTCString()}</pubDate></item></channel></rss>`;
+      cache.set(rssFeedCacheKey('full', source.url), digest.parseRssXml(xml, source, 'full'));
+    }
+    const { payload } = await request(['ML']);
+    assert.deepEqual(payload.countries.ML.items.map(row => row.source), ['Reuters', 'Reuters']);
+    assert.equal(briefGroundingGap(selectCountryHeadlines(payload.countries.ML.items, 'ML')), 'thin-grounding');
+    put('Guardian Pacific', [article('Guardian Pacific', { originPublisher: 'Reuters', originPublisherTrusted: false })]);
+    assert.equal((await request()).payload.countries.PW.items[0].source, 'Guardian Pacific');
+  });
+
+  it('rejects aggregator redirects before they can fill the country headline slots', async () => {
+    put('Island Times (Palau)', [
+      ...Array.from({ length: 5 }, (_, i) => article('Island Times (Palau)', { link: `https://news.google.com./rss/articles/opaque-${i}`, publishedAt: Date.now() - i * 1000 })),
+      article('Island Times (Palau)'),
+    ]);
+    const { payload } = await request();
+    assert.deepEqual(payload.countries.PW.items.map(row => row.link), ['https://islandtimes.org/palau-funding']);
+  });
+
   it('reports missing or malformed caches as partial and a cache outage as unavailable', async () => {
     cache.delete(rssFeedCacheKey('full', feed('Guardian Pacific').url));
     cache.set(rssFeedCacheKey('full', feed('Guardian Africa').url), { items: 'invalid' });

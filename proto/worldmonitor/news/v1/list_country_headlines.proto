@@ -9,7 +9,7 @@ import "sebuf/http/annotations.proto";
 message ListCountryHeadlinesRequest {
   // ISO 3166-1 alpha-2 codes. Repeated query parameter, at most 250 countries.
   repeated string country_codes = 1 [
-    (sebuf.http.query) = { name: "country_codes" },
+    (sebuf.http.query) = { name: "country_codes", required: true },
     (buf.validate.field).repeated.min_items = 1,
     (buf.validate.field).repeated.max_items = 250
   ];
@@ -17,7 +17,7 @@ message ListCountryHeadlinesRequest {
 
 // CountryHeadline is a dated article from a configured RSS feed, before dashboard category caps.
 message CountryHeadline {
-  // Registered source feed name.
+  // Publisher name: trusted origin publisher or registered feed name.
   string source = 1;
   // Headline that names the requested country.
   string title = 2;
@@ -30,7 +30,7 @@ message CountryHeadline {
 // CountryHeadlineBucket contains at most five distinct article URLs.
 message CountryHeadlineBucket {
   // Newest articles, with distinct publisher families selected first.
-  repeated CountryHeadline items = 1;
+  repeated CountryHeadline items = 1 [(buf.validate.field).repeated.max_items = 5];
 }
 
 // ListCountryHeadlinesResponse describes cache availability independently of country matches.
