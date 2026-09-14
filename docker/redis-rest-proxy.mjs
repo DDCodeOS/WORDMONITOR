@@ -74,6 +74,8 @@ const ALLOWED_COMMANDS = new Set([
   'HGET', 'HSET', 'HSETNX', 'HINCRBY', 'HDEL', 'HGETALL', 'HMGET', 'HMSET', 'HKEYS', 'HVALS', 'HEXISTS', 'HLEN',
   'LPUSH', 'RPUSH', 'LPOP', 'RPOP', 'LRANGE', 'LLEN', 'LTRIM', 'LREM',
   'SADD', 'SREM', 'SMEMBERS', 'SISMEMBER', 'SCARD',
+  // SSCAN is key-scoped set iteration; SMEMBERS already dumps the same set.
+  'SSCAN',
   // ZREMRANGEBY* are the retention trims (#7087 accumulator + forecast-evidence
   // prune, resilience 30-day history trim). Without them a self-hosted install
   // answers the prune with a per-command error inside an HTTP 200 pipeline, so
