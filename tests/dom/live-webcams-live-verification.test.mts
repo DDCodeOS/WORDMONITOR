@@ -1,6 +1,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { LiveWebcamsPanel } from '@/components/LiveWebcamsPanel';
+import { setStreamQuality } from '@/services/ai-flow-settings';
 import { LIVE_VIDEO_TIMING } from '@/services/live-video/model';
 
 import { createFakeYouTubeIframeApi, type FakeYouTubeIframeApi, type FakeYouTubePlayer } from './helpers/fake-youtube-iframe-api.mts';
@@ -25,6 +26,7 @@ vi.mock('@/config/live-video-sources', async (importOriginal) => {
 
 const HOUR = 60 * 60_000;
 const WALL = ['Jerusalem live webcam', 'Middle East live webcam', 'Ukraine live webcam', 'Washington DC live webcam'];
+const SWAPPED_WALL = ['Jerusalem live webcam', 'Middle East live webcam', 'Taipei live webcam', 'Washington DC live webcam'];
 const RECORDING_VERDICT_MS = LIVE_VIDEO_TIMING.durationGrowthWindowMs + 3 * LIVE_VIDEO_TIMING.pollMs;
 
 class FakeIntersectionObserver {
@@ -47,6 +49,8 @@ interface PanelInternals {
   content: HTMLElement;
   observer: FakeIntersectionObserver | null;
   stopForIdle(idleAfterMs: number): void;
+  refresh(): void;
+  stopLiveMediaForClose(): void;
 }
 
 let panel: LiveWebcamsPanel | undefined;
@@ -96,6 +100,14 @@ function cellById(feedId: string): HTMLElement {
   return cell;
 }
 
+function gridFeedIds(): (string | undefined)[] {
+  return Array.from(content().querySelectorAll<HTMLElement>('.webcam-cell'), (cell) => cell.dataset.feedId);
+}
+
+function offlineNote(): string | null {
+  return content().querySelector('.webcam-offline-note')?.textContent ?? null;
+}
+
 function hasLiveDot(title: string): boolean {
   return cellFor(title).querySelector('.webcam-live-dot') !== null;
 }
@@ -117,6 +129,18 @@ async function flush(ms = 0): Promise<void> {
 async function playWall(): Promise<void> {
   click('.webcam-preview-play', content());
   await flush();
+}
+
+/** Plays the wall, ends Kyiv's stream as a recording, and lets Taipei take its tile live. */
+async function swapOutUkraine(): Promise<void> {
+  mountOnScreen();
+  await playWall();
+  for (const title of ['Jerusalem live webcam', 'Middle East live webcam', 'Washington DC live webcam']) api().playerFor(title).goLive();
+  reportEndedRecording(api().playerFor('Ukraine live webcam'));
+  await flush(RECORDING_VERDICT_MS);
+  expect(playingFeeds()).toEqual(SWAPPED_WALL);
+  api().playerFor('Taipei live webcam').goLive();
+  await flush(LIVE_VIDEO_TIMING.pollMs);
 }
 
 beforeAll(async () => {
@@ -189,13 +213,63 @@ describe('Live Webcams live verification', () => {
     expect(hasLiveDot('Ukraine live webcam')).toBe(false);
 
     await flush(RECORDING_VERDICT_MS);
-    expect(playingFeeds()).toEqual(['Jerusalem live webcam', 'Middle East live webcam', 'Taipei live webcam', 'Washington DC live webcam']);
-    expect(content().querySelector('.webcam-offline-note')?.textContent).toBe('Ukraine is offline right now');
+    expect(playingFeeds()).toEqual(SWAPPED_WALL);
+    expect(offlineNote()).toBe('Ukraine is offline right now');
+    api().playerFor('Taipei live webcam').goLive();
 
-    internals().stopForIdle(HOUR);
+    // The shortest idle stop (15 min) outlasts the failure memory, so Resume always comes after it expires.
+    await flush(HOUR);
     contentButton('Resume').click();
     await flush();
-    expect(playingFeeds()).toEqual(['Jerusalem live webcam', 'Middle East live webcam', 'Taipei live webcam', 'Washington DC live webcam']);
+    expect(playingFeeds()).toEqual(SWAPPED_WALL);
+    expect(content().querySelector('.webcam-preview-tile')).toBeNull();
+    expect(offlineNote()).toBe('Ukraine is offline right now');
+  });
+
+  it('keeps the replacement through a refresh and a stream quality change after the failure memory expires', async () => {
+    await swapOutUkraine();
+    await flush(LIVE_VIDEO_TIMING.failureMemoryMs + LIVE_VIDEO_TIMING.pollMs);
+
+    internals().refresh();
+    expect(playingFeeds()).toEqual(SWAPPED_WALL);
+    expect(content().querySelector('.webcam-preview-tile')).toBeNull();
+    expect(offlineNote()).toBe('Ukraine is offline right now');
+
+    setStreamQuality('medium');
+    expect(playingFeeds()).toEqual(SWAPPED_WALL);
+    expect(content().querySelector('.webcam-preview-tile')).toBeNull();
+    expect(offlineNote()).toBe('Ukraine is offline right now');
+  });
+
+  it('hands the slot to the next spare when the replacement goes offline too', async () => {
+    mountOnScreen();
+    await playWall();
+    for (const title of ['Jerusalem live webcam', 'Middle East live webcam', 'Washington DC live webcam']) api().playerFor(title).goLive();
+    reportEndedRecording(api().playerFor('Ukraine live webcam'));
+    await flush(RECORDING_VERDICT_MS);
+
+    api().playerFor('Taipei live webcam').error(150);
+    await flush(LIVE_VIDEO_TIMING.pollMs);
+    const chainedWall = ['Jerusalem live webcam', 'Mecca live webcam', 'Middle East live webcam', 'Washington DC live webcam'];
+    expect(playingFeeds()).toEqual(chainedWall);
+    expect(offlineNote()).toBe('Ukraine is offline right now');
+
+    internals().refresh();
+    expect(playingFeeds()).toEqual(chainedWall);
+    expect(gridFeedIds()).toEqual(['jerusalem', 'middle-east', 'mecca', 'washington']);
+  });
+
+  it.each([
+    { action: 'picking the region again', run: () => { click('.webcam-region-btn[data-region="europe"]'); click('.webcam-region-btn[data-region="all"]'); } },
+    { action: 'picking the view again', run: () => { click('.webcam-view-btn[data-mode="single"]'); click('.webcam-view-btn[data-mode="grid"]'); } },
+    { action: 'closing the panel', run: () => internals().stopLiveMediaForClose() },
+  ])('brings the offline feed back after $action', async ({ run }) => {
+    await swapOutUkraine();
+
+    run();
+
+    expect(gridFeedIds()).toEqual(['jerusalem', 'middle-east', 'kyiv', 'washington']);
+    expect(offlineNote()).toBeNull();
   });
 
   it('replaces a feed YouTube refuses to embed', async () => {

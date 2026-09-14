@@ -109,8 +109,11 @@ export class LiveWebcamsPanel extends Panel {
   private toolbar: HTMLElement | null = null;
   // One verified live session per playing tile, keyed by feed id.
   private tileSessions = new Map<string, LiveVideoSession>();
-  // When each feed was last found offline. The grid swaps it for a spare feed while the failure is recent.
+  // When each feed was last found offline. A recently offline feed is not picked to replace another.
   private offlineAt = new Map<string, number>();
+  // Grid slots whose feed went offline, each mapped to the feed playing in its place. Held until the user
+  // picks a region or view again or closes the panel, so every render and Resume keeps the swap.
+  private substitutes = new Map<string, WebcamFeed>();
   // Feeds the user has explicitly started. The grid is a "wall" — multiple tiles play at once;
   // single view keeps one. Tiles coexist and are only torn down by scroll-away/hidden/idle/close.
   private activeIframeFeedIds = new Set<string>();
@@ -231,11 +234,9 @@ export class LiveWebcamsPanel extends Panel {
     return offlineAt !== undefined && Date.now() - offlineAt < LIVE_VIDEO_TIMING.failureMemoryMs;
   }
 
-  /** The first four pool feeds, each recently offline one swapped in place for the next spare feed. */
+  /** The first four pool feeds, each one that went offline replaced by the feed swapped in for it. */
   private get gridFeeds(): WebcamFeed[] {
-    const pool = this.gridPool;
-    const spares = pool.slice(MAX_GRID_CELLS).filter(feed => !this.isKnownOffline(feed.id));
-    return pool.slice(0, MAX_GRID_CELLS).map(feed => (this.isKnownOffline(feed.id) && spares.length > 0 ? spares.shift()! : feed));
+    return this.gridPool.slice(0, MAX_GRID_CELLS).map(feed => this.substitutes.get(feed.id) ?? feed);
   }
 
   private createToolbar(): void {
@@ -303,6 +304,7 @@ export class LiveWebcamsPanel extends Panel {
     });
     // Region change swaps the entire feed set — stop the current wall and start fresh from previews.
     this.clearActivePlayback();
+    this.substitutes.clear();
     if (this.idleStopped) this.idleStopped = { ...this.idleStopped, feedIds: [] };
     const feeds = this.filteredFeeds;
     if (feeds.length > 0 && !feeds.includes(this.activeFeed)) {
@@ -320,6 +322,7 @@ export class LiveWebcamsPanel extends Panel {
     const keepActive = this.activeIframeFeedIds.has(this.activeFeed.id);
     this.activeIframeFeedIds.clear();
     if (keepActive) this.activeIframeFeedIds.add(this.activeFeed.id);
+    this.substitutes.clear();
     this.savePrefs();
     this.toolbar?.querySelectorAll('.webcam-view-btn').forEach(btn => {
       (btn as HTMLElement).classList.toggle('active', (btn as HTMLElement).dataset.mode === mode);
@@ -373,6 +376,9 @@ export class LiveWebcamsPanel extends Panel {
     }
     this.tileSessions.get(feed.id)?.destroy();
     this.tileSessions.delete(feed.id);
+    // A replacement that goes offline in turn hands its slot to the next spare.
+    const slotId = Array.from(this.substitutes).find(([, shown]) => shown.id === feed.id)?.[0] ?? feed.id;
+    this.substitutes.set(slotId, spare);
     // Keep the idle-stop snapshot honest: Resume restores what was actually on screen.
     if (this.activeIframeFeedIds.delete(feed.id)) this.activeIframeFeedIds.add(spare.id);
     container.replaceChildren();
@@ -380,17 +386,17 @@ export class LiveWebcamsPanel extends Panel {
     this.renderOfflineNote();
   }
 
+  /** The next pool feed that is not on the grid, not swapped out, and not recently offline. */
   private spareFeed(): WebcamFeed | null {
-    const shown = new Set(Array.from(this.content.querySelectorAll<HTMLElement>('.webcam-cell'), cell => cell.dataset.feedId));
-    return this.gridPool.find(feed => !shown.has(feed.id) && !this.isKnownOffline(feed.id)) ?? null;
+    const shown = new Set(this.gridFeeds.map(feed => feed.id));
+    return this.gridPool.find(feed => !shown.has(feed.id) && !this.substitutes.has(feed.id) && !this.isKnownOffline(feed.id)) ?? null;
   }
 
-  /** Names the feeds the grid swapped out because they are offline. */
+  /** Names the feeds the grid swapped out because they went offline. */
   private renderOfflineNote(): void {
     const grid = this.content.querySelector('.webcam-grid');
     if (!grid) return;
-    const shown = new Set(Array.from(grid.querySelectorAll<HTMLElement>('.webcam-cell'), cell => cell.dataset.feedId));
-    const swappedOut = this.gridPool.slice(0, MAX_GRID_CELLS).filter(feed => !shown.has(feed.id) && this.isKnownOffline(feed.id));
+    const swappedOut = this.gridPool.slice(0, MAX_GRID_CELLS).filter(feed => this.substitutes.has(feed.id));
     let note = this.content.querySelector<HTMLElement>('.webcam-offline-note');
     if (swappedOut.length === 0) {
       note?.remove();
@@ -741,6 +747,7 @@ export class LiveWebcamsPanel extends Panel {
   public stopLiveMediaForClose(): void {
     this.idleStopped = null;
     this.clearActivePlayback();
+    this.substitutes.clear();
     if (this.isVisible && this.element.isConnected) {
       this.render();
     }
