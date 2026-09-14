@@ -1071,16 +1071,17 @@ function parseRssXml(xml: string, feed: ServerFeed, variant: string): ParseResul
     // dialect is read; extractTag's [^<]* body would not match a container
     // anyway, but skipping Atom keeps that an invariant rather than a
     // regex accident.
-    const originPublisher = isAtom ? '' : extractTag(block, 'source');
+    const extractedOriginPublisher = isAtom ? '' : extractTag(block, 'source');
+    // Ordinary feeds cannot vouch for RSS <source>. The country reader already
+    // ignores untrusted origin metadata, so keep those late headlines and store
+    // an empty publisher. Trusted aggregators still have the 200-character
+    // identity bound.
+    const originPublisher = originPublisherTrusted ? extractedOriginPublisher : '';
     if (!forDigest) {
-      // The country reader trusts origin metadata only from configured
-      // aggregators. Do not let ignored metadata from an ordinary feed discard
-      // an otherwise valid retained headline, while keeping cached fields bounded.
-      const countryOriginPublisher = originPublisherTrusted ? originPublisher : '';
-      if (title.length <= 1000 && link.length <= 2048 && countryOriginPublisher.length <= 200) {
+      if (title.length <= 1000 && link.length <= 2048 && originPublisher.length <= 200) {
         countryItems.push({
           source: feed.name, title, link, publishedAt,
-          originPublisher: countryOriginPublisher, originPublisherTrusted,
+          originPublisher, originPublisherTrusted,
         });
       }
       continue;
@@ -1092,7 +1093,7 @@ function parseRssXml(xml: string, feed: ServerFeed, variant: string): ParseResul
 
     items.push({
       source: feed.name,
-      originPublisher,
+      originPublisher: extractedOriginPublisher,
       originPublisherTrusted,
       title,
       link,
