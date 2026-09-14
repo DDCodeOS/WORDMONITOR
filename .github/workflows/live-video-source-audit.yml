@@ -18,6 +18,9 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-latest
+    # Worst case stays inside 15 minutes: about 3 for checkout, npm ci and Chromium; about 4 for the batched
+    # check (7 pages of up to 8 players at up to 31 s each, HLS fetches capped at 15 s); at most 4 for alone
+    # re-checks (ALONE_RECHECK_BUDGET_MS); about 2 for the reporter (one canary retry, GitHub calls capped at 30 s).
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0

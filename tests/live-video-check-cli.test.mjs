@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
+  ALONE_RECHECK_BUDGET_MS,
   catalogTargets,
   classifyHlsPlaylist,
   exitCodeFor,
@@ -500,10 +501,10 @@ describe('audit report (--all --report)', () => {
 
     const [silent] = bySlot.get('live-news/yahoo').attempts;
     assert.equal(silent.verdict, 'unverifiable');
-    assert.equal(silent.unverifiableFromRunner, false, 'still never ready when checked alone while the canaries play');
-    assert.equal(silent.why, 'the player never became ready, even when checked alone');
-    assert.equal(silent.evidence.checkedAlone, true);
-    assert.equal(jerusalem.evidence.checkedAlone, false);
+    assert.equal(silent.unverifiableFromRunner, false, 'still never ready in two checks alone while the canaries play');
+    assert.equal(silent.why, 'the player never became ready, in the batch or in two checks alone');
+    assert.deepEqual([silent.evidence.aloneChecks, silent.evidence.recheckSkipped], [2, false]);
+    assert.deepEqual([jerusalem.evidence.aloneChecks, jerusalem.evidence.recheckSkipped], [0, false]);
 
     assert.deepEqual(bySlot.get('live-news/rtve').attempts, []);
     assert.deepEqual(report.canaries.map((canary) => [canary.entry, canary.kind, canary.verdict, canary.evidence.author]), [
@@ -536,7 +537,7 @@ describe('audit report (--all --report)', () => {
     const cases = [
       [{ verdict: 'failed', outcome: { kind: 'not-started' } }, false, 'needs-replacement', /scheduled or not started/],
       [{ verdict: 'unverifiable', reason: 'live-signal-missing' }, true, 'unverifiable-from-runner', /isLive missing/],
-      [{ verdict: 'unverifiable', reason: 'player-api-silent' }, false, 'needs-replacement', /never became ready, even when checked alone/],
+      [{ verdict: 'unverifiable', reason: 'player-api-silent' }, false, 'needs-replacement', /never became ready, in the batch or in two checks alone/],
       [{ verdict: 'unverifiable', reason: 'player-api-blocked' }, true, 'unverifiable-from-runner', /IFrame API did not load/],
     ];
     for (const [verdict, unverifiable, status, why] of cases) {
@@ -590,12 +591,25 @@ describe('audit report (--all --report)', () => {
     const bySlot = new Map(report.slots.map((slot) => [slot.slot, slot]));
     const [bloomberg] = bySlot.get('live-news/bloomberg').attempts;
     assert.equal(bySlot.get('live-news/bloomberg').status, 'ok');
-    assert.deepEqual([bloomberg.verdict, bloomberg.evidence.checkedAlone], ['live', true]);
-    assert.equal(bySlot.get('webcams/taipei').attempts[0].evidence.checkedAlone, false);
+    assert.deepEqual([bloomberg.verdict, bloomberg.evidence.aloneChecks], ['live', 1]);
+    assert.equal(bySlot.get('webcams/taipei').attempts[0].evidence.aloneChecks, 0);
     assert.match(lines.join('\n'), /^LIVE\s+live-news\/bloomberg/m);
   });
 
-  it('counts a player that never became ready, even alone, as dead while the canaries play; a missing live signal is not re-checked', async () => {
+  it('uses the second alone check when the first alone check stalls too', async () => {
+    const catalog = { webcams: {}, gridPriority: [], news: { bloomberg: [watch('QB5BNdBFujE')] }, canaries: [CANARY] };
+    const { calls, probeYouTube } = recordingProbe((candidate, call) => {
+      if (candidate.kind === 'channel') return live('gCNeDWCI0vo');
+      return call === 4 ? live('QB5BNdBFujE') : silentVerdict;
+    });
+    const { writes: [{ report }] } = await audit(['--all', '--report', 'audit.json'], { catalog, probeYouTube });
+    assert.deepEqual(calls.slice(2), [{ ids: ['QB5BNdBFujE'], batchSize: 1 }, { ids: ['QB5BNdBFujE'], batchSize: 1 }]);
+    const [slot] = report.slots;
+    assert.equal(slot.status, 'ok');
+    assert.deepEqual([slot.attempts[0].verdict, slot.attempts[0].evidence.aloneChecks, slot.attempts[0].evidence.recheckSkipped], ['live', 2, false]);
+  });
+
+  it('counts a player that stalls in the batch and in two checks alone as dead while the canaries play; a missing live signal is not re-checked', async () => {
     const catalog = { webcams: {}, gridPriority: [], news: { bloomberg: [watch('QB5BNdBFujE')], yahoo: [watch('KQp-e_XQnDE')] }, canaries: [CANARY] };
     const { calls, probeYouTube } = recordingProbe((candidate) => {
       if (candidate.kind === 'channel') return live('gCNeDWCI0vo');
@@ -603,16 +617,16 @@ describe('audit report (--all --report)', () => {
       return silentVerdict;
     });
     const { lines, writes: [{ report }] } = await audit(['--all', '--report', 'audit.json'], { catalog, probeYouTube });
-    assert.deepEqual(calls.slice(2), [{ ids: ['QB5BNdBFujE'], batchSize: 1 }]);
+    assert.deepEqual(calls.slice(2), [{ ids: ['QB5BNdBFujE'], batchSize: 1 }, { ids: ['QB5BNdBFujE'], batchSize: 1 }]);
     const [bloomberg, yahoo] = report.slots;
     assert.equal(bloomberg.status, 'needs-replacement');
     assert.deepEqual(
-      [bloomberg.attempts[0].verdict, bloomberg.attempts[0].unverifiableFromRunner, bloomberg.attempts[0].why, bloomberg.attempts[0].evidence.checkedAlone],
-      ['unverifiable', false, 'the player never became ready, even when checked alone', true],
+      [bloomberg.attempts[0].verdict, bloomberg.attempts[0].unverifiableFromRunner, bloomberg.attempts[0].why, bloomberg.attempts[0].evidence.aloneChecks],
+      ['unverifiable', false, 'the player never became ready, in the batch or in two checks alone', 2],
     );
     assert.equal(yahoo.status, 'unverifiable-from-runner');
-    assert.equal(yahoo.attempts[0].evidence.checkedAlone, false);
-    assert.match(lines.join('\n'), /why: the player never became ready, even when checked alone/);
+    assert.equal(yahoo.attempts[0].evidence.aloneChecks, 0);
+    assert.match(lines.join('\n'), /why: the player never became ready, in the batch or in two checks alone/);
   });
 
   it('skips the re-check and keeps a never-ready player unverifiable when no canary plays', async () => {
@@ -622,8 +636,39 @@ describe('audit report (--all --report)', () => {
     assert.equal(calls.length, 2);
     const [slot] = report.slots;
     assert.equal(slot.status, 'unverifiable-from-runner');
-    assert.deepEqual([slot.attempts[0].unverifiableFromRunner, slot.attempts[0].evidence.checkedAlone], [true, false]);
+    assert.deepEqual(
+      [slot.attempts[0].unverifiableFromRunner, slot.attempts[0].evidence.aloneChecks, slot.attempts[0].evidence.recheckSkipped, slot.attempts[0].why],
+      [true, 0, false, 'the player frame loaded but never became ready'],
+    );
     assert.equal(report.canaries[0].verdict, 'unverifiable');
+  });
+
+  it('stops checking alone once the audit time budget is used up, and leaves the rest unverifiable', async () => {
+    const catalog = {
+      webcams: {},
+      gridPriority: [],
+      news: { bloomberg: [watch('QB5BNdBFujE')], yahoo: [watch('KQp-e_XQnDE')], rtve: [watch('-xzg3wujOVM')] },
+      canaries: [CANARY],
+    };
+    // Each alone check takes half the budget, so two run and nothing fits after them.
+    let nowMs = 0;
+    const { calls, probeYouTube } = recordingProbe((candidate, call) => {
+      if (call > 2) nowMs += ALONE_RECHECK_BUDGET_MS / 2;
+      return candidate.kind === 'channel' ? live('gCNeDWCI0vo') : silentVerdict;
+    });
+    const { lines, writes: [{ report }] } = await audit(['--all', '--report', 'audit.json'], { catalog, probeYouTube, clock: () => nowMs });
+    assert.deepEqual(calls.slice(2).map((call) => call.ids), [['QB5BNdBFujE'], ['KQp-e_XQnDE']]);
+    for (const slot of report.slots) {
+      const [attempt] = slot.attempts;
+      assert.equal(slot.status, 'unverifiable-from-runner', slot.slot);
+      assert.deepEqual(
+        [attempt.why, attempt.unverifiableFromRunner, attempt.evidence.recheckSkipped],
+        ['not re-checked: audit time budget used up', true, true],
+        slot.slot,
+      );
+    }
+    assert.deepEqual(report.slots.map((slot) => slot.attempts[0].evidence.aloneChecks), [1, 1, 0]);
+    assert.match(lines.join('\n'), /why: not re-checked: audit time budget used up/);
   });
 
   it('records a live HLS playlist as live with playback not checked', async () => {

@@ -133,11 +133,15 @@ export function renderAuditBody(report, { runUrl = '', canaries, gridPriority = 
   const shown = inAttentionOrder(findings.filter((slot) => slot.shownByDefault), gridPriority);
   const hidden = inAttentionOrder(findings.filter((slot) => !slot.shownByDefault), gridPriority);
   const unverifiable = report.slots.filter((slot) => slot.status === 'unverifiable-from-runner');
+  const recheckSkipped = report.slots.flatMap((slot) => slot.attempts).filter((attempt) => attempt.evidence?.recheckSkipped === true).length;
   const lines = [
     `Daily live video source audit: ${findings.length} slot(s) need attention, ${shown.length} of them shown by default.`,
     '',
     `- Checked: ${cell(report.checkedAt)}${runUrl ? ` — [Workflow run](${runUrl})` : ''}`,
     `- Canaries: ${canaries}`,
+    ...(recheckSkipped > 0
+      ? [`- Not re-checked alone: ${recheckSkipped} never-ready ${recheckSkipped === 1 ? 'entry' : 'entries'}, because the audit time budget was used up`]
+      : []),
     '',
     'Status `needs-replacement` means no entry is live, `degraded` means an earlier entry failed and a later one plays, and `empty` means a slot viewers see by default has no entries.',
   ];
@@ -147,7 +151,7 @@ export function renderAuditBody(report, { runUrl = '', canaries, gridPriority = 
     const rows = unverifiable.flatMap((slot) => slot.attempts.map((attempt, index) => [slot.slot, slot.surface, entryCell(attempt, index), because(attempt)]));
     lines.push(
       '', '### Could not verify from the runner', '',
-      'An HLS 403 or 451, an HLS timeout, a YouTube player that never became ready while no canary played, a player that stopped reporting whether a video is live, or a YouTube player API that did not load can depend on the runner (its network, its region, or YouTube itself). These slots may still play for viewers, so they are not counted above. A player that never became ready while a canary played is checked again alone, and is counted above if it still fails.',
+      'An HLS 403 or 451, an HLS timeout, a YouTube player that never became ready while no canary played, a player that stopped reporting whether a video is live, or a YouTube player API that did not load can depend on the runner (its network, its region, or YouTube itself). These slots may still play for viewers, so they are not counted above. A player that never became ready while a canary played is checked alone up to twice within the audit time budget, and is counted above only if both checks stall.',
       '', ...table(['Slot', 'Where it shows', 'Entry', 'Why'], rows),
     );
   }

@@ -293,6 +293,24 @@ describe('live video audit issue', () => {
     assert.equal(body.indexOf('live-news/bloomberg'), body.indexOf('live-news/bloomberg', section), 'listed only in the unverifiable section');
   });
 
+  it('notes in the header how many never-ready entries the time budget left unchecked', async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'live-video-audit-budget-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const skipped = (entry) => attempt(entry, 'unverifiable', { why: 'not re-checked: audit time budget used up', unverifiableFromRunner: true, evidence: { recheckSkipped: true } });
+    const report = reportFor(baseCatalog, {
+      'live-news/bloomberg': { status: 'unverifiable-from-runner', attempts: [skipped(watch('QB5BNdBFujE'))] },
+      'live-news/rtve': { status: 'unverifiable-from-runner', attempts: [skipped(watch('KQp-e_XQnDE'))] },
+    });
+
+    const summaryPath = join(dir, 'summary.md');
+    await publish(report, { gh: fakeGh([]).gh, summaryPath });
+    assert.match(readFileSync(summaryPath, 'utf8'), /^- Not re-checked alone: 2 never-ready entries, because the audit time budget was used up$/m);
+
+    const quietPath = join(dir, 'quiet.md');
+    await publish(reportFor(baseCatalog), { gh: fakeGh([]).gh, summaryPath: quietPath });
+    assert.doesNotMatch(readFileSync(quietPath, 'utf8'), /Not re-checked alone/);
+  });
+
   it('counts an empty grid hotspot as "no entries configured", first, with the slot shown in its cell', async () => {
     const catalog = { ...baseCatalog, webcams: { ...baseCatalog.webcams, jerusalem: [] } };
     const report = reportFor(catalog, {

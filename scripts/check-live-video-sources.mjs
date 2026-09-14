@@ -13,6 +13,12 @@ const PROBE_ORIGIN = 'https://www.worldmonitor.app';
 const PROBE_URL = `${PROBE_ORIGIN}/__live_video_probe__`;
 const BATCH_SIZE = 8;
 const MAX_POLLS = Math.ceil((2 * LIVE_VIDEO_TIMING.verdictDeadlineMs) / LIVE_VIDEO_TIMING.pollMs);
+/** A player that never became ready counts as dead only after this many checks alone stall too. */
+export const ALONE_RECHECKS = 2;
+/** Total time the alone checks may take, so the audit workflow always reaches its reporter inside the job timeout. */
+export const ALONE_RECHECK_BUDGET_MS = 4 * 60_000;
+/** The longest one alone check can take: a browser launch, the page and every poll. A check starts only if this still fits. */
+const ALONE_CHECK_MAX_MS = MAX_POLLS * LIVE_VIDEO_TIMING.pollMs + 15_000;
 const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
 const INDENT = ' '.repeat(12);
 const CATALOG_FILE = 'src/config/live-video-sources.ts';
@@ -30,7 +36,8 @@ Label an entry with name=, e.g. kyiv=https://www.youtube.com/watch?v=e2gC37ILQmk
 
 --slot checks every entry of one slot in ${CATALOG_FILE}.
 --all checks every slot and the audit canaries, and lists slots with no entries. The canaries are
-  checked first; while one plays, a player that never became ready is checked again on its own page.
+  checked first; while one plays, a player that never became ready is checked again on its own page,
+  up to twice within ${ALONE_RECHECK_BUDGET_MS / 60_000} minutes, and counts as dead only when both checks stall.
 --report also writes the --all result as JSON: where each slot shows, its status and every attempt.
   scripts/report-live-video-audit.mjs turns that file into the daily audit issue.
 
@@ -123,7 +130,10 @@ function why(result) {
     case 'unverifiable':
       if (verdict.reason === 'player-api-blocked') return 'the YouTube IFrame API did not load';
       if (verdict.reason === 'live-signal-missing') return 'the player no longer reports whether a video is live (isLive missing)';
-      return result.checkedAlone ? 'the player never became ready, even when checked alone' : 'the player frame loaded but never became ready';
+      if (result.recheckSkipped) return 'not re-checked: audit time budget used up';
+      return result.aloneChecks >= ALONE_RECHECKS
+        ? 'the player never became ready, in the batch or in two checks alone'
+        : 'the player frame loaded but never became ready';
   }
   return 'unknown verdict';
 }
@@ -401,9 +411,9 @@ const NETWORK_TIMEOUT_CODES = new Set(['UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADE
 function unverifiableFromRunner(row) {
   if (!row.parsed.ok) return false;
   const { verdict } = row;
-  // A player that never became ready is dead only once it failed again alone while a canary played
-  // (reprobeNeverReadyAlone): in a batched page the stall can be the page, not the stream.
-  if (verdict.verdict === 'unverifiable') return !(verdict.reason === 'player-api-silent' && row.checkedAlone);
+  // A player that never became ready is dead only once it also stalled in ALONE_RECHECKS checks alone while a
+  // canary played (recheckNeverReadyAlone): in a batched page, or on one page alone, the stall can be the page.
+  if (verdict.verdict === 'unverifiable') return !(verdict.reason === 'player-api-silent' && row.aloneChecks >= ALONE_RECHECKS);
   if (verdict.verdict !== 'failed' || row.parsed.candidate.kind !== 'hls') return false;
   const { outcome } = verdict;
   return outcome.kind === 'timeout'
@@ -431,7 +441,8 @@ function attemptRecord(row) {
       httpStatus: outcome?.kind === 'hls-http' ? outcome.status : null,
       durationSeconds: row.durationSeconds ?? null,
       verdictAtMs: row.verdictAtMs ?? null,
-      checkedAlone: row.checkedAlone === true,
+      aloneChecks: row.aloneChecks ?? 0,
+      recheckSkipped: row.recheckSkipped === true,
     },
   };
 }
@@ -516,16 +527,27 @@ const isCanary = (row) => row.name?.startsWith('canary/') === true;
 const neverBecameReady = (row) => row.parsed.ok && row.verdict?.verdict === 'unverifiable' && row.verdict.reason === 'player-api-silent';
 
 /**
- * Re-checks every entry whose player never became ready, one player per page with the full deadline:
- * a crowded batched page can stall a player that plays fine alone. The verdict it settles on alone
- * replaces the batched one. Callers run this only while a canary plays, so a runner-wide stall never
- * turns into rot.
+ * Re-checks every entry whose player never became ready, one player per page with the full deadline, in up
+ * to ALONE_RECHECKS rounds: a crowded page, or one unlucky page alone (1 of 12 when measured), can stall a
+ * player that plays fine. The latest verdict replaces the earlier one. A check starts only while it still
+ * fits in `budgetMs`; entries it cannot reach are marked recheckSkipped. Callers run this only while a
+ * canary plays, so a runner-wide stall never turns into rot.
  */
-async function reprobeNeverReadyAlone(rows, probeYouTube) {
-  const stalled = rows.filter(neverBecameReady);
-  if (stalled.length === 0) return;
-  const probed = await probeYouTube(stalled.map((row) => row.parsed.candidate), { batchSize: 1 });
-  stalled.forEach((row, index) => Object.assign(row, probed[index], { checkedAlone: true }));
+async function recheckNeverReadyAlone(rows, probeYouTube, { budgetMs, clock }) {
+  const startedAt = clock();
+  const fits = () => clock() - startedAt + ALONE_CHECK_MAX_MS <= budgetMs;
+  let pending = rows.filter(neverBecameReady);
+  for (let check = 1; check <= ALONE_RECHECKS && pending.length > 0; check++) {
+    for (const row of pending) {
+      if (!fits()) {
+        row.recheckSkipped = true;
+        continue;
+      }
+      const [probed] = await probeYouTube([row.parsed.candidate], { batchSize: 1 });
+      Object.assign(row, probed, { aloneChecks: check });
+    }
+    pending = pending.filter((row) => !row.recheckSkipped && neverBecameReady(row));
+  }
 }
 
 /** Checks bare entries and returns them as report attempts; the reporter re-checks the canaries with this. */
@@ -543,6 +565,7 @@ export async function runCheck(argv, {
   surfaces,
   writeReport = writeFileSync,
   now = () => new Date(),
+  clock = () => performance.now(),
 } = {}) {
   let args;
   let targets;
@@ -569,7 +592,9 @@ export async function runCheck(argv, {
   const slotRows = rows.filter((row) => !isCanary(row));
   await probeRows(canaryRows, { probeYouTube, probeHls });
   await probeRows(slotRows, { probeYouTube, probeHls });
-  if (canaryRows.some((row) => row.verdict?.verdict === 'live')) await reprobeNeverReadyAlone(slotRows, probeYouTube);
+  if (canaryRows.some((row) => row.verdict?.verdict === 'live')) {
+    await recheckNeverReadyAlone(slotRows, probeYouTube, { budgetMs: ALONE_RECHECK_BUDGET_MS, clock });
+  }
 
   for (const slot of targets.empty) write(formatEmptySlot(slot));
   for (const row of rows) write(formatCheckLine(row));
