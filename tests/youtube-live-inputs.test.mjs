@@ -43,7 +43,7 @@ test('channel live detection is retired: shipped handles, international handles 
   const handles = new Set([...panel.matchAll(/handle:\s*'([^']+)'/g)].map(match => match[1]));
   assert.ok(handles.size > 50);
   const surface = edge();
-  for (const channel of [...handles, '@中', '@あい', '@café', '@a·b', 'UCabcdefghijklmnopqrstuv']) {
+  for (const channel of [...handles, '@中', '@あい', '@cafe\u0301', '@a·b', 'UCabcdefghijklmnopqrstuv']) {
     const response = await surface.request({ channel });
     assert.equal(response.status, 410, channel);
     assert.deepEqual(await response.json(), RETIRED, channel);
@@ -66,7 +66,16 @@ test('a video is named from YouTube oEmbed alone, even when a channel is also gi
   }
 });
 test('the relay no longer serves, proxies or configures YouTube live detection', () => {
+  // Positive controls: the absence checks below read the real route table and the helper the relay keeps.
+  assert.match(relaySource, /pathname === '\/yahoo-chart'/, 'the relay route table must still be readable');
+  assert.match(relaySource, /function ytFetchViaProxy\(/, 'the shared proxy helper stays for its PROXY_URL callers');
   assert.doesNotMatch(relaySource, /['"]\/youtube-live['"]/, 'the /youtube-live route falls through to the relay 404');
   assert.doesNotMatch(relaySource, /YOUTUBE_PROXY_URL/);
   assert.doesNotMatch(relaySource, /function handleYouTubeLiveRequest|function ytFetchDirect|function ytFetch\(|ytLiveCache|YT_CACHE_TTL/);
+});
+test('the earlier tests leave no synthetic relay or limiter env behind', () => {
+  // Runs last: afterEach must delete keys edge() added, not only restore the snapshot's own keys.
+  for (const name of ['WS_RELAY_URL', 'UPSTASH_REDIS_REST_URL', 'UPSTASH_REDIS_REST_TOKEN']) {
+    assert.equal(process.env[name], originalEnv[name], name);
+  }
 });

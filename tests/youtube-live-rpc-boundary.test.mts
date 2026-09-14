@@ -35,11 +35,11 @@ beforeEach(async () => {
   globalThis.fetch = (async (input, init) => {
     const url = new URL(String(input));
     calls.push(url);
+    // Tripwire: the relay answers as if it still served lookups, so any call to it shows up in the results.
     if (url.hostname === 'relay.example.test') return Response.json({ videoId: VIDEO, isLive: true, channelExists: true });
     if (url.hostname === 'www.youtube.com') {
-      if (oembedFails) return new Response('', { status: 503 });
-      if (url.pathname === '/oembed') return Response.json({ title: 'Synthetic video', author_name: 'Synthetic channel' });
-      return new Response(`{"channelId":"${CHANNEL_ID}","videoDetails":{"videoId":"${VIDEO}","isLive":true}}`);
+      if (oembedFails || url.pathname !== '/oembed') return new Response('', { status: 503 });
+      return Response.json({ title: 'Synthetic video', author_name: 'Synthetic channel' });
     }
     return redis.fetchImpl(input, init);
   }) as typeof fetch;
@@ -76,7 +76,7 @@ describe('YouTube public RPC input boundary and retired channel detection', () =
     const source = readFileSync(new URL('../src/components/LiveNewsPanel.ts', import.meta.url), 'utf8');
     const handles = new Set([...source.matchAll(/handle:\s*'([^']+)'/g)].map(match => match[1]!));
     assert.ok(handles.size > 50);
-    for (const channel of [...handles, '@中', '@あい', '@café', '@a·b', CHANNEL_ID]) {
+    for (const channel of [...handles, '@中', '@あい', '@cafe\u0301', '@a·b', CHANNEL_ID]) {
       assert.deepEqual(await getYoutubeLiveStreamInfo(ctx(), { channel, videoId: '' }), RETIRED, channel);
     }
     assert.equal(calls.length, 0);
