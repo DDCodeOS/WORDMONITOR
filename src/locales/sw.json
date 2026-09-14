@@ -935,9 +935,9 @@
         "space": "NAFASI"
       },
       "connecting": "Inaunganisha…",
-      "unverified": "Haiwezi kuthibitisha kuwa mtaji huu ni moja kwa moja",
-      "offline": "{{city}} hayako mtandaoni sasa",
-      "noFeeds": "Hakuna kamera za mtandaoni moja kwa moja katika eneo hili sasa"
+      "unverified": "Haiwezekani kuthibitisha kwamba mtiririko huu ni wa moja kwa moja",
+      "offline": "{{city}} haiko hewani kwa sasa",
+      "noFeeds": "Hakuna kamera za wavuti za moja kwa moja katika eneo hili kwa sasa"
     },
     "pinnedWebcams": {
       "pinFromMap": "Bandika kamera ya wavuti kutoka kwenye ramani"
