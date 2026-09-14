@@ -1,6 +1,8 @@
 import { ensureHydrated, getHydratedData, waitForBootstrapSlowTier } from './bootstrap';
 import { getPersistentCache, setPersistentCache } from './persistent-cache';
 import type { ConvergenceCard, CorrelationDomain } from './correlation-engine';
+import { CORRELATION_DOMAINS } from './correlation-engine/types';
+import { enqueueSentryCall } from '@/bootstrap/sentry-defer';
 
 export interface CorrelationSnapshot {
   cards: ConvergenceCard[];
@@ -8,17 +10,18 @@ export interface CorrelationSnapshot {
   origin: 'seed' | 'local';
 }
 
-export type CorrelationSnapshotState =
+export type CorrelationSnapshotState = { offline: boolean } & (
   | { status: 'loading' | 'waiting'; snapshot: null }
-  | { status: 'current' | 'updating'; snapshot: CorrelationSnapshot };
+  | { status: 'current' | 'updating'; snapshot: CorrelationSnapshot });
 
-const DOMAINS = ['military', 'escalation', 'economic', 'disaster'] as const;
 const CACHE_KEY = 'correlation-snapshots:v1';
 const MINUTE = 60_000;
 const REFRESH_MS = 5 * MINUTE;
 const FRESH_MS = 15 * MINUTE;
 // Historical display only; this does not extend the producer's freshness budget.
 const MAX_AGE_MS = 60 * MINUTE;
+// Client clocks can lag the producer; reject only implausibly future-dated data.
+const CLOCK_SKEW_MS = 10 * MINUTE;
 
 type Listener = (state: CorrelationSnapshotState) => void;
 const snapshots = new Map<CorrelationDomain, CorrelationSnapshot>();
@@ -32,6 +35,9 @@ let attempted = false;
 let failureCount = 0;
 let nextFetchAt = 0;
 let saveQueued = false;
+let offlineProbeAt = 0;
+let reachedServer = false;
+let reportedFailure = false;
 
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -61,19 +67,20 @@ function validCards(value: unknown, domain: CorrelationDomain): value is Converg
 }
 
 function validTime(value: unknown): value is number {
-  return finite(value) && value > 0 && value <= Date.now() + MINUTE
+  return finite(value) && value > 0 && value <= Date.now() + CLOCK_SKEW_MS
     && Date.now() - value < MAX_AGE_MS;
 }
 
 function stateFor(domain: CorrelationDomain): CorrelationSnapshotState {
+  const offline = navigator.onLine === false && !reachedServer;
   const snapshot = snapshots.get(domain);
   if (!snapshot || !validTime(snapshot.computedAt)) {
-    return { status: attempted ? 'waiting' : 'loading', snapshot: null };
+    return { status: attempted ? 'waiting' : 'loading', snapshot: null, offline };
   }
-  const updating = pending || navigator.onLine === false
+  const updating = pending || offline
     || Date.now() - snapshot.computedAt >= FRESH_MS
     || (snapshot.origin === 'seed' && failedDomains.has(domain));
-  return { status: updating ? 'updating' : 'current', snapshot };
+  return { status: updating ? 'updating' : 'current', snapshot, offline };
 }
 
 function notify(): void {
@@ -116,7 +123,8 @@ function persist(): void {
       // Local adapters may attach large source objects; the panel never renders them.
       cards: snapshot.cards.map(card => ({
         ...card,
-        assessment: snapshot.origin === 'seed' ? card.assessment : undefined,
+        // Premium annotations belong to the current session, even on seed cards.
+        assessment: undefined,
         signals: card.signals.map(({ rawData: _rawData, ...signal }) => signal),
       })),
     }]));
@@ -130,7 +138,7 @@ async function restore(epoch: number): Promise<void> {
   try {
     const saved = await getPersistentCache<unknown>(CACHE_KEY);
     if (!active || epoch !== generation || !record(saved?.data)) return;
-    for (const domain of DOMAINS) {
+    for (const domain of CORRELATION_DOMAINS) {
       const value = saved.data[domain];
       if (record(value) && validTime(value.computedAt) && validCards(value.cards, domain)
         && (value.origin === 'seed' || (value.origin === 'local' && value.cards.length > 0))) {
@@ -154,9 +162,10 @@ async function refresh(): Promise<void> {
     if (!active || epoch !== generation) return;
     const payload = getHydratedData('correlationCards') ?? await ensureHydrated('correlationCards');
     if (!active || epoch !== generation) return;
+    reachedServer = payload !== undefined;
     let changed = false;
     failedDomains.clear();
-    for (const domain of DOMAINS) {
+    for (const domain of CORRELATION_DOMAINS) {
       if (record(payload) && validTime(payload.computedAt) && validCards(payload[domain], domain)) {
         changed = accept(domain, {
           cards: payload[domain], computedAt: payload.computedAt, origin: 'seed',
@@ -171,16 +180,29 @@ async function refresh(): Promise<void> {
     }
   } catch (error) {
     if (!active || epoch !== generation) return;
-    for (const domain of DOMAINS) failedDomains.add(domain);
+    reachedServer = false;
+    for (const domain of CORRELATION_DOMAINS) failedDomains.add(domain);
     console.warn('[CorrelationSnapshot] Refresh failed', error);
   } finally {
     if (active && epoch === generation) {
       pending = false;
       attempted = true;
       failureCount = failedDomains.size ? failureCount + 1 : 0;
-      nextFetchAt = Date.now() + (failureCount
-        ? Math.min(15_000 * 2 ** Math.min(failureCount - 1, 4), 180_000)
-        : REFRESH_MS);
+      if (!failureCount) reportedFailure = false;
+      if (failureCount >= 3 && !reportedFailure && (navigator.onLine !== false || reachedServer)) {
+        reportedFailure = true;
+        const domains = [...failedDomains];
+        try {
+          enqueueSentryCall(s => s.captureMessage('Correlation snapshot recovery stalled', {
+            level: 'warning', tags: { component: 'correlation-snapshots' }, extra: { domains },
+          }));
+        } catch { /* Telemetry must not interrupt recovery. */ }
+      }
+      const retryMs = Math.min(15_000 * 2 ** Math.min(failureCount - 1, 4), 180_000)
+        * (0.8 + 0.2 * Math.random());
+      offlineProbeAt = Date.now() + REFRESH_MS;
+      nextFetchAt = navigator.onLine === false && !reachedServer
+        ? offlineProbeAt : Date.now() + (failureCount ? retryMs : REFRESH_MS);
       notify();
       schedule();
     }
@@ -188,11 +210,11 @@ async function refresh(): Promise<void> {
 }
 
 function tick(): void {
-  if (!active) return;
+  if (!active || document.hidden) return;
   if (!pending && Date.now() >= nextFetchAt) {
-    if (navigator.onLine === false) {
+    if (navigator.onLine === false && !reachedServer && Date.now() < offlineProbeAt) {
       attempted = true;
-      nextFetchAt = Date.now() + MINUTE;
+      nextFetchAt = offlineProbeAt;
     } else {
       void refresh();
     }
@@ -203,13 +225,25 @@ function tick(): void {
 
 function schedule(): void {
   clearTimeout(timer);
-  if (!active) return;
+  if (!active || document.hidden) return;
   timer = setTimeout(tick, pending ? MINUTE : Math.max(1, Math.min(MINUTE, nextFetchAt - Date.now())));
 }
 
 function reconnect(): void {
   nextFetchAt = 0;
+  offlineProbeAt = 0;
   tick();
+}
+
+function disconnect(): void {
+  reachedServer = false;
+  offlineProbeAt = Date.now() + MINUTE;
+  tick();
+}
+
+function visibilityChanged(): void {
+  clearTimeout(timer);
+  if (!document.hidden) tick();
 }
 
 export function subscribeCorrelationSnapshot(domain: CorrelationDomain, listener: Listener): () => void {
@@ -222,9 +256,12 @@ export function subscribeCorrelationSnapshot(domain: CorrelationDomain, listener
     active = true;
     generation++;
     window.addEventListener('online', reconnect);
-    window.addEventListener('offline', tick);
+    window.addEventListener('offline', disconnect);
+    document.addEventListener('visibilitychange', visibilityChanged);
     void restore(generation);
     nextFetchAt = 0;
+    reachedServer = false;
+    offlineProbeAt = Date.now() + MINUTE;
     tick();
   }
   return () => {
@@ -238,7 +275,8 @@ export function subscribeCorrelationSnapshot(domain: CorrelationDomain, listener
     pending = false;
     clearTimeout(timer);
     window.removeEventListener('online', reconnect);
-    window.removeEventListener('offline', tick);
+    window.removeEventListener('offline', disconnect);
+    document.removeEventListener('visibilitychange', visibilityChanged);
   };
 }
 

@@ -18,6 +18,7 @@ test('FAST-demoted consumers use demand-gated public hydration without miss-to-R
   const forecasts = method(loader, '  async loadForecasts()', '  async loadSimulationOutcome(');
   const correlation = read('src/components/CorrelationPanel.ts');
   const correlationLoader = read('src/services/correlation-snapshots.ts');
+  const correlationRefresh = method(correlationLoader, 'async function refresh()', 'function tick()');
 
   assert.match(forecasts, /await ensureHydrated\('forecasts'\)/);
   assert.doesNotMatch(forecasts, /fetchForecastFeed|getForecasts/);
@@ -26,7 +27,7 @@ test('FAST-demoted consumers use demand-gated public hydration without miss-to-R
   assert.match(correlationLoader, /ensureHydrated\('correlationCards'\)/);
   assert.match(correlation, /observeNearViewport\(\(\) => \{[\s\S]*subscribeCorrelationSnapshot[\s\S]*\}, 400\)/);
   assert.match(
-    correlationLoader,
+    correlationRefresh,
     /waitForBootstrapSlowTier\(3_500\)[\s\S]*getHydratedData\('correlationCards'\)[\s\S]*ensureHydrated\('correlationCards'\)/,
     'rolling deploys must re-read the old SLOW response before trying the new per-key URL',
   );

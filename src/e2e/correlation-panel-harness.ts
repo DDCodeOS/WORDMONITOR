@@ -21,6 +21,7 @@ globalThis.fetch = async (input, init) => {
       economic: mode === 'empty' ? [] : [{
         id: 'fixture-economic', domain: 'economic', title: 'Energy trade restrictions',
         score: 42, timestamp: computedAt, countries: ['US'], trend: 'stable',
+        location: { lat: 38.9, lon: -77.0, label: 'Synthetic location' },
         signals: [
           { type: 'sanctions_news', source: 'fixture', severity: 45, timestamp: computedAt, label: 'Synthetic sanctions announcement' },
           { type: 'commodity_spike', source: 'fixture', severity: 40, timestamp: computedAt, label: 'Synthetic energy price movement' },

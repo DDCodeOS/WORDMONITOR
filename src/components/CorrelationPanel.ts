@@ -32,9 +32,13 @@ export class CorrelationPanel extends Panel {
   private expandedCard: string | null = null;
   private onMapNavigate?: (lat: number, lon: number) => void;
   private boundUpdateHandler: EventListener;
-  private snapshotState: CorrelationSnapshotState = { status: 'loading', snapshot: null };
+  private snapshotState: CorrelationSnapshotState = { status: 'loading', snapshot: null, offline: false };
   private stopSnapshots?: () => void;
   private correlationDestroyed = false;
+  private assessmentHandler?: (cards: ConvergenceCard[]) => void;
+  private assessedCards?: ConvergenceCard[];
+  private renderedCards?: ConvergenceCard[];
+  private renderedOrigin?: 'seed' | 'local';
 
   constructor(id: string, title: string, domain: CorrelationDomain, infoTooltip?: string) {
     super({ id, title, showCount: true, infoTooltip });
@@ -45,12 +49,13 @@ export class CorrelationPanel extends Panel {
       if (this.correlationDestroyed) return;
       this.stopSnapshots = subscribeCorrelationSnapshot(this.domain, state => {
         this.snapshotState = state;
-        this.requestRender();
+        this.requestAssessments();
+        this.requestRender(false);
       });
     }, 400);
 
     this.boundUpdateHandler = ((e: CustomEvent) => {
-      if (e.detail?.domains?.includes(this.domain)) {
+      if (e.detail?.assessmentUpdate && e.detail?.domains?.includes(this.domain)) {
         this.requestRender();
       }
     }) as EventListener;
@@ -68,6 +73,20 @@ export class CorrelationPanel extends Panel {
     this.onMapNavigate = handler;
   }
 
+  setAssessmentHandler(handler: (cards: ConvergenceCard[]) => void): void {
+    this.assessmentHandler = handler;
+    this.assessedCards = undefined;
+    this.requestAssessments();
+    this.requestRender();
+  }
+
+  private requestAssessments(): void {
+    const cards = this.snapshotState.snapshot?.cards;
+    if (!this.assessmentHandler || !cards || cards === this.assessedCards) return;
+    this.assessedCards = cards;
+    this.assessmentHandler(cards);
+  }
+
   protected navigateToMap(lat: number, lon: number): void {
     this.onMapNavigate?.(lat, lon);
   }
@@ -77,14 +96,18 @@ export class CorrelationPanel extends Panel {
   }
 
   private pendingRender = false;
+  private forceRender = false;
   /** Schedule a safe redraw for subclasses that install deferred panel data. */
-  protected requestRender(): void {
+  protected requestRender(force = true): void {
+    this.forceRender ||= force;
     if (this.correlationDestroyed || this.pendingRender) return;
     this.pendingRender = true;
     requestAnimationFrame(() => {
       this.pendingRender = false;
       if (this.correlationDestroyed) return;
-      this.render();
+      const force = this.forceRender;
+      this.forceRender = false;
+      this.render(force);
     });
   }
 
@@ -92,23 +115,36 @@ export class CorrelationPanel extends Panel {
     if (!this.correlationDestroyed) publishLocalCorrelationCards(this.domain, cards);
   }
 
-  private render(): void {
+  private render(force = true): void {
     if (this.correlationDestroyed) return;
     const cards = this.snapshotState.snapshot?.cards ?? [];
     this.setCount(cards.length);
     if (this.countEl) this.countEl.hidden = this.snapshotState.snapshot === null;
-    const supplement = this.renderSupplement();
-    const { snapshot, status } = this.snapshotState;
+    const { snapshot, status, offline } = this.snapshotState;
     const notice = h('div', {
       className: 'correlation-status',
       role: 'status',
       style: 'padding:8px;opacity:0.7;font-size:calc(10px * var(--wm-panel-effective-scale, 1));line-height:1.5;',
     }, snapshot
-      ? t(`components.correlation.${navigator.onLine === false ? 'savedOffline' : status === 'updating' ? 'saved' : 'updated'}`, {
+      ? t(`components.correlation.${offline ? 'savedOffline' : status === 'updating' ? 'saved' : 'updated'}`, {
         time: describeFreshness(snapshot.computedAt),
       })
-      : t(`components.correlation.${navigator.onLine === false ? 'offline' : 'waiting'}`),
+      : t(`components.correlation.${offline ? 'offline' : status === 'loading' ? 'loading' : 'waiting'}`),
     ...(snapshot?.origin === 'local' ? [h('div', {}, t('components.correlation.localSignals'))] : []));
+
+    const emptyText = t(`components.correlation.${status === 'updating' ? 'emptySaved' : 'empty'}`);
+    const previousNotice = this.content.querySelector('.correlation-status');
+    if (!force && !this.isLocked && previousNotice
+      && this.renderedCards === snapshot?.cards && this.renderedOrigin === snapshot?.origin) {
+      // Updating age/connectivity must not replace focused controls or reset scrolling.
+      previousNotice.replaceChildren(...notice.childNodes);
+      const empty = this.content.querySelector('.correlation-empty');
+      if (empty) empty.textContent = emptyText;
+      return;
+    }
+    this.renderedCards = snapshot?.cards;
+    this.renderedOrigin = snapshot?.origin;
+    const supplement = this.renderSupplement();
 
     if (!snapshot) {
       this.setContentNodes(...(supplement ? [supplement] : []), notice);
@@ -119,7 +155,7 @@ export class CorrelationPanel extends Panel {
       const empty = h('div', {
         className: 'correlation-empty',
         style: 'padding:12px;text-align:center;opacity:0.5;font-size:calc(11px * var(--wm-panel-effective-scale, 1));',
-      }, t(`components.correlation.${status === 'updating' ? 'emptySaved' : 'empty'}`));
+      }, emptyText);
       // #6557: a settled empty state is authoritative content.
       this.setContentNodes(...(supplement ? [supplement] : []), notice, empty);
       return;

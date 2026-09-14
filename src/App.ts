@@ -285,6 +285,7 @@ const DEFAULT_VIEWPORT_MARGIN_PX = 400;
 // run site (#4486) so the engine bytes stay off the eager boot graph. The TYPE is
 // referenced via the inline `import(...)` type in app-context.ts (erased at build).
 import type { CorrelationPanel } from '@/components/CorrelationPanel';
+import { CORRELATION_DOMAINS } from '@/services/correlation-engine/types';
 
 const CYBER_LAYER_ENABLED = import.meta.env.VITE_ENABLE_CYBER_LAYER === 'true';
 const FREE_MAP_PANEL_ACCESS_KEY = 'worldmonitor-free-map-panel-access-v1';
@@ -1940,6 +1941,10 @@ export class App {
       engine.registerAdapter(economicAdapter);
       engine.registerAdapter(disasterAdapter);
       this.state.correlationEngine = engine;
+      for (const domain of CORRELATION_DOMAINS) {
+        const panel = this.state.panels[`${domain}-correlation`] as CorrelationPanel | undefined;
+        panel?.setAssessmentHandler(cards => engine.assessCards(cards));
+      }
 
       await this.runCorrelationEngine();
     } catch (error) {
@@ -1961,7 +1966,7 @@ export class App {
     // which on a first-run overlap would write empty cards into live panels.
     const didRun = await engine.run(this.state, runtimeMode);
     if (!didRun || this.state.isDestroyed) return;
-    for (const domain of ['military', 'escalation', 'economic', 'disaster'] as const) {
+    for (const domain of CORRELATION_DOMAINS) {
       const panel = this.state.panels[`${domain}-correlation`] as CorrelationPanel | undefined;
       panel?.updateCards(engine.getCards(domain));
     }
