@@ -38,6 +38,8 @@ const EMBED_BLOCKED: SettledVerdict = { verdict: 'failed', outcome: { kind: 'pla
 const NOT_FOUND: SettledVerdict = { verdict: 'failed', outcome: { kind: 'player-error', code: 100 } };
 const SILENT: SettledVerdict = { verdict: 'unverifiable', reason: 'player-api-silent' };
 const BLOCKED_API: SettledVerdict = { verdict: 'unverifiable', reason: 'player-api-blocked' };
+const NOT_STARTED: SettledVerdict = { verdict: 'failed', outcome: { kind: 'not-started' } };
+const SIGNAL_MISSING: SettledVerdict = { verdict: 'unverifiable', reason: 'live-signal-missing' };
 
 function verdict(state: ChainState, settled: SettledVerdict, parsed: ParsedSource, nowMs = 10_000) {
   return advanceChain(state, { type: 'verdict', verdict: settled }, parsed, nowMs);
@@ -163,6 +165,34 @@ describe('advanceChain', () => {
     const step = verdict(startChain(youtubeOnly, new Set()).state, BLOCKED_API, youtubeOnly);
     assert.deepEqual(step.state.phase === 'unverified' && step.state.reason, 'player-api-blocked');
     assert.deepEqual(step.effect, { type: 'keep' });
+  });
+
+  it('counts a stream that never started as not live', () => {
+    const scheduled = source([JERUSALEM]);
+    const step = verdict(startChain(scheduled, new Set()).state, NOT_STARTED, scheduled);
+    assert.equal(step.state.phase === 'offline' && step.state.reason, 'not-live');
+    assert.deepEqual(step.effect, { type: 'unmount' });
+
+    const mixed = source([JERUSALEM, AJE_CHANNEL, KYIV_RECORDING]);
+    let next = verdict(startChain(mixed, new Set()).state, NOT_STARTED, mixed);
+    assert.deepEqual(next.effect, { type: 'mount', index: 1 });
+    next = verdict(next.state, { verdict: 'failed', outcome: { kind: 'channel-not-live' } }, mixed);
+    next = verdict(next.state, RECORDING, mixed);
+    assert.equal(next.state.phase === 'offline' && next.state.reason, 'not-live');
+  });
+
+  it('treats a missing live signal like a blocked player API: never the next YouTube candidate', () => {
+    // The signal is missing for every video, so moving on would empty the wall.
+    const builtin = source([JERUSALEM, AJE_CHANNEL]);
+    const step = verdict(startChain(builtin, new Set()).state, SIGNAL_MISSING, builtin);
+    assert.deepEqual(step.state.phase === 'unverified' && step.state.reason, 'live-signal-missing');
+    assert.deepEqual(step.effect, { type: 'keep' });
+
+    const custom = source([JERUSALEM, AJE_CHANNEL], 'custom');
+    assert.deepEqual(verdict(startChain(custom, new Set()).state, SIGNAL_MISSING, custom).effect, { type: 'keep' });
+
+    const withHls = source([JERUSALEM, AJE_CHANNEL, AJE_HLS]);
+    assert.deepEqual(verdict(startChain(withHls, new Set()).state, SIGNAL_MISSING, withHls).effect, { type: 'mount', index: 2 });
   });
 
   it('re-resolves once when a live stream ends, then goes offline if it ends again soon', () => {

@@ -26,6 +26,7 @@ import {
   type ParsedSource,
   type PlayerObservation,
   type SettledVerdict,
+  type UnverifiableReason,
   type YouTubeVideoSnapshot,
 } from './model';
 import { loadYouTubeIframeApi, type YouTubePlayerLike } from './youtube-iframe-api';
@@ -34,7 +35,7 @@ export type LiveVideoState =
   | { readonly phase: 'connecting'; readonly attempt: number; readonly of: number }
   | { readonly phase: 'live'; readonly via: Candidate['kind']; readonly title: string | null; readonly author: string | null; readonly watchUrl: string | null }
   | { readonly phase: 'recording'; readonly title: string | null; readonly watchUrl: string | null }
-  | { readonly phase: 'unverified'; readonly reason: 'player-api-blocked' | 'player-api-silent'; readonly watchUrl: string | null }
+  | { readonly phase: 'unverified'; readonly reason: UnverifiableReason; readonly watchUrl: string | null }
   | { readonly phase: 'offline'; readonly reason: OfflineReason; readonly watchUrl: string | null };
 
 export interface LiveVideoPresentation {
@@ -462,12 +463,11 @@ function attemptOutcome(verdict: SettledVerdict): Record<string, string | number
   return { outcome: verdict.verdict === 'unverifiable' ? verdict.reason : verdict.verdict };
 }
 
-function reportSignalMissing(slot: string, candidate: Candidate, verdict: SettledVerdict): void {
-  if (signalMissingReported || candidate.kind === 'hls') return;
-  if ((verdict.verdict === 'live' || verdict.verdict === 'recording') && verdict.video?.isLive === undefined) {
-    signalMissingReported = true;
-    track('live-video-signal-missing', { slot });
-  }
+/** Once per page: YouTube stopped exposing isLive, so no tile can be verified live. */
+function reportSignalMissing(slot: string, verdict: SettledVerdict): void {
+  if (signalMissingReported || verdict.verdict !== 'unverifiable' || verdict.reason !== 'live-signal-missing') return;
+  signalMissingReported = true;
+  track('live-video-signal-missing', { slot });
 }
 
 /**
@@ -513,7 +513,7 @@ export function openLiveVideo(container: HTMLElement, options: LiveVideoOptions)
     if (destroyed || !transport || state.phase !== 'connecting' || state.index !== index) return;
     const verdict = classifyAttempt(transport.observe());
     if (verdict.verdict === 'pending') return;
-    reportSignalMissing(slot, candidate, verdict);
+    reportSignalMissing(slot, verdict);
     const step = advanceChain(state, { type: 'verdict', verdict }, parsed, Date.now());
     if (verdict.verdict !== 'live' && step.state.phase !== 'recording' && step.state.phase !== 'unverified') {
       recentFailures.set(failureKey(slot, candidate), Date.now());

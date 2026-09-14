@@ -253,7 +253,7 @@ export type OfflineReason =
   | 'no-entries'         // nothing configured: the owner fills the slot
   | 'needs-channel-url'  // a user-added @handle channel
   | 'insecure-url'       // a user-added http:// manifest
-  | 'not-live'           // every attempt was an ended recording or a channel with nothing live
+  | 'not-live'           // every attempt was an ended recording, a stream that never started, or a channel with nothing live
   | 'embed-blocked'      // every attempt failed with 101/150/152/153
   | 'unavailable'        // mixed failures: 100, 2, 5, timeouts, silent players, HLS failures
   | 'stream-ended';      // a live stream ended again soon after one re-resolve
@@ -270,7 +270,7 @@ export type ChainState = ChainProgress & (
   | { readonly phase: 'connecting'; readonly index: number }
   | { readonly phase: 'live'; readonly index: number; readonly video: YouTubeVideoSnapshot | null }
   | { readonly phase: 'recording'; readonly index: number; readonly video: YouTubeVideoSnapshot | null }
-  | { readonly phase: 'unverified'; readonly index: number; readonly reason: 'player-api-blocked' | 'player-api-silent' }
+  | { readonly phase: 'unverified'; readonly index: number; readonly reason: UnverifiableReason }
   | { readonly phase: 'offline'; readonly reason: OfflineReason }
 );
 
@@ -304,7 +304,8 @@ function summarizeOffline(attempts: readonly AttemptReport[]): OfflineReason {
   if (verdicts.every((v) => v.verdict === 'failed' && v.outcome.kind === 'player-error' && EMBED_BLOCKED_CODES.has(v.outcome.code))) {
     return 'embed-blocked';
   }
-  if (verdicts.every((v) => v.verdict === 'recording' || (v.verdict === 'failed' && v.outcome.kind === 'channel-not-live'))) {
+  if (verdicts.every((v) => v.verdict === 'recording'
+    || (v.verdict === 'failed' && (v.outcome.kind === 'channel-not-live' || v.outcome.kind === 'not-started')))) {
     return 'not-live';
   }
   return 'unavailable';
@@ -342,9 +343,10 @@ export function startChain(parsed: ParsedSource, recentFailureKeys: ReadonlySet<
 /**
  *  connecting + live          → live, keep
  *  connecting + recording     → a user-added video keeps it as a recording; otherwise next candidate or offline
- *  connecting + failed        → next candidate or offline
+ *  connecting + failed        → next candidate or offline (a stream that never started counts as not live)
  *  connecting + silent player → built-in: next candidate or offline; user-added: unverified, keep
- *  connecting + blocked API   → an untried HLS candidate, else unverified, keep
+ *  connecting + blocked API or missing live signal → an untried HLS candidate, else unverified, keep
+ *                               (the signal is missing for every YouTube video, so trying the next one cannot help)
  *  live + live-lost           → re-resolve from the top once; again inside the relock window → offline(stream-ended)
  *  settled + retry            → start over (the caller clears failure memory)
  *  anything else              → unchanged, keep

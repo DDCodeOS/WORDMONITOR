@@ -12,9 +12,15 @@ const catalog = vi.hoisted(() => ({
   sources: {} as Record<string, readonly string[]>,
   original: {} as Record<string, readonly string[]>,
 }));
+const analytics = vi.hoisted(() => ({ track: vi.fn() }));
 
 vi.mock('@/services/live-video/youtube-iframe-api', () => ({
   loadYouTubeIframeApi: () => Promise.resolve(loader.blocked ? null : loader.api?.namespace ?? null),
+}));
+
+vi.mock('@/services/analytics', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/services/analytics')>()),
+  track: analytics.track,
 }));
 
 vi.mock('@/config/live-video-sources', async (importOriginal) => {
@@ -28,7 +34,7 @@ vi.mock('@/config/live-video-sources', async (importOriginal) => {
 const HOUR = 60 * 60_000;
 const WALL = ['Jerusalem live webcam', 'Middle East live webcam', 'Ukraine live webcam', 'Washington DC live webcam'];
 const SWAPPED_WALL = ['Jerusalem live webcam', 'Middle East live webcam', 'Taipei live webcam', 'Washington DC live webcam'];
-const RECORDING_VERDICT_MS = LIVE_VIDEO_TIMING.durationGrowthWindowMs + 3 * LIVE_VIDEO_TIMING.pollMs;
+const RECORDING_VERDICT_MS = LIVE_VIDEO_TIMING.recordingConfirmMs + 3 * LIVE_VIDEO_TIMING.pollMs;
 
 class FakeIntersectionObserver {
   readonly callback: IntersectionObserverCallback;
@@ -156,6 +162,7 @@ beforeEach(() => {
   vi.stubGlobal('IntersectionObserver', FakeIntersectionObserver);
   loader.api = createFakeYouTubeIframeApi();
   loader.blocked = false;
+  analytics.track.mockClear();
 });
 
 afterEach(() => {
@@ -293,6 +300,43 @@ describe('Live Webcams live verification', () => {
     api().playerFor('Taipei live webcam').goLive();
     await flush(LIVE_VIDEO_TIMING.pollMs);
     expect(hasLiveDot('Taipei live webcam')).toBe(true);
+  });
+
+  it('never shows a live dot for a stream that reports live but never plays, and swaps it out at the deadline', async () => {
+    mountOnScreen();
+    await playWall();
+    for (const title of ['Middle East live webcam', 'Ukraine live webcam', 'Washington DC live webcam']) api().playerFor(title).goLive();
+    // A scheduled stream's waiting room: YouTube lists it as live, but the player never leaves -1.
+    const scheduled = api().playerFor('Jerusalem live webcam');
+    scheduled.ready({ videoId: scheduled.embeddedVideoId, isLive: true, duration: 0 });
+
+    await flush(LIVE_VIDEO_TIMING.verdictDeadlineMs - LIVE_VIDEO_TIMING.pollMs);
+    expect(hasLiveDot('Jerusalem live webcam')).toBe(false);
+    expect(cellFor('Jerusalem live webcam').textContent).toContain('Connecting…');
+
+    await flush(LIVE_VIDEO_TIMING.pollMs);
+    expect(playingFeeds()).toEqual(['Middle East live webcam', 'Taipei live webcam', 'Ukraine live webcam', 'Washington DC live webcam']);
+    expect(offlineNote()).toBe('Jerusalem is offline right now');
+    expect(analytics.track).toHaveBeenCalledWith('live-video-attempt-failed', { slot: 'webcams/jerusalem', kind: 'video', outcome: 'not-started' });
+  });
+
+  it('keeps every tile unverified when YouTube stops reporting isLive, and reports the missing signal once', async () => {
+    mountOnScreen();
+    await playWall();
+    for (const title of WALL) {
+      const player = api().playerFor(title);
+      player.ready({ videoId: player.embeddedVideoId, duration: 3_600 });
+      player.setState(1);
+    }
+
+    await flush(LIVE_VIDEO_TIMING.verdictDeadlineMs);
+
+    expect(playingFeeds()).toEqual(WALL);
+    expect(offlineNote()).toBeNull();
+    expect(content().querySelectorAll('.webcam-live-dot')).toHaveLength(0);
+    for (const title of WALL) expect(cellFor(title).textContent).toContain('Can’t confirm this stream is live');
+    const reports = analytics.track.mock.calls.filter(([event]) => event === 'live-video-signal-missing');
+    expect(reports).toEqual([['live-video-signal-missing', { slot: 'webcams/jerusalem' }]]);
   });
 
   it('shows an offline card with Retry when no replacement feed is left', async () => {
