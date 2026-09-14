@@ -19,8 +19,9 @@ export const WEBCAM_SOURCES = {
   'middle-east': ['https://www.youtube.com/watch?v=AkqGOcpDvZU'],
   'tel-aviv': [],
   mecca: ['https://www.youtube.com/watch?v=ju3cuAIc1i4'],
-  // MTV Lebanon News: plays only while the channel is live.
-  'beirut-mtv': ['https://www.youtube.com/channel/UC9_XmAwE5szLHF76FjMylaw'],
+  // MTV Lebanon News' channel embed (youtube.com/channel/UC9_XmAwE5szLHF76FjMylaw) returned player
+  // error 150 on 2026-09-15; paste it back once the checker reports it live.
+  'beirut-mtv': [],
   // Rotates through Kyiv, Odesa, Kharkiv, Kramatorsk, Sloviansk, Donetsk and Dnipro.
   kyiv: ['https://www.youtube.com/watch?v=e2gC37ILQmk'],
   paris: ['https://www.youtube.com/watch?v=-xzg3wujOVM'],

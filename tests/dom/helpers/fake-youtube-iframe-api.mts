@@ -37,6 +37,8 @@ export class FakeYouTubePlayer implements YouTubePlayerLike {
 
   ready(video: FakeVideo): void {
     this.video = video;
+    // The real API renames the attached iframe after the video it loaded.
+    if (video.title) this.iframe.title = video.title;
     this.events.onReady?.();
   }
 

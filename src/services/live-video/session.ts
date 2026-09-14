@@ -151,6 +151,11 @@ function mountYouTubeWeb(container: HTMLElement, candidate: YouTubeCandidate, co
   let video: YouTubeVideoSnapshot | null = null;
   const durations: DurationSample[] = [];
 
+  // The IFrame API renames the frame after the video it loads; the tile keeps its own title.
+  const keepTitle = () => {
+    if (iframe.title !== context.presentation.title) iframe.title = context.presentation.title;
+  };
+
   const readVideo = () => {
     if (!player) return;
     try {
@@ -179,10 +184,12 @@ function mountYouTubeWeb(container: HTMLElement, candidate: YouTubeCandidate, co
           onReady: () => {
             if (destroyed) return;
             readyAtMs = context.elapsedMs();
+            keepTitle();
             readVideo();
           },
           onStateChange: ({ data }) => {
             if (destroyed) return;
+            keepTitle();
             if (data === PLAYING) context.onPlayingChange(true);
             else if (data === PAUSED) context.onPlayingChange(false);
             else if (data === ENDED) context.onLiveLost();
@@ -203,6 +210,7 @@ function mountYouTubeWeb(container: HTMLElement, candidate: YouTubeCandidate, co
     observe() {
       if (apiBlocked) return { transport: 'youtube', api: 'blocked' };
       if (player && readyAtMs !== null) {
+        keepTitle();
         readVideo();
         try {
           if (player.getPlayerState() === PLAYING) pushDuration(durations, { atMs: context.elapsedMs(), seconds: player.getDuration() });

@@ -168,6 +168,17 @@ describe('Live Webcams live verification', () => {
     expect(hasLiveDot('Ukraine live webcam')).toBe(false);
   });
 
+  it('keeps the tile title when YouTube renames the frame after the video', async () => {
+    mountOnScreen();
+    await playWall();
+    const frame = content().querySelector<HTMLIFrameElement>('.webcam-iframe[title="Jerusalem live webcam"]');
+    api().playerFor('Jerusalem live webcam').goLive({ title: 'Western Wall, Temple Archaeological Park' });
+    await flush(LIVE_VIDEO_TIMING.pollMs);
+
+    expect(frame?.title).toBe('Jerusalem live webcam');
+    expect(playingFeeds()).toEqual(WALL);
+  });
+
   it('replaces an ended recording with the next feed, names the offline city, and restores the replacement after an idle stop', async () => {
     mountOnScreen();
     await playWall();
