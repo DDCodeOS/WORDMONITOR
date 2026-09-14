@@ -77,6 +77,10 @@ export class FakeYouTubePlayer implements YouTubePlayerLike {
     this.muted = false;
   }
 
+  isMuted(): boolean {
+    return this.muted;
+  }
+
   playVideo(): void {
     this.setState(PLAYING);
   }

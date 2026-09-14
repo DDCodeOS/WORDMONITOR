@@ -15,6 +15,7 @@ export interface YouTubePlayerLike {
   getPlayerState(): number;
   mute(): void;
   unMute(): void;
+  isMuted(): boolean;
   playVideo(): void;
   pauseVideo(): void;
   destroy(): void;

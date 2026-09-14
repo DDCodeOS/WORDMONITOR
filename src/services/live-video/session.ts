@@ -90,6 +90,8 @@ const ENDED = 0;
 const PLAYING = 1;
 const PAUSED = 2;
 const MAX_DURATION_SAMPLES = 30;
+/** How often the web player's mute state is read: the IFrame API has no mute event. */
+const MUTE_SYNC_MS = 500;
 /** Media time an HLS stream must play before it counts as live: a playlist can say live over a black 0:00 frame. */
 const HLS_PLAYED_SECONDS = 1;
 /** How far the media clock may outrun the wall clock between polls before the jump counts as a seek. */
@@ -138,7 +140,7 @@ function createFrame(presentation: LiveVideoPresentation, src: string): HTMLIFra
   return iframe;
 }
 
-/** Web: an embed iframe the official IFrame API attaches to, which reads isLive, duration and errors. */
+/** Web: an embed iframe the official IFrame API attaches to, which reads isLive, duration, errors and mute. */
 function mountYouTubeWeb(container: HTMLElement, candidate: YouTubeCandidate, context: TransportContext): Transport {
   const iframe = createFrame(context.presentation, youtubeEmbedSrc(candidate, {
     origin: window.location.origin,
@@ -155,6 +157,23 @@ function mountYouTubeWeb(container: HTMLElement, candidate: YouTubeCandidate, co
   let errorCode: number | null = null;
   let video: YouTubeVideoSnapshot | null = null;
   const durations: DurationSample[] = [];
+  let reportedMuted = context.muted;
+  let muteSyncTimer: ReturnType<typeof setInterval> | null = null;
+
+  // The session stops polling once a stream is live, but a viewer can unmute from YouTube's own
+  // control bar at any time, so the transport reads the player for as long as it is mounted.
+  const syncMuted = () => {
+    if (destroyed || !player) return;
+    let muted: boolean;
+    try {
+      muted = player.isMuted();
+    } catch {
+      return;
+    }
+    if (muted === reportedMuted) return;
+    reportedMuted = muted;
+    context.onMutedChange(muted);
+  };
 
   // The IFrame API renames the frame after the video it loads; the tile keeps its own title.
   const keepTitle = () => {
@@ -191,6 +210,7 @@ function mountYouTubeWeb(container: HTMLElement, candidate: YouTubeCandidate, co
             readyAtMs = context.elapsedMs();
             keepTitle();
             readVideo();
+            muteSyncTimer ??= setInterval(syncMuted, MUTE_SYNC_MS);
           },
           onStateChange: ({ data }) => {
             if (destroyed) return;
@@ -234,6 +254,8 @@ function mountYouTubeWeb(container: HTMLElement, candidate: YouTubeCandidate, co
       };
     },
     setMuted(muted) {
+      // Already known to the caller: never report it back.
+      reportedMuted = muted;
       try {
         if (muted) player?.mute();
         else player?.unMute();
@@ -247,6 +269,8 @@ function mountYouTubeWeb(container: HTMLElement, candidate: YouTubeCandidate, co
     },
     destroy() {
       destroyed = true;
+      if (muteSyncTimer !== null) clearInterval(muteSyncTimer);
+      muteSyncTimer = null;
       try {
         player?.destroy();
       } catch { /* the frame is removed below either way */ }
