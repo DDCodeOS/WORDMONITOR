@@ -14,6 +14,7 @@ const { listPredictionMarkets } = await import('../server/worldmonitor/predictio
 const { listWebcams } = await import('../server/worldmonitor/webcam/v1/list-webcams');
 const { getUSNIFleetReport } = await import('../server/worldmonitor/military/v1/get-usni-fleet-report');
 const { getHumanitarianSummary } = await import('../server/worldmonitor/conflict/v1/get-humanitarian-summary');
+const { getHumanitarianSummaryBatch } = await import('../server/worldmonitor/conflict/v1/get-humanitarian-summary-batch');
 
 const cache = new Map<string, unknown>();
 const commands: unknown[][] = [];
@@ -34,6 +35,11 @@ beforeEach(() => {
     const body = JSON.parse(String(init?.body));
     if (url.pathname === '/pipeline') {
       commands.push(...body);
+      if (body.every((command: string[]) => command[0] === 'GET')) {
+        return Response.json(body.map((command: string[]) => ({
+          result: cache.has(command[1]) ? JSON.stringify(cache.get(command[1])) : null,
+        })));
+      }
       if (body[0][0] === 'GEOSEARCH') {
         assert.equal(body[0][1], 'webcam:cameras:geo:123');
         return Response.json([{ result: [camera.webcamId] }]);
@@ -91,6 +97,14 @@ it('serves the canonical humanitarian seed without provider fallback', async () 
   cache.set('conflict:humanitarian:v1:YE', payload);
   assert.deepEqual(await getHumanitarianSummary({} as never, { countryCode: 'YE' }), payload);
   assert.deepEqual(commands, [['GET', 'conflict:humanitarian:v1:YE']]);
+});
+
+it('serves canonical humanitarian seeds through the batch RPC', async () => {
+  const summary = { countryCode: 'YE', countryName: 'Yemen', totalDisplaced: 123 };
+  cache.set('conflict:humanitarian:v1:YE', { summary });
+  const result = await getHumanitarianSummaryBatch({} as never, { countryCodes: ['YE', 'SD', 'YE'] });
+  assert.deepEqual(result, { results: { YE: summary }, fetched: 1, requested: 2 });
+  assert.deepEqual(commands, [['GET', 'conflict:humanitarian:v1:SD'], ['GET', 'conflict:humanitarian:v1:YE']]);
 });
 
 it('uses the raw webcam catalog while keeping the response cache deployment-scoped', async () => {
