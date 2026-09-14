@@ -2251,6 +2251,14 @@
         "context": "Context established"
       }
     },
+    "liveMedia": {
+      "idleStatus": "Paused for inactivity",
+      "idleBody": "Live video stopped after {{duration}} without mouse, keyboard or touch activity.",
+      "idleResume": "Resume",
+      "idleKeepPlaying": "Keep playing when idle",
+      "idleSettingsHint": "Change this anytime in Settings › Media.",
+      "idleKeepPlayingToast": "Live video will keep playing when idle. Change in Settings › Media."
+    },
     "liveNews": {
       "notLive": "{{name}} is not currently live",
       "cannotEmbed": "{{name}} can't be played here — it may be restricted in your region (error {{code}})",

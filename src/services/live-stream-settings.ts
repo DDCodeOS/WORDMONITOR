@@ -46,6 +46,12 @@ export function parseLiveMediaIdleStop(raw: unknown): LiveMediaIdleStop | undefi
   return LIVE_MEDIA_IDLE_STOP_OPTIONS.find((option) => option === raw || String(option) === raw);
 }
 
+export function formatIdleStopMinutes(minutes: number, locale: string): string {
+  const inHours = minutes >= 60 && minutes % 60 === 0;
+  return new Intl.NumberFormat(locale, { style: 'unit', unit: inHours ? 'hour' : 'minute', unitDisplay: 'long' })
+    .format(inHours ? minutes / 60 : minutes);
+}
+
 export function getLiveStreamsAlwaysOn(): boolean {
   return readRaw(STORAGE_KEY_LIVE_STREAMS_ALWAYS_ON) === 'true';
 }

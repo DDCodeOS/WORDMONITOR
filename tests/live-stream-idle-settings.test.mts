@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 
 import {
   DEFAULT_LIVE_MEDIA_IDLE_STOP,
+  formatIdleStopMinutes,
+  LIVE_MEDIA_IDLE_STOP_MINUTES,
   LIVE_MEDIA_IDLE_STOP_OPTIONS,
   LIVE_MEDIA_IDLE_STOP_STORAGE_KEY,
   parseLiveMediaIdleStop,
@@ -24,6 +26,15 @@ describe('live media idle-stop preference', () => {
     for (const invalid of [undefined, null, '', ' 60', '60.0', '45', 45, 0, 'Never', 'true', {}, Number.NaN]) {
       assert.equal(parseLiveMediaIdleStop(invalid), undefined, `rejects ${String(invalid)}`);
     }
+  });
+
+  it('names durations in whole hours once they reach an hour, in the reader language', () => {
+    assert.deepEqual(
+      LIVE_MEDIA_IDLE_STOP_MINUTES.map((minutes) => formatIdleStopMinutes(minutes, 'en')),
+      ['15 minutes', '30 minutes', '1 hour', '2 hours', '4 hours'],
+    );
+    assert.equal(formatIdleStopMinutes(90, 'en'), '90 minutes');
+    assert.equal(formatIdleStopMinutes(60, 'fr'), '1 heure');
   });
 
   it('syncs across devices and survives a cloud row written by an older client', () => {
