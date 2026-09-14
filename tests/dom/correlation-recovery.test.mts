@@ -523,9 +523,11 @@ describe('CorrelationPanel presentation', () => {
     result.getElement().querySelector<HTMLElement>('.correlation-card-header')!.click();
     expect(result.getElement().textContent).toContain('Premium narrative for displayed evidence');
     expect(engine.getCards('economic')[0]?.assessment).toBeUndefined();
-    // A later sibling publication must not persist the in-memory seed annotation.
-    service.publishLocalCorrelationCards('military', [card('military')]);
+    // A valid sibling update persists the retained, now-annotated economic seed.
+    mocks.fetch.mockResolvedValue({ ...payload(null, NOW), military: [card('military')] });
+    window.dispatchEvent(new Event('online'));
     await settle();
+    expect(mocks.write).toHaveBeenCalledTimes(2);
     expect(mocks.write.mock.calls[mocks.write.mock.calls.length - 1]![1].economic.cards[0].assessment).toBeUndefined();
     await vi.advanceTimersByTimeAsync(MINUTE);
     expect(mocks.deduct).toHaveBeenCalledTimes(1);
