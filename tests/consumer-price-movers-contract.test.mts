@@ -21,7 +21,7 @@ beforeEach(() => {
 });
 afterEach(() => { globalThis.fetch = originalFetch; process.env = { ...originalEnv }; });
 
-for (const [query, expected] of [['', 10], ['&limit=0', 10], ['&limit=3', 3], ['&limit=-1', 10], ['&limit=99', 10]] as const) {
+for (const [query, expected] of [['', 10], ['&limit=0', 10], ['&limit=3', 3], ['&limit=-1', 10], ['&limit=99', 10], ['&limit=', 10], ['&limit=oops', 10]] as const) {
   test(`generated movers GET uses limit ${query || 'omitted'}`, async () => {
     const routes = createConsumerPricesServiceRoutes({ listConsumerPriceMovers } as ConsumerPricesServiceHandler);
     const route = routes.find((entry) => entry.path.endsWith('/list-consumer-price-movers'))!;
@@ -48,4 +48,12 @@ test('both movers producers include the public 90d range and seed metadata', () 
     assert.ok(seed.includes(`key: \`consumer-prices:movers:\${MARKET}:${days}d\``));
     assert.ok(seed.includes(`metaKey: \`seed-meta:consumer-prices:movers:\${MARKET}:${days}d\``));
   }
+});
+
+ test('category filtering precedes the limit and cache misses stay unavailable', async () => {
+  const response = await listConsumerPriceMovers({}, { marketCode: 'ae', range: '90d', limit: 2, categorySlug: 'dairy' });
+  assert.deepEqual(response.risers.map((mover) => mover.productId), ['up-1', 'up-3']);
+  globalThis.fetch = async () => Response.json({ result: null });
+  const missing = await listConsumerPriceMovers({}, { marketCode: 'ae', range: '90d', limit: 0, categorySlug: '' });
+  assert.deepEqual(missing, { marketCode: 'ae', asOf: '0', range: '90d', risers: [], fallers: [], upstreamUnavailable: true });
 });
