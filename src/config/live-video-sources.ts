@@ -14,6 +14,12 @@
 //   npm run live-video:check -- --slot webcams/kyiv
 //   npm run live-video:check -- --slot live-news/cnn
 //   npm run live-video:check -- --all
+//
+// A daily audit (.github/workflows/live-video-source-audit.yml) keeps one GitHub issue, "Live video
+// sources: slots needing a replacement": each slot that is empty or has nothing live, where it shows
+// and why. To fix a slot, check a candidate with the first command above, paste the line it prints
+// after `paste:` into that slot's list below, and the next run drops the slot from the issue. The
+// issue closes itself once no slot needs attention.
 
 export const WEBCAM_SOURCES = {
   jerusalem: ['https://www.youtube.com/watch?v=zp6LNSoq000'],
