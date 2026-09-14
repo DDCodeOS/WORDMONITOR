@@ -119,13 +119,18 @@ export type PlayerObservation =
       readonly elapsedMs: number;
       /** hls.js `details.live`, native `duration === Infinity`, or the playlist text. */
       readonly manifest: 'live' | 'vod' | 'unknown';
+      /**
+       * advancing: `currentTime` moved forward while playing. stalled: a browser that has seen no playback yet.
+       * unchecked: a caller that cannot play media (the Node checker), so the manifest is the only evidence.
+       */
+      readonly progress: 'advancing' | 'stalled' | 'unchecked';
       readonly failure: { readonly kind: 'http'; readonly status: number } | { readonly kind: 'fatal'; readonly detail: string } | null;
     };
 
 export type FailureOutcome =
   | { readonly kind: 'player-error'; readonly code: number }
   | { readonly kind: 'channel-not-live' }
-  /** YouTube lists the video as live but it never played: a scheduled stream's waiting room. */
+  /** Listed as live but never played: a scheduled YouTube stream's waiting room, or an HLS stream the browser cannot render. */
   | { readonly kind: 'not-started' }
   | { readonly kind: 'timeout' }
   | { readonly kind: 'hls-http'; readonly status: number }
@@ -177,17 +182,23 @@ function playedThroughConfirmWindow(durations: readonly DurationSample[]): boole
  *            isLive true but never played        → failed(not-started)
  *            isLive missing                      → unverifiable(live-signal-missing)
  *            otherwise                           → failed(timeout)
- *  hls: http/fatal failure → failed; live → live; vod → recording; deadline → failed(timeout)
+ *  hls: http/fatal failure                       → failed(hls-http / hls-fatal)
+ *       vod manifest                             → recording
+ *       live manifest + playback advancing       → live (a playlist can say live over a frame that never renders)
+ *       live manifest + playback unchecked       → live (the Node checker has only the manifest)
+ *       deadline: live manifest, playback stalled → failed(not-started)
+ *                 otherwise                      → failed(timeout)
  * Duration never decides live: a live stream's getDuration() stays flat while it plays.
  */
 export function classifyAttempt(observation: PlayerObservation): AttemptVerdict {
   if (observation.transport === 'hls') {
-    const { failure, manifest, elapsedMs } = observation;
+    const { failure, manifest, progress, elapsedMs } = observation;
     if (failure?.kind === 'http') return failed({ kind: 'hls-http', status: failure.status });
     if (failure?.kind === 'fatal') return failed({ kind: 'hls-fatal', detail: failure.detail });
-    if (manifest === 'live') return { verdict: 'live', video: null };
     if (manifest === 'vod') return { verdict: 'recording', video: null };
-    return elapsedMs >= LIVE_VIDEO_TIMING.verdictDeadlineMs ? failed({ kind: 'timeout' }) : PENDING;
+    if (manifest === 'live' && (progress === 'advancing' || progress === 'unchecked')) return { verdict: 'live', video: null };
+    if (elapsedMs < LIVE_VIDEO_TIMING.verdictDeadlineMs) return PENDING;
+    return manifest === 'live' && progress === 'stalled' ? failed({ kind: 'not-started' }) : failed({ kind: 'timeout' });
   }
   if (observation.api === 'blocked') return { verdict: 'unverifiable', reason: 'player-api-blocked' };
 

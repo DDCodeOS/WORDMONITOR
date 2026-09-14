@@ -90,6 +90,10 @@ const ENDED = 0;
 const PLAYING = 1;
 const PAUSED = 2;
 const MAX_DURATION_SAMPLES = 30;
+/** Media time an HLS stream must play before it counts as live: a playlist can say live over a black 0:00 frame. */
+const HLS_PLAYED_SECONDS = 1;
+/** How far the media clock may outrun the wall clock between polls before the jump counts as a seek. */
+const HLS_SEEK_SLACK_SECONDS = 0.25;
 
 // Page-wide, so a feed that just failed in one tile is tried last in the next.
 const recentFailures = new Map<string, number>();
@@ -372,11 +376,27 @@ function mountHls(container: HTMLElement, candidate: Extract<Candidate, { kind: 
   let manifest: 'live' | 'vod' | 'unknown' = 'unknown';
   let failure: HlsFailure = null;
   let hls: import('hls.js').default | null = null;
+  let playedSeconds = 0;
+  let lastSample: { readonly atMs: number; readonly seconds: number } | null = null;
 
   const fail = (next: NonNullable<HlsFailure>) => {
     if (destroyed || failure) return;
     failure = next;
     context.onLiveLost();
+  };
+
+  // Sums the media time that advanced between polls while playing. A jump faster than the wall
+  // clock is a seek (hls.js moves a live stream to its edge before any frame renders), not playback.
+  const readProgress = (): 'advancing' | 'stalled' => {
+    if (playedSeconds >= HLS_PLAYED_SECONDS) return 'advancing';
+    const sample = { atMs: context.elapsedMs(), seconds: video.currentTime };
+    const previous = lastSample;
+    lastSample = video.paused ? null : sample;
+    if (previous && lastSample) {
+      const step = sample.seconds - previous.seconds;
+      if (step > 0 && step <= (sample.atMs - previous.atMs) / 1000 + HLS_SEEK_SLACK_SECONDS) playedSeconds += step;
+    }
+    return playedSeconds >= HLS_PLAYED_SECONDS ? 'advancing' : 'stalled';
   };
 
   video.addEventListener('loadedmetadata', () => {
@@ -415,7 +435,7 @@ function mountHls(container: HTMLElement, candidate: Extract<Candidate, { kind: 
   if (context.autoplay) video.play()?.catch(() => {});
 
   return {
-    observe: () => ({ transport: 'hls', elapsedMs: context.elapsedMs(), manifest, failure }),
+    observe: () => ({ transport: 'hls', elapsedMs: context.elapsedMs(), manifest, progress: readProgress(), failure }),
     setMuted(muted) {
       video.muted = muted;
     },

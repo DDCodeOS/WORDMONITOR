@@ -29,7 +29,7 @@ Label an entry with name=, e.g. kyiv=https://www.youtube.com/watch?v=e2gC37ILQmk
 --all checks every slot and the audit canaries, and lists slots with no entries.
 
 YouTube entries play in headless Chromium as if embedded on ${PROBE_ORIGIN}.
-HLS entries are fetched from this machine. Exits 1 when any entry is not live or a slot is empty.`;
+HLS entries are fetched from this machine; their playback is not checked. Exits 1 when any entry is not live or a slot is empty.`;
 
 const PROBLEM_WHY = {
   'not-https': 'the manifest must be an https URL',
@@ -88,7 +88,7 @@ function why(result) {
   const isHls = result.parsed.candidate.kind === 'hls';
   switch (verdict.verdict) {
     case 'live':
-      return isHls ? 'HLS playlist is live' : 'YouTube reports a live stream (isLive=true) and it is playing';
+      return isHls ? 'HLS playlist is live (playback not checked outside a browser)' : 'YouTube reports a live stream (isLive=true) and it is playing';
     case 'recording':
       if (isHls) return 'HLS playlist has ended (VOD or ENDLIST)';
       return `ended recording (isLive=false, duration ${formatSeconds(result.durationSeconds ?? 0)})`;
@@ -98,7 +98,10 @@ function why(result) {
         return `YouTube player error ${outcome.code}: ${PLAYER_ERROR_WHY[outcome.code] ?? 'unknown error'}`;
       }
       if (outcome.kind === 'channel-not-live') return 'the channel has no live stream right now';
-      if (outcome.kind === 'not-started') return `scheduled or not started: YouTube lists it as live but it did not play within ${LIVE_VIDEO_TIMING.verdictDeadlineMs / 1000} s`;
+      if (outcome.kind === 'not-started') {
+        const within = `${LIVE_VIDEO_TIMING.verdictDeadlineMs / 1000} s`;
+        return isHls ? `HLS playlist is live but did not play within ${within}` : `scheduled or not started: YouTube lists it as live but it did not play within ${within}`;
+      }
       if (outcome.kind === 'timeout') return `no verdict within ${LIVE_VIDEO_TIMING.verdictDeadlineMs / 1000} s`;
       if (outcome.kind === 'hls-http') return `manifest returned HTTP ${outcome.status}`;
       return `stream failed: ${outcome.detail}`;
@@ -306,7 +309,7 @@ function firstVariantUri(text) {
 
 async function probeHlsCandidate(candidate) {
   const startedAt = Date.now();
-  const observe = (fields) => classifyAttempt({ transport: 'hls', elapsedMs: Date.now() - startedAt, manifest: 'unknown', failure: null, ...fields });
+  const observe = (fields) => classifyAttempt({ transport: 'hls', elapsedMs: Date.now() - startedAt, manifest: 'unknown', progress: 'unchecked', failure: null, ...fields });
   const signal = AbortSignal.timeout(LIVE_VIDEO_TIMING.verdictDeadlineMs);
   try {
     let url = candidate.url;
