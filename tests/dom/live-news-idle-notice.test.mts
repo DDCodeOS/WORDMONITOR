@@ -21,6 +21,7 @@ interface PanelInternals {
   ensurePlayerContainer(): void;
   getChannelDisplayName(channel: LiveChannelLike): string;
   switchChannel(channel: LiveChannelLike): Promise<void>;
+  resolveChannelVideo(channel: LiveChannelLike): Promise<void>;
 }
 
 let panel: LiveNewsPanel | undefined;
@@ -215,18 +216,26 @@ describe('Live News idle stop', () => {
     expect(notice()).toBeNull();
   });
 
-  it('keeps the notice with the new channel name after a channel switch', () => {
+  it.each([false, true])('keeps the notice after a channel switch with auto-play %s', async (alwaysOn) => {
+    localStorage.setItem('wm-live-streams-always-on', String(alwaysOn));
+    localStorage.setItem('wm-live-media-idle-stop', '60');
     mount();
+    placePanelOnScreen();
     playFromPlaceholder();
     vi.advanceTimersByTime(HOUR);
 
     const sky = internals().channels.find((channel) => channel.id === 'sky');
     if (!sky) throw new Error('seeded sky channel missing');
-    void internals().switchChannel(sky);
+    vi.spyOn(internals(), 'resolveChannelVideo').mockResolvedValue(undefined);
+    await internals().switchChannel(sky);
 
     expect(isPlaying()).toBe(false);
     expect(notice()?.querySelector('.live-media-shell-title')?.textContent)
       .toBe(internals().getChannelDisplayName(sky));
+
+    button('Resume').click();
+    expect(isPlaying()).toBe(true);
+    expect(getActiveLiveMedia('live-news')?.streamId).toBe(sky.id);
   });
 
   it('returns to Ready without a notice when the tab is hidden while playing', () => {

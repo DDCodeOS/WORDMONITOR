@@ -1489,7 +1489,7 @@
       "provenanceTitle": "Произход на обхвата: колко включени истории и отделни източници е избрано от този преглед",
       "compiledFrom": "Събрано от {{stories}} истории в {{sources}} източници",
       "briefFreshness": "Генериран преди {{minutes}}м · най-нов източник {{hours}}ч стар",
-      "briefStoryDetails": "Story details ({{count}})",
+      "briefStoryDetails": "Подробности за историята ({{count}})",
       "streamIdleStopLabel": "Спиране на живото видео при неактивност",
       "streamIdleStopDesc": "Спира Live News и Live Webcams след толкова дълго време без активност и показва уведомление в панела.",
       "streamIdleStopNever": "Никога"

@@ -1485,7 +1485,7 @@
       "provenanceTitle": "Původ pokrytí: počet příjatých příběhů a odlišných zdrojů, ze kterých byl tento přehled vybrán",
       "compiledFrom": "Sestaveno z {{stories}} příběhů z {{sources}} zdrojů",
       "briefFreshness": "Vygenerováno před {{minutes}}m · nejnovější zdroj starý {{hours}}h",
-      "briefStoryDetails": "Story details ({{count}})",
+      "briefStoryDetails": "Podrobnosti zprávy ({{count}})",
       "streamIdleStopLabel": "Zastavit živé video při nečinnosti",
       "streamIdleStopDesc": "Zastaví Live News a Live Webcams po této době bez aktivity a zobrazí upozornění na panelu.",
       "streamIdleStopNever": "Nikdy"
@@ -2864,7 +2864,7 @@
       "idleResume": "Pokračovat",
       "idleKeepPlaying": "Pokračovat v přehrávání při nečinnosti",
       "idleSettingsHint": "Toto můžete kdykoli změnit v Nastavení › Média.",
-      "idleKeepPlayingToast": "Živé video se bude přehrávat při nečinnosti. Změňte v Nastavení › Média."
+      "idleKeepPlayingToast": "Živé video se bude přehrávat při nečinnosti. Toto nastavení můžete změnit v Nastavení › Média."
     }
   },
   "popups": {

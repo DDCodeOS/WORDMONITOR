@@ -1317,7 +1317,7 @@
       "provenanceTitle": "Proveniência de cobertura: quantas histórias ingeridas e fontes distintas foram selecionadas para este resumo",
       "compiledFrom": "Compilado de {{stories}} histórias em {{sources}} fontes",
       "briefFreshness": "Gerado há {{minutes}}m · fonte mais recente com {{hours}}h",
-      "briefStoryDetails": "Story details ({{count}})",
+      "briefStoryDetails": "Detalhes da notícia ({{count}})",
       "streamIdleStopLabel": "Pausar vídeo ao vivo quando inativo",
       "streamIdleStopDesc": "Para Live News e Live Webcams após este período sem atividade e exibe um aviso no painel.",
       "streamIdleStopNever": "Nunca"

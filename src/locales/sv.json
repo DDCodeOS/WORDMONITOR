@@ -1315,7 +1315,7 @@
       "provenanceTitle": "Täckningshärkomst: hur många inmatade historier och unika källor denna kortfattade sammanfattning valdes från",
       "compiledFrom": "Kompilerat från {{stories}} berättelser från {{sources}} källor",
       "briefFreshness": "Genererad {{minutes}}m sedan · senaste källa {{hours}}h gammal",
-      "briefStoryDetails": "Story details ({{count}})",
+      "briefStoryDetails": "Detaljer om nyheten ({{count}})",
       "streamIdleStopLabel": "Stoppa livevideo när inaktiv",
       "streamIdleStopDesc": "Stoppar Live News och Live Webcams efter denna tid utan aktivitet och visar ett meddelande i panelen.",
       "streamIdleStopNever": "Aldrig"
@@ -2442,7 +2442,7 @@
     },
     "liveMedia": {
       "idleStatus": "Pausad på grund av inaktivitet",
-      "idleBody": "Livevideo stoppades efter {{duration}} utanmus-, tangent- eller pekaktivitet.",
+      "idleBody": "Livevideo stoppades efter {{duration}} utan mus-, tangent- eller pekaktivitet.",
       "idleResume": "Återuppta",
       "idleKeepPlaying": "Fortsätt spela när inaktiv",
       "idleSettingsHint": "Ändra detta när som helst i Inställningar › Media.",

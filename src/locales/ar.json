@@ -1456,7 +1456,7 @@
       "provenanceTitle": "أصل التغطية: عدد القصص المأخوذة والمصادر المميزة التي تم اختيار هذا الملخص منها",
       "compiledFrom": "مجمّع من {{stories}} قصة عبر {{sources}} مصادر",
       "briefFreshness": "تم الإنشاء منذ {{minutes}}د · أحدث مصدر عمره {{hours}}س",
-      "briefStoryDetails": "Story details ({{count}})",
+      "briefStoryDetails": "تفاصيل القصة ({{count}})",
       "streamIdleStopLabel": "إيقاف الفيديو المباشر عند عدم النشاط",
       "streamIdleStopDesc": "يوقف الأخبار المباشرة وكاميرات الويب المباشرة بعد هذه المدة بدون نشاط ويعرض إشعارًا في اللوحة.",
       "streamIdleStopNever": "أبدًا"

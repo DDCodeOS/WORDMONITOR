@@ -1841,8 +1841,8 @@
       "provenanceTitle": "Provenienza della copertura: quante storie acquisite e quante fonti distinte sono state utilizzate per selezionare questo briefing",
       "compiledFrom": "Compilato da {{stories}} storie provenienti da {{sources}} fonti",
       "briefFreshness": "Generato {{minutes}}m fa · fonte più recente {{hours}}h fa",
-      "briefStoryDetails": "Story details ({{count}})",
-      "streamIdleStopLabel": "Arresta il video in diretta quando inattivo",
+      "briefStoryDetails": "Dettagli della notizia ({{count}})",
+      "streamIdleStopLabel": "Arresta il video in diretta durante l'inattività",
       "streamIdleStopDesc": "Interrompe Live News e Live Webcams dopo questo periodo di inattività e mostra un avviso nel pannello.",
       "streamIdleStopNever": "Mai"
     },
@@ -2841,11 +2841,11 @@
     },
     "liveMedia": {
       "idleStatus": "Pausa per inattività",
-      "idleBody": "Video in diretta interrotto dopo {{duration}} senza attività del mouse, tastiera o tocco.",
+      "idleBody": "Il video in diretta si è interrotto dopo {{duration}} senza attività del mouse, della tastiera o dello schermo tattile.",
       "idleResume": "Riprendi",
-      "idleKeepPlaying": "Mantieni la riproduzione quando inattivo",
+      "idleKeepPlaying": "Mantieni la riproduzione durante l'inattività",
       "idleSettingsHint": "Cambia questa impostazione in qualsiasi momento in Impostazioni › Media.",
-      "idleKeepPlayingToast": "Il video in diretta continuerà a riprodursi quando inattivo. Modifica in Impostazioni › Media."
+      "idleKeepPlayingToast": "Il video in diretta continuerà a riprodursi durante l'inattività. Modifica in Impostazioni › Media."
     }
   },
   "popups": {

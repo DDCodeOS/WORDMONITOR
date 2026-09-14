@@ -1639,8 +1639,8 @@
       "provenanceTitle": "Pokrivanje izvora: koliko je unesenih članaka i različitih izvora odabrano za ovaj sažetak",
       "compiledFrom": "Sastavljeno od {{stories}} priča iz {{sources}} izvora",
       "briefFreshness": "Generirano prije {{minutes}}m · najnoviji izvor star {{hours}}h",
-      "briefStoryDetails": "Story details ({{count}})",
-      "streamIdleStopLabel": "Zaustavi live video kada je neaktivan",
+      "briefStoryDetails": "Detalji priče ({{count}})",
+      "streamIdleStopLabel": "Zaustavi live video kada je korisnik neaktivan",
       "streamIdleStopDesc": "Zaustavlja Live News i Live Webcams nakon ovog vremena bez aktivnosti i prikazuje obavijest u panelu.",
       "streamIdleStopNever": "Nikada"
     },
@@ -2919,9 +2919,9 @@
       "idleStatus": "Pauziran zbog neaktivnosti",
       "idleBody": "Live video je zaustavljen nakon {{duration}} bez aktivnosti miša, tipkovnice ili dodira.",
       "idleResume": "Nastavi",
-      "idleKeepPlaying": "Nastavi reproduciranje kada je neaktivno",
+      "idleKeepPlaying": "Nastavi reproduciranje kada je korisnik neaktivan",
       "idleSettingsHint": "Promijeni ovo bilo kada u Postavkama › Mediji.",
-      "idleKeepPlayingToast": "Live video će nastaviti s reproduciranjem kada je neaktivno. Promijeni u Postavkama › Mediji."
+      "idleKeepPlayingToast": "Live video će se nastaviti reproducirati kada je korisnik neaktivan. Promijeni u Postavkama › Mediji."
     }
   },
   "popups": {

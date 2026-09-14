@@ -564,7 +564,7 @@ export class LiveNewsPanel extends Panel {
       !!this.desktopEmbedIframe ||
       !!this.nativeVideoElement ||
       this.ownsLiveNewsMedia() ||
-      (this.alwaysOn && !document.hidden && this.isPanelVisible());
+      (this.idleStoppedAfterMs === null && this.alwaysOn && !document.hidden && this.isPanelVisible());
   }
 
   private ownsLiveMediaForChannel(channelId: string): boolean {

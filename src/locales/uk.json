@@ -1638,10 +1638,10 @@
       "compiledFrom": "Compiled from {{stories}} stories across {{sources}} sources",
       "provenanceTitle": "Coverage provenance: how many ingested stories and distinct sources this brief was selected from",
       "briefFreshness": "Generated {{minutes}}m ago · newest source {{hours}}h old",
-      "briefStoryDetails": "Story details ({{count}})",
+      "briefStoryDetails": "Подробиці новини ({{count}})",
       "sources_few": "{{count}} джерела",
       "sources_many": "{{count}} джерел",
-      "streamIdleStopLabel": "Зупинити прямий видеотрансляцію при бездіяльності",
+      "streamIdleStopLabel": "Зупинити пряму трансляцію відео при бездіяльності",
       "streamIdleStopDesc": "Зупиняє Live News і Live Webcams після цього часу без активності та показує повідомлення на панелі.",
       "streamIdleStopNever": "Ніколи"
     },
@@ -2929,11 +2929,11 @@
     },
     "liveMedia": {
       "idleStatus": "Призупинено через бездіяльність",
-      "idleBody": "Прямий видеотрансляцію зупинено після {{duration}} без активності миші, клавіатури чи сенсора.",
+      "idleBody": "Пряму трансляцію відео зупинено після {{duration}} без активності миші, клавіатури чи сенсора.",
       "idleResume": "Відновити",
       "idleKeepPlaying": "Продовжити відтворення при бездіяльності",
       "idleSettingsHint": "Змінити це можна будь-коли в Параметри › Медіа.",
-      "idleKeepPlayingToast": "Прямий видеотрансляцію продовжиться при бездіяльності. Змініть у Параметри › Медіа."
+      "idleKeepPlayingToast": "Пряма трансляція відео продовжиться при бездіяльності. Змініть у Параметри › Медіа."
     }
   },
   "popups": {

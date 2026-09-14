@@ -1444,7 +1444,7 @@
       "provenanceTitle": "Provenance de la couverture : nombre d'articles ingérés et de sources distinctes à partir desquels ce résumé a été sélectionné",
       "compiledFrom": "Compilé à partir de {{stories}} articles provenant de {{sources}} sources",
       "briefFreshness": "Généré il y a {{minutes}}m · source la plus récente datant de {{hours}}h",
-      "briefStoryDetails": "Story details ({{count}})",
+      "briefStoryDetails": "Détails de l’article ({{count}})",
       "streamIdleStopLabel": "Arrêter la vidéo en direct en cas d'inactivité",
       "streamIdleStopDesc": "Arrête Live News et Live Webcams après cette durée sans activité et affiche une notification dans le panneau.",
       "streamIdleStopNever": "Jamais"
@@ -2841,7 +2841,7 @@
     },
     "liveMedia": {
       "idleStatus": "En pause pour inactivité",
-      "idleBody": "Vidéo en direct arrêtée après {{duration}} sans activité souris, clavier ou tactile.",
+      "idleBody": "La vidéo en direct s’est arrêtée après {{duration}} sans activité de la souris, du clavier ou de l’écran tactile.",
       "idleResume": "Reprendre",
       "idleKeepPlaying": "Continuer la lecture en cas d'inactivité",
       "idleSettingsHint": "Modifiez ce paramètre à tout moment dans Paramètres › Média.",

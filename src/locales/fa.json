@@ -1630,7 +1630,7 @@
       "compiledFrom": "گردآوری‌شده از {{stories}} خبر از {{sources}} منبع",
       "provenanceTitle": "شفافیت پوشش: این گزیده از چه تعداد خبر دریافتی و چند منبع مجزا انتخاب شده است",
       "briefFreshness": "تولید شده {{minutes}}m پیش · جدیدترین منبع {{hours}}h قدیمی",
-      "briefStoryDetails": "Story details ({{count}})",
+      "briefStoryDetails": "جزئیات خبر ({{count}})",
       "streamIdleStopLabel": "توقف ویدیوی زنده هنگام عدم فعالیت",
       "streamIdleStopDesc": "پخش Live News و Live Webcams را پس از این مدت بدون فعالیت متوقف می‌کند و یک پیام را در پنل نمایش می‌دهد.",
       "streamIdleStopNever": "هرگز"

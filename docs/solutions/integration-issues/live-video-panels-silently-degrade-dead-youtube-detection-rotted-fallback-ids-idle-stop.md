@@ -178,6 +178,7 @@ How to read the output:
 Agent user agents get 403 `agent_request_blocked` (`shared/agent-request-policy.json:14`). Send a non-agent UA. `Origin` is optional, but a disallowed one gets 403 (`api/youtube/live.js:20-22`).
 
 ```bash
+UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
 curl -s -D - -A "$UA" -H 'Origin: https://www.worldmonitor.app' \
   'https://api.worldmonitor.app/api/youtube/live?channel=@SkyNews'
 ```
