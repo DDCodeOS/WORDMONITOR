@@ -9,8 +9,17 @@ import { auditAttempts, catalogSlots, DEFAULT_CATALOG, slotStatus } from './chec
 
 export const ISSUE_TITLE = 'Live video sources: slots needing a replacement';
 
-const FINDING_STATUSES = new Set(['empty', 'needs-replacement', 'degraded']);
-const STATUSES = new Set([...FINDING_STATUSES, 'ok', 'unverifiable-from-runner']);
+const STATUSES = new Set(['ok', 'degraded', 'needs-replacement', 'empty', 'unverifiable-from-runner']);
+
+/** A broken feed on any surface, or a slot viewers see by default with nothing configured. */
+function isFinding(slot) {
+  return slot.status === 'needs-replacement' || slot.status === 'degraded' || (slot.status === 'empty' && slot.shownByDefault);
+}
+
+/** A slot with no entries that the dashboard hides: listed so the owner can fill it, never counted. */
+function isUnfilled(slot) {
+  return slot.status === 'empty' && !slot.shownByDefault;
+}
 const VERDICTS = new Set(['live', 'recording', 'failed', 'unverifiable', 'invalid']);
 const FINDINGS_HEADER = ['Slot', 'Where it shows', 'Status', 'Entry', 'Why', 'Shown instead'];
 
@@ -120,7 +129,7 @@ function table(header, rows) {
 }
 
 export function renderAuditBody(report, { runUrl = '', canaries, gridPriority = [] }) {
-  const findings = report.slots.filter((slot) => FINDING_STATUSES.has(slot.status));
+  const findings = report.slots.filter(isFinding);
   const shown = inAttentionOrder(findings.filter((slot) => slot.shownByDefault), gridPriority);
   const hidden = inAttentionOrder(findings.filter((slot) => !slot.shownByDefault), gridPriority);
   const unverifiable = report.slots.filter((slot) => slot.status === 'unverifiable-from-runner');
@@ -130,7 +139,7 @@ export function renderAuditBody(report, { runUrl = '', canaries, gridPriority = 
     `- Checked: ${cell(report.checkedAt)}${runUrl ? ` — [Workflow run](${runUrl})` : ''}`,
     `- Canaries: ${canaries}`,
     '',
-    'Status `needs-replacement` means no entry is live, `degraded` means an earlier entry failed and a later one plays, and `empty` means no entries are configured.',
+    'Status `needs-replacement` means no entry is live, `degraded` means an earlier entry failed and a later one plays, and `empty` means a slot viewers see by default has no entries.',
   ];
   if (shown.length > 0) lines.push('', '### Shown by default', '', ...table(FINDINGS_HEADER, shown.flatMap(findingRows)));
   if (hidden.length > 0) lines.push('', '### Not shown by default', '', ...table(FINDINGS_HEADER, hidden.flatMap(findingRows)));
@@ -140,6 +149,16 @@ export function renderAuditBody(report, { runUrl = '', canaries, gridPriority = 
       '', '### Could not verify from the runner', '',
       'An HLS 403 or 451, an HLS timeout, or a YouTube player API that did not load can depend on the runner\'s network or region. These slots may still play for viewers, so they are not counted above.',
       '', ...table(['Slot', 'Where it shows', 'Entry', 'Why'], rows),
+    );
+  }
+  const unfilled = report.slots.filter(isUnfilled);
+  if (unfilled.length > 0) {
+    const bySurface = new Map();
+    for (const slot of unfilled) bySurface.set(slot.surface, [...(bySurface.get(slot.surface) ?? []), slot.slot]);
+    lines.push(
+      '', '### Unfilled slots (hidden from viewers)', '',
+      `${unfilled.length} slot(s) have no entries, so the dashboard hides them. They are not counted above; fill one the same way as a broken slot.`,
+      '', ...[...bySurface].map(([surface, slots]) => `- ${surface}: ${slots.join(', ')}`),
     );
   }
   lines.push(
@@ -155,9 +174,11 @@ export function renderAuditBody(report, { runUrl = '', canaries, gridPriority = 
 
 function recoveredComment(report, runUrl) {
   const unverifiable = report.slots.filter((slot) => slot.status === 'unverifiable-from-runner').length;
+  const unfilled = report.slots.filter(isUnfilled).length;
   return [
     `Recovered: no live video slot needs attention as of ${report.checkedAt}.`,
     unverifiable > 0 ? `${unverifiable} slot(s) could not be verified from the runner; the run summary lists them.` : '',
+    unfilled > 0 ? `${unfilled} unfilled slot(s) stay hidden from viewers; the run summary lists them.` : '',
     runUrl ? `[Workflow run](${runUrl})` : '',
   ].filter(Boolean).join(' ');
 }
@@ -176,7 +197,7 @@ export async function publishAudit(report, {
   if (summaryPath) appendFileSync(summaryPath, `${body}\n`);
   if (!repository) throw new Error('GITHUB_REPOSITORY is required to publish the live video audit');
 
-  const findings = report.slots.filter((slot) => FINDING_STATUSES.has(slot.status)).length;
+  const findings = report.slots.filter(isFinding).length;
   const pages = gh(['api', '--paginate', '--slurp', `repos/${repository}/issues?state=open&per_page=100`]);
   const existing = pages.flat().find((issue) => !issue.pull_request && issue.title === ISSUE_TITLE);
   if (findings === 0) {

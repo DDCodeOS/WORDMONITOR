@@ -146,6 +146,29 @@ describe('live video audit issue', () => {
     assert.equal(calls.length, 1);
   });
 
+  it('closes the issue, or files none, when the only empty slots are hidden from viewers', async (t) => {
+    const catalog = { ...baseCatalog, webcams: { ...baseCatalog.webcams, 'tel-aviv': [] }, news: { ...baseCatalog.news, rtve: [] } };
+    const report = reportFor(catalog, {
+      'webcams/tel-aviv': { status: 'empty', attempts: [] },
+      'live-news/rtve': { status: 'empty', attempts: [] },
+    });
+    const dir = mkdtempSync(join(tmpdir(), 'live-video-audit-hidden-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const summaryPath = join(dir, 'summary.md');
+
+    const { calls, gh } = fakeGh([{ number: 6, title: ISSUE_TITLE }]);
+    assert.deepEqual(await publish(report, { gh, catalog, summaryPath }), { findings: 0, action: 'closed', issue: 6 });
+    assert.equal(calls.length, 3);
+    assert.match(calls[1].payload.body, /^Recovered/);
+    assert.match(calls[1].payload.body, /2 unfilled slot\(s\) stay hidden from viewers/);
+    assert.deepEqual(calls[2].payload, { state: 'closed', state_reason: 'completed' });
+    assert.match(readFileSync(summaryPath, 'utf8'), /^Daily live video source audit: 0 slot\(s\) need attention, 0 of them shown by default\.$/m);
+
+    const { calls: noneCalls, gh: noneGh } = fakeGh([]);
+    assert.deepEqual(await publish(report, { gh: noneGh, catalog }), { findings: 0, action: 'none' });
+    assert.equal(noneCalls.length, 1);
+  });
+
   it('retries the canaries once when every canary failed, and reports on the retried result', async () => {
     const report = reportFor(baseCatalog, { 'webcams/jerusalem': { status: 'needs-replacement', attempts: [dead(watch('zp6LNSoq000'))] } });
     report.canaries = [dead(CANARY_1), dead(CANARY_2)];
@@ -237,31 +260,35 @@ describe('live video audit issue', () => {
     assert.match(closeCalls[1].payload.body, /1 slot\(s\) could not be verified from the runner/);
   });
 
-  it('reports a slot with no entries as "no entries configured"', async () => {
-    const catalog = { ...baseCatalog, news: { ...baseCatalog.news, rtve: [] } };
-    const report = reportFor(catalog, { 'live-news/rtve': { status: 'empty', attempts: [] } });
+  it('counts an empty grid hotspot as "no entries configured", first, with the slot shown in its cell', async () => {
+    const catalog = { ...baseCatalog, webcams: { ...baseCatalog.webcams, jerusalem: [] } };
+    const report = reportFor(catalog, {
+      'webcams/jerusalem': { status: 'empty', attempts: [] },
+      'live-news/bloomberg': { status: 'needs-replacement', attempts: [dead(watch('QB5BNdBFujE'))] },
+    }, { 'webcams/jerusalem': 'webcams/tel-aviv' });
+    report.slots.reverse();
     const { calls, gh } = fakeGh([]);
 
-    assert.deepEqual(await publish(report, { gh, catalog }), { findings: 1, action: 'created' });
-    assert.match(calls[1].payload.body, /^\| live-news\/rtve \| Live News optional \| empty \| — \| no entries configured \| — \|$/m);
+    assert.deepEqual(await publish(report, { gh, catalog }), { findings: 2, action: 'created' });
+    const { body } = calls[1].payload;
+    const rows = body.split('\n').filter((line) => /^\| (webcams|live-news)\//.test(line));
+    assert.equal(rows[0], '| webcams/jerusalem | Webcam grid #1 | empty | — | no entries configured | webcams/tel-aviv |');
+    assert.match(rows[1], /^\| live-news\/bloomberg \|/);
+    assert.match(body, /^Daily live video source audit: 2 slot\(s\) need attention, 2 of them shown by default\.$/m);
+    assert.doesNotMatch(body, /### Unfilled slots/);
   });
 
   it('lists hotspot wall slots first, then other slots shown by default, then the rest', async () => {
-    const catalog = {
-      ...baseCatalog,
-      webcams: { ...baseCatalog.webcams, 'tel-aviv': [] },
-      news: { ...baseCatalog.news, rtve: [] },
-    };
-    const report = reportFor(catalog, {
+    const report = reportFor(baseCatalog, {
       'webcams/kyiv': { status: 'needs-replacement', attempts: [dead(watch('e2gC37ILQmk')), dead(watch('VGnFLdQW39A'))] },
-      'webcams/tel-aviv': { status: 'empty', attempts: [] },
+      'webcams/tel-aviv': { status: 'needs-replacement', attempts: [dead(watch('oDCAAfOSqvA'))] },
       'live-news/bloomberg': { status: 'needs-replacement', attempts: [dead(watch('QB5BNdBFujE'))] },
-      'live-news/rtve': { status: 'empty', attempts: [] },
+      'live-news/rtve': { status: 'needs-replacement', attempts: [dead(watch('KQp-e_XQnDE'))] },
     });
     report.slots.reverse();
     const { calls, gh } = fakeGh([]);
 
-    await publish(report, { gh, catalog });
+    await publish(report, { gh });
 
     const { body } = calls[1].payload;
     const order = ['### Shown by default', '| webcams/kyiv |', '| live-news/bloomberg |', '### Not shown by default', '| webcams/tel-aviv |', '| live-news/rtve |']
@@ -269,6 +296,34 @@ describe('live video audit issue', () => {
     for (const [needle, index] of order) assert.ok(index >= 0, `${needle} is missing:\n${body}`);
     assert.deepEqual(order.map(([needle]) => needle), [...order].sort((a, b) => a[1] - b[1]).map(([needle]) => needle));
     assert.match(body, /^Daily live video source audit: 4 slot\(s\) need attention, 2 of them shown by default\.$/m);
+  });
+
+  it('lists hidden empty slots by surface under "Unfilled slots", without counting them', async () => {
+    const catalog = {
+      ...baseCatalog,
+      webcams: { ...baseCatalog.webcams, 'tel-aviv': [] },
+      news: { ...baseCatalog.news, 'bbc-news': [], rtve: [] },
+    };
+    const report = reportFor(catalog, {
+      'webcams/kyiv': { status: 'degraded', attempts: [dead(watch('e2gC37ILQmk')), live(watch('VGnFLdQW39A'))] },
+      'webcams/tel-aviv': { status: 'empty', attempts: [] },
+      'live-news/bbc-news': { status: 'empty', attempts: [] },
+      'live-news/rtve': { status: 'empty', attempts: [] },
+    });
+    const { calls, gh } = fakeGh([]);
+
+    assert.deepEqual(await publish(report, { gh, catalog }), { findings: 1, action: 'created' });
+    const { body } = calls[1].payload;
+    assert.match(body, /^Daily live video source audit: 1 slot\(s\) need attention, 1 of them shown by default\.$/m);
+    assert.doesNotMatch(body, /### Not shown by default/);
+    const section = body.indexOf('### Unfilled slots (hidden from viewers)');
+    assert.ok(section > body.indexOf('| webcams/kyiv |'), body);
+    assert.ok(section < body.indexOf('### Fix a slot'), body);
+    assert.equal(body.indexOf('webcams/tel-aviv'), body.indexOf('webcams/tel-aviv', section), 'tel-aviv appears only in the unfilled section');
+    assert.equal(body.indexOf('live-news/rtve'), body.indexOf('live-news/rtve', section), 'rtve appears only in the unfilled section');
+    assert.match(body, /^- Webcam \(Middle East\): webcams\/tel-aviv$/m);
+    assert.match(body, /^- Live News optional: live-news\/bbc-news, live-news\/rtve$/m);
+    assert.doesNotMatch(body, /\| empty \|/);
   });
 
   it('fills the shown-instead column with the stand-in slot, the live backup entry, or a dash', async () => {
@@ -299,11 +354,17 @@ describe('live video audit command line', () => {
     const reportPath = join(dir, 'live-video-audit.json');
     const payloadPath = join(dir, 'payload.json');
     const liveVerdict = { verdict: { verdict: 'live', video: { videoId: 'gCNeDWCI0vo', isLive: true, title: 'Live', author: 'Channel' } } };
+    const blockedVerdict = { verdict: { verdict: 'failed', outcome: { kind: 'player-error', code: 150 } } };
+    // Every video entry fails and every channel (the canaries among them) plays, so some slots need a replacement.
     await runCheck(['--all', '--report', reportPath], {
       write: () => {},
-      probeYouTube: async (candidates) => candidates.map(() => liveVerdict),
+      probeYouTube: async (candidates) => candidates.map((candidate) => (candidate.kind === 'channel' ? liveVerdict : blockedVerdict)),
       probeHls: async (candidates) => candidates.map(() => ({ verdict: { verdict: 'live', video: null } })),
     });
+    const hiddenEmpty = JSON.parse(readFileSync(reportPath, 'utf8')).slots
+      .filter((slot) => slot.status === 'empty' && !slot.shownByDefault)
+      .map((slot) => slot.slot);
+    assert.ok(hiddenEmpty.length > 0, 'the catalog has hidden slots with no entries; if every slot is filled, drop the unfilled-section assertions');
     writeFileSync(join(dir, 'gh'), `#!/usr/bin/env node
 const fs = require('node:fs');
 if (process.argv.includes('--paginate')) {
@@ -324,10 +385,20 @@ if (process.argv.includes('--paginate')) {
     assert.equal(reported.status, 0, reported.stderr);
     const result = JSON.parse(reported.stdout);
     assert.equal(result.action, 'created');
-    assert.ok(result.findings > 0, 'the catalog has slots with no entries');
+    assert.ok(result.findings > 0, 'every video entry failed');
     const payload = JSON.parse(readFileSync(payloadPath, 'utf8'));
     assert.equal(payload.title, ISSUE_TITLE);
-    assert.match(payload.body, /\| webcams\/tel-aviv \| [^|]+ \| empty \| — \| no entries configured \|/);
+    assert.match(payload.body, /\| needs-replacement \| `https:\/\/www\.youtube\.com\/watch\?v=[^`]+` \| YouTube player error 150/);
+    const unfilled = payload.body.indexOf('### Unfilled slots (hidden from viewers)');
+    assert.ok(unfilled > 0, payload.body);
+    const unfilledSlots = payload.body.slice(unfilled).split('\n')
+      .filter((line) => line.startsWith('- '))
+      .flatMap((line) => line.slice(line.indexOf(': ') + 2).split(', '));
+    assert.deepEqual([...unfilledSlots].sort(), [...hiddenEmpty].sort());
+    const tableSlots = payload.body.split('\n')
+      .filter((line) => /^\| (webcams|live-news)\//.test(line))
+      .map((line) => line.split(' | ')[0].slice(2));
+    for (const slot of hiddenEmpty) assert.ok(!tableSlots.includes(slot), `${slot} is listed only as unfilled`);
 
     const missing = runReporter({ LIVE_VIDEO_AUDIT_REPORT: join(dir, 'missing.json') });
     assert.equal(missing.status, 1);
