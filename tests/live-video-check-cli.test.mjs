@@ -10,7 +10,10 @@ import {
   parseCheckArgs,
   probeYouTubeCandidates,
   runCheck,
+  slotStatus,
 } from '../scripts/check-live-video-sources.mjs';
+import { extractLiveVideoSurfaces, readLiveVideoSurfaces } from '../scripts/lib/live-video-surfaces.mjs';
+import { LIVE_NEWS_SOURCES, WEBCAM_SOURCES } from '../src/config/live-video-sources.ts';
 import { LIVE_VIDEO_TIMING, parseSourceEntry } from '../src/services/live-video/model.ts';
 
 const parsed = (entry) => parseSourceEntry(entry);
@@ -47,6 +50,15 @@ describe('parseCheckArgs', () => {
     assert.deepEqual(parseCheckArgs(['--all']), { mode: 'all' });
     assert.deepEqual(parseCheckArgs(['--slot', 'webcams/kyiv']), { mode: 'slot', slot: 'webcams/kyiv' });
     assert.throws(() => parseCheckArgs(['--slot']), /--slot needs a slot/);
+  });
+
+  it('reads --report only alongside --all', () => {
+    assert.deepEqual(parseCheckArgs(['--all', '--report', 'audit.json']), { mode: 'all', report: 'audit.json' });
+    assert.deepEqual(parseCheckArgs(['--report', 'audit.json', '--all']), { mode: 'all', report: 'audit.json' });
+    assert.throws(() => parseCheckArgs(['--all', '--report']), /--report needs a file/);
+    assert.throws(() => parseCheckArgs(['--all', '--report', '--all']), /--report needs a file/);
+    assert.throws(() => parseCheckArgs(['--report', 'audit.json']), /--report needs --all/);
+    assert.throws(() => parseCheckArgs(['--slot', 'webcams/kyiv', '--report', 'audit.json']), /--report needs --all/);
   });
 });
 
@@ -324,5 +336,214 @@ describe('runCheck', () => {
     const out = [];
     assert.equal(await runCheck([], { write: (line) => out.push(line) }), 2);
     assert.match(out.join('\n'), /Usage/);
+  });
+});
+
+describe('slotStatus', () => {
+  const live = { verdict: 'live', unverifiableFromRunner: false };
+  const dead = { verdict: 'failed', unverifiableFromRunner: false };
+  const geo = { verdict: 'failed', unverifiableFromRunner: true };
+
+  it('names what a slot needs from its attempts in try order', () => {
+    assert.equal(slotStatus([]), 'empty');
+    assert.equal(slotStatus([live, dead]), 'ok');
+    assert.equal(slotStatus([dead, live]), 'degraded');
+    assert.equal(slotStatus([dead, dead]), 'needs-replacement');
+  });
+
+  it('never counts an attempt the runner could not verify as a failure', () => {
+    assert.equal(slotStatus([geo, live]), 'ok');
+    assert.equal(slotStatus([geo, dead, live]), 'degraded');
+    assert.equal(slotStatus([geo]), 'unverifiable-from-runner');
+    assert.equal(slotStatus([dead, geo]), 'unverifiable-from-runner');
+  });
+});
+
+describe('audit report (--all --report)', () => {
+  const watch = (id) => `https://www.youtube.com/watch?v=${id}`;
+  const BLOOMBERG_HLS = 'https://bloomberg.com/media-manifest/streams/us.m3u8';
+  const BBC_HLS = 'https://vs-hls-push-uk.live.fastly.md.bbci.co.uk/x=4/iptv_hd_abr_v1.m3u8';
+  const CANARY = 'https://www.youtube.com/channel/UCNye-wNBqNL5ZzHSJj3l8Bg';
+  const catalog = {
+    webcams: {
+      jerusalem: [watch('zp6LNSoq000')],
+      'middle-east': [],
+      kyiv: [watch('e2gC37ILQmk'), watch('VGnFLdQW39A')],
+      washington: [watch('oDCAAfOSqvA')],
+      taipei: [watch('z_fY1pj1VBw')],
+      tokyo: [watch('_k-5U7IeK8g')],
+      sydney: [watch('5uZa3-RMFos')],
+    },
+    gridPriority: ['jerusalem', 'middle-east', 'kyiv', 'washington', 'taipei', 'tokyo'],
+    news: {
+      bloomberg: [BLOOMBERG_HLS, watch('QB5BNdBFujE')],
+      'bbc-news': [BBC_HLS],
+      yahoo: [watch('KQp-e_XQnDE')],
+      rtve: [],
+    },
+    canaries: [CANARY],
+  };
+  const surfaces = {
+    webcamFeeds: [
+      { id: 'jerusalem', region: 'middle-east' },
+      { id: 'middle-east', region: 'middle-east' },
+      { id: 'kyiv', region: 'europe' },
+      { id: 'washington', region: 'americas' },
+      { id: 'taipei', region: 'asia' },
+      { id: 'tokyo', region: 'asia' },
+      { id: 'sydney', region: 'asia' },
+    ],
+    gridCells: 4,
+    newsDefaults: { full: ['bloomberg'], tech: ['bloomberg', 'yahoo'] },
+    newsOptional: ['bloomberg', 'yahoo', 'bbc-news', 'rtve'],
+  };
+  const live = (videoId, title = 'Live cam', author = 'Cams') => ({
+    verdict: { verdict: 'live', video: { videoId, isLive: true, title, author } },
+    durationSeconds: 90_000,
+    verdictAtMs: 2_100,
+  });
+  const youtubeVerdicts = {
+    zp6LNSoq000: { verdict: { verdict: 'failed', outcome: { kind: 'player-error', code: 150 } }, durationSeconds: null, verdictAtMs: 1_200 },
+    e2gC37ILQmk: {
+      verdict: { verdict: 'recording', video: { videoId: 'e2gC37ILQmk', isLive: false, title: 'LIVE: View of Kyiv', author: 'DW News' } },
+      durationSeconds: 24_181,
+      verdictAtMs: 8_400,
+    },
+    'KQp-e_XQnDE': { verdict: { verdict: 'unverifiable', reason: 'player-api-silent' }, durationSeconds: null, verdictAtMs: 15_000 },
+  };
+  const probeYouTube = async (candidates) => candidates.map((candidate) => (candidate.kind === 'channel'
+    ? live('gCNeDWCI0vo', 'Al Jazeera English - Live', 'Al Jazeera English')
+    : youtubeVerdicts[candidate.videoId] ?? live(candidate.videoId)));
+  const probeHls = async (candidates) => candidates.map(() => ({ verdict: { verdict: 'failed', outcome: { kind: 'hls-http', status: 403 } } }));
+
+  async function audit(argv, overrides = {}) {
+    const lines = [];
+    const writes = [];
+    const code = await runCheck(argv, {
+      write: (line) => lines.push(line),
+      catalog,
+      surfaces,
+      probeYouTube,
+      probeHls,
+      now: () => new Date('2026-09-15T05:17:00.000Z'),
+      writeReport: (path, text) => writes.push({ path, report: JSON.parse(text) }),
+      ...overrides,
+    });
+    return { code, lines, writes };
+  }
+
+  it('writes the report without changing the human output or the exit code', async () => {
+    const plain = await audit(['--all']);
+    const reported = await audit(['--all', '--report', 'audit.json']);
+    assert.equal(plain.code, 1);
+    assert.equal(reported.code, plain.code);
+    assert.deepEqual(reported.lines, plain.lines);
+    assert.deepEqual(plain.writes, []);
+    assert.equal(reported.writes.length, 1);
+    assert.equal(reported.writes[0].path, 'audit.json');
+    assert.equal(reported.writes[0].report.checkedAt, '2026-09-15T05:17:00.000Z');
+  });
+
+  it('places each slot where customers see it and names the slot shown in its place', async () => {
+    const { writes: [{ report }] } = await audit(['--all', '--report', 'audit.json']);
+    assert.deepEqual(report.slots.map((slot) => [slot.slot, slot.surface, slot.shownByDefault, slot.status, slot.shownInstead]), [
+      ['webcams/jerusalem', 'Webcam grid #1', true, 'needs-replacement', 'webcams/taipei'],
+      ['webcams/middle-east', 'Webcam grid #2', true, 'empty', 'webcams/tokyo'],
+      ['webcams/kyiv', 'Webcam grid #3', true, 'degraded', null],
+      ['webcams/washington', 'Webcam grid #4', true, 'ok', null],
+      ['webcams/taipei', 'Webcam grid #1', true, 'ok', null],
+      ['webcams/tokyo', 'Webcam grid #2', true, 'ok', null],
+      ['webcams/sydney', 'Webcam (Asia)', false, 'ok', null],
+      ['live-news/bloomberg', 'Live News default (full, tech)', true, 'ok', null],
+      ['live-news/bbc-news', 'Live News optional', false, 'unverifiable-from-runner', null],
+      ['live-news/yahoo', 'Live News default (tech)', true, 'needs-replacement', null],
+      ['live-news/rtve', 'Live News optional', false, 'empty', null],
+    ]);
+  });
+
+  it('keeps a wall slot with no spare left in its cell with nothing shown instead', async () => {
+    const thin = { ...catalog, webcams: { ...catalog.webcams, taipei: [], tokyo: [] } };
+    const { writes: [{ report }] } = await audit(['--all', '--report', 'audit.json'], { catalog: thin });
+    const bySlot = new Map(report.slots.map((slot) => [slot.slot, slot]));
+    assert.equal(bySlot.get('webcams/jerusalem').shownInstead, null);
+    assert.equal(bySlot.get('webcams/middle-east').shownInstead, null);
+    assert.equal(bySlot.get('webcams/taipei').surface, 'Webcam (Asia)');
+    assert.equal(bySlot.get('webcams/taipei').shownByDefault, false);
+  });
+
+  it('records every attempt in try order with its verdict and evidence', async () => {
+    const { writes: [{ report }] } = await audit(['--all', '--report', 'audit.json']);
+    const bySlot = new Map(report.slots.map((slot) => [slot.slot, slot]));
+
+    const [jerusalem] = bySlot.get('webcams/jerusalem').attempts;
+    assert.equal(jerusalem.entry, watch('zp6LNSoq000'));
+    assert.equal(jerusalem.kind, 'video');
+    assert.equal(jerusalem.verdict, 'failed');
+    assert.equal(jerusalem.unverifiableFromRunner, false);
+    assert.match(jerusalem.why, /YouTube player error 150/);
+    assert.equal(jerusalem.evidence.errorCode, 150);
+    assert.equal(jerusalem.evidence.verdictAtMs, 1_200);
+
+    const [recording, backup] = bySlot.get('webcams/kyiv').attempts;
+    assert.equal(recording.verdict, 'recording');
+    assert.match(recording.why, /ended recording \(isLive=false, duration 24,181 s\)/);
+    assert.deepEqual(
+      [recording.evidence.title, recording.evidence.author, recording.evidence.isLive, recording.evidence.durationSeconds],
+      ['LIVE: View of Kyiv', 'DW News', false, 24_181],
+    );
+    assert.equal(backup.verdict, 'live');
+
+    const [geo] = bySlot.get('live-news/bbc-news').attempts;
+    assert.equal(geo.kind, 'hls');
+    assert.equal(geo.unverifiableFromRunner, true);
+    assert.equal(geo.evidence.httpStatus, 403);
+
+    const [silent] = bySlot.get('live-news/yahoo').attempts;
+    assert.equal(silent.verdict, 'unverifiable');
+    assert.equal(silent.unverifiableFromRunner, false, 'a player that never became ready is dead for viewers too');
+
+    assert.deepEqual(bySlot.get('live-news/rtve').attempts, []);
+    assert.deepEqual(report.canaries.map((canary) => [canary.entry, canary.kind, canary.verdict, canary.evidence.author]), [
+      [CANARY, 'channel', 'live', 'Al Jazeera English'],
+    ]);
+  });
+
+  it('fails before probing when a slot has no place on the dashboard', async () => {
+    let probed = false;
+    const unplaced = { ...surfaces, webcamFeeds: surfaces.webcamFeeds.filter((feed) => feed.id !== 'sydney') };
+    await assert.rejects(
+      audit(['--all', '--report', 'audit.json'], { surfaces: unplaced, probeYouTube: async () => { probed = true; return []; } }),
+      /webcams\/sydney/,
+    );
+    assert.equal(probed, false);
+  });
+});
+
+describe('live video surfaces', () => {
+  it('reads the webcam wall, regions and Live News defaults from the panels', () => {
+    const surfaces = readLiveVideoSurfaces();
+    assert.deepEqual(surfaces.webcamFeeds.map((feed) => feed.id).sort(), Object.keys(WEBCAM_SOURCES).sort());
+    assert.ok(surfaces.webcamFeeds.every((feed) => /^[a-z-]+$/.test(feed.region)));
+    assert.equal(surfaces.gridCells, 4);
+    assert.deepEqual(Object.keys(surfaces.newsDefaults).sort(), ['full', 'tech']);
+    assert.ok(surfaces.newsDefaults.full.includes('bloomberg'));
+    const newsIds = new Set([...Object.values(surfaces.newsDefaults).flat(), ...surfaces.newsOptional]);
+    assert.deepEqual([...newsIds].sort(), Object.keys(LIVE_NEWS_SOURCES).sort());
+  });
+
+  it('fails loudly when a panel list can no longer be read', () => {
+    const webcamsPanel = "const WEBCAM_FEEDS: WebcamFeed[] = [\n  { id: 'kyiv', city: 'Ukraine', country: 'Ukraine', region: 'europe' },\n];\nconst MAX_GRID_CELLS = 4;\n";
+    const newsPanel = "const FULL_LIVE_CHANNELS: LiveChannel[] = [\n  { id: 'bloomberg', name: 'Bloomberg' },\n];\nexport const OPTIONAL_LIVE_CHANNELS: LiveChannel[] = [\n  { id: 'bloomberg', name: 'Bloomberg' },\n];\n";
+    assert.deepEqual(extractLiveVideoSurfaces({ webcamsPanel, newsPanel }), {
+      webcamFeeds: [{ id: 'kyiv', region: 'europe' }],
+      gridCells: 4,
+      newsDefaults: { full: ['bloomberg'] },
+      newsOptional: ['bloomberg'],
+    });
+    assert.throws(() => extractLiveVideoSurfaces({ webcamsPanel: '', newsPanel }), /WEBCAM_FEEDS/);
+    assert.throws(() => extractLiveVideoSurfaces({ webcamsPanel: webcamsPanel.replace("region: 'europe'", 'region: REGION'), newsPanel }), /WEBCAM_FEEDS/);
+    assert.throws(() => extractLiveVideoSurfaces({ webcamsPanel: webcamsPanel.replace('MAX_GRID_CELLS = 4', 'MAX_GRID_CELLS = CELLS'), newsPanel }), /MAX_GRID_CELLS/);
+    assert.throws(() => extractLiveVideoSurfaces({ webcamsPanel, newsPanel: newsPanel.replace(/export const OPTIONAL[\s\S]*/, '') }), /OPTIONAL_LIVE_CHANNELS/);
+    assert.throws(() => extractLiveVideoSurfaces({ webcamsPanel, newsPanel: newsPanel.replace("{ id: 'bloomberg', name: 'Bloomberg' },\n];\nexport", "{ id: ID, name: 'Bloomberg' },\n];\nexport") }), /FULL_LIVE_CHANNELS/);
   });
 });

@@ -3,8 +3,10 @@
 // using the classifier the dashboard uses (src/services/live-video/model.ts).
 // Run with: npm run live-video:check -- <entry> [name=<entry> ...]
 
+import { writeFileSync } from 'node:fs';
+import { readLiveVideoSurfaces } from './lib/live-video-surfaces.mjs';
 import { isMainModule } from './lib/main-module.mjs';
-import { AUDIT_CANARIES, LIVE_NEWS_SOURCES, WEBCAM_SOURCES } from '../src/config/live-video-sources.ts';
+import { AUDIT_CANARIES, LIVE_NEWS_SOURCES, WEBCAM_GRID_PRIORITY, WEBCAM_SOURCES } from '../src/config/live-video-sources.ts';
 import { classifyAttempt, LIVE_VIDEO_TIMING, parseSourceEntry } from '../src/services/live-video/model.ts';
 
 const PROBE_ORIGIN = 'https://www.worldmonitor.app';
@@ -14,12 +16,12 @@ const MAX_POLLS = Math.ceil((2 * LIVE_VIDEO_TIMING.verdictDeadlineMs) / LIVE_VID
 const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
 const INDENT = ' '.repeat(12);
 const CATALOG_FILE = 'src/config/live-video-sources.ts';
-const DEFAULT_CATALOG = { webcams: WEBCAM_SOURCES, news: LIVE_NEWS_SOURCES, canaries: AUDIT_CANARIES };
+export const DEFAULT_CATALOG = { webcams: WEBCAM_SOURCES, gridPriority: WEBCAM_GRID_PRIORITY, news: LIVE_NEWS_SOURCES, canaries: AUDIT_CANARIES };
 
 const USAGE = `Usage: npm run live-video:check -- <entry> [<entry> ...]
        npm run live-video:check -- --slot webcams/<id>
        npm run live-video:check -- --slot live-news/<id>
-       npm run live-video:check -- --all
+       npm run live-video:check -- --all [--report <file>]
 
 Checks whether each entry is live right now, with the classifier the dashboard uses.
 An entry is a YouTube video ID, any YouTube watch/live/embed/youtu.be URL, a
@@ -28,6 +30,8 @@ Label an entry with name=, e.g. kyiv=https://www.youtube.com/watch?v=e2gC37ILQmk
 
 --slot checks every entry of one slot in ${CATALOG_FILE}.
 --all checks every slot and the audit canaries, and lists slots with no entries.
+--report also writes the --all result as JSON: where each slot shows, its status and every attempt.
+  scripts/report-live-video-audit.mjs turns that file into the daily audit issue.
 
 YouTube entries play in headless Chromium as if embedded on ${PROBE_ORIGIN}.
 HLS entries are fetched from this machine; their playback is not checked. Exits 1 when any entry is not live or a slot is empty.`;
@@ -51,6 +55,14 @@ const PLAYER_ERROR_WHY = {
 
 export function parseCheckArgs(argv) {
   if (argv.includes('--help') || argv.includes('-h')) return { mode: 'help' };
+  const reportAt = argv.indexOf('--report');
+  if (reportAt >= 0) {
+    const file = argv[reportAt + 1];
+    if (!file || file.startsWith('--')) throw new Error(`--report needs a file, e.g. --all --report audit.json\n\n${USAGE}`);
+    const rest = argv.filter((_, index) => index !== reportAt && index !== reportAt + 1);
+    if (rest.length !== 1 || rest[0] !== '--all') throw new Error(`--report needs --all\n\n${USAGE}`);
+    return { mode: 'all', report: file };
+  }
   if (argv.length === 1 && argv[0] === '--all') return { mode: 'all' };
   if (argv[0] === '--slot') {
     if (argv.length !== 2 || argv[1].startsWith('--')) throw new Error(`--slot needs a slot, e.g. --slot webcams/kyiv\n\n${USAGE}`);
@@ -337,17 +349,24 @@ async function probeHlsCandidates(candidates) {
   return Promise.all(candidates.map(probeHlsCandidate));
 }
 
-/** The entries a catalog mode checks, named by slot (a second entry is `slot#2`), plus the slots with no entries. */
-export function catalogTargets(target, catalog = DEFAULT_CATALOG) {
-  const slots = [
+/** Every catalog slot in check order, as [slot, entries]. */
+export function catalogSlots(catalog) {
+  return [
     ...Object.entries(catalog.webcams).map(([id, entries]) => [`webcams/${id}`, entries]),
     ...Object.entries(catalog.news ?? {}).map(([id, entries]) => [`live-news/${id}`, entries]),
   ];
+}
+
+const entryName = (slot, index) => (index === 0 ? slot : `${slot}#${index + 1}`);
+
+/** The entries a catalog mode checks, named by slot (a second entry is `slot#2`), plus the slots with no entries. */
+export function catalogTargets(target, catalog = DEFAULT_CATALOG) {
+  const slots = catalogSlots(catalog);
   const selected = target.mode === 'all' ? slots : slots.filter(([slot]) => slot === target.slot);
   if (target.mode === 'slot' && selected.length === 0) {
     throw new Error(`Unknown slot ${target.slot}. Slots: ${slots.map(([slot]) => slot).join(', ')}`);
   }
-  const entries = selected.flatMap(([slot, list]) => list.map((entry, index) => ({ name: index === 0 ? slot : `${slot}#${index + 1}`, entry })));
+  const entries = selected.flatMap(([slot, list]) => list.map((entry, index) => ({ name: entryName(slot, index), entry })));
   if (target.mode === 'all') entries.push(...catalog.canaries.map((entry, index) => ({ name: `canary/${index + 1}`, entry })));
   const empty = selected.filter(([, list]) => list.length === 0).map(([slot]) => slot);
   return { entries, empty };
@@ -357,7 +376,149 @@ function formatEmptySlot(slot) {
   return ['EMPTY'.padEnd(10), slot, `no entries: paste a live stream URL into ${CATALOG_FILE}`].join('  ');
 }
 
-export async function runCheck(argv, { write = console.log, probeYouTube = probeYouTubeWithBrowser, probeHls = probeHlsCandidates, catalog = DEFAULT_CATALOG } = {}) {
+async function probeRows(rows, { probeYouTube, probeHls }) {
+  const youtubeRows = rows.filter((row) => row.parsed.ok && row.parsed.candidate.kind !== 'hls');
+  const hlsRows = rows.filter((row) => row.parsed.ok && row.parsed.candidate.kind === 'hls');
+  if (youtubeRows.length) {
+    const probed = await probeYouTube(youtubeRows.map((row) => row.parsed.candidate));
+    youtubeRows.forEach((row, index) => Object.assign(row, probed[index]));
+  }
+  if (hlsRows.length) {
+    const probed = await probeHls(hlsRows.map((row) => row.parsed.candidate));
+    hlsRows.forEach((row, index) => Object.assign(row, probed[index]));
+  }
+}
+
+// A manifest that answers 403/451 or times out, or a player API that never loaded, can depend on
+// where the check runs (region, network), so the audit cannot call the entry dead from there.
+const RUNNER_BLOCKED_HLS_STATUSES = new Set([403, 451]);
+
+function unverifiableFromRunner(row) {
+  if (!row.parsed.ok) return false;
+  const { verdict } = row;
+  // A frame that loads but never becomes ready is dead for viewers too; the chain skips it.
+  if (verdict.verdict === 'unverifiable') return verdict.reason !== 'player-api-silent';
+  if (verdict.verdict !== 'failed' || row.parsed.candidate.kind !== 'hls') return false;
+  const { outcome } = verdict;
+  return outcome.kind === 'timeout' || (outcome.kind === 'hls-http' && RUNNER_BLOCKED_HLS_STATUSES.has(outcome.status));
+}
+
+/** One checked entry as the audit report records it: the verdict, why, and the evidence behind it. */
+function attemptRecord(row) {
+  const verdict = row.parsed.ok ? row.verdict : null;
+  const video = verdict?.video ?? null;
+  const outcome = verdict?.verdict === 'failed' ? verdict.outcome : null;
+  return {
+    entry: row.parsed.entry,
+    kind: row.parsed.ok ? row.parsed.candidate.kind : null,
+    verdict: verdict ? verdict.verdict : 'invalid',
+    why: why(row),
+    unverifiableFromRunner: unverifiableFromRunner(row),
+    evidence: {
+      videoId: video?.videoId || null,
+      title: video?.title || null,
+      author: video?.author || null,
+      isLive: typeof video?.isLive === 'boolean' ? video.isLive : null,
+      errorCode: outcome?.kind === 'player-error' ? outcome.code : null,
+      httpStatus: outcome?.kind === 'hls-http' ? outcome.status : null,
+      durationSeconds: row.durationSeconds ?? null,
+      verdictAtMs: row.verdictAtMs ?? null,
+    },
+  };
+}
+
+/**
+ * What a slot needs, from its attempts in try order:
+ *  no entries → empty; first entry live → ok; a later entry live after a failure → degraded;
+ *  nothing live → needs-replacement, or unverifiable-from-runner when the runner could not verify an entry.
+ */
+export function slotStatus(attempts) {
+  if (attempts.length === 0) return 'empty';
+  const liveAt = attempts.findIndex((attempt) => attempt.verdict === 'live');
+  if (liveAt >= 0) return attempts.slice(0, liveAt).some((attempt) => !attempt.unverifiableFromRunner) ? 'degraded' : 'ok';
+  return attempts.some((attempt) => attempt.unverifiableFromRunner) ? 'unverifiable-from-runner' : 'needs-replacement';
+}
+
+const NOTHING_LIVE = new Set(['empty', 'needs-replacement']);
+
+function titleCase(key) {
+  return key.split('-').map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
+}
+
+/**
+ * Where customers see each slot, by the panels' own rules. The "all regions" wall is the first
+ * `gridCells` slots of the grid priority; a wall slot with nothing live gives its cell to the next
+ * spare that plays (LiveWebcamsPanel.gridFeeds). An empty wall slot keeps its cell here, so the
+ * owner sees which hotspot is missing and which slot fills in for it.
+ */
+export function placeSlots(catalog, statusBySlot, surfaces) {
+  const nothingLive = (id) => NOTHING_LIVE.has(statusBySlot.get(`webcams/${id}`));
+  const priority = catalog.gridPriority ?? [];
+  const intended = priority.slice(0, surfaces.gridCells);
+  const spares = priority.slice(surfaces.gridCells).filter((id) => !nothingLive(id));
+  const wall = intended.map((id) => (nothingLive(id) && spares.length > 0 ? spares.shift() : id));
+  const regions = new Map(surfaces.webcamFeeds.map((feed) => [feed.id, feed.region]));
+  const placements = new Map();
+
+  for (const id of Object.keys(catalog.webcams)) {
+    const slot = `webcams/${id}`;
+    const region = regions.get(id);
+    if (!region) throw new Error(`${slot} is not a feed in LiveWebcamsPanel.ts WEBCAM_FEEDS, so the audit cannot say where it shows`);
+    const cell = intended.includes(id) ? intended.indexOf(id) : wall.indexOf(id);
+    placements.set(slot, cell < 0
+      ? { surface: `Webcam (${titleCase(region)})`, shownByDefault: false, shownInstead: null }
+      : { surface: `Webcam grid #${cell + 1}`, shownByDefault: true, shownInstead: intended[cell] === id && wall[cell] !== id ? `webcams/${wall[cell]}` : null });
+  }
+
+  for (const id of Object.keys(catalog.news ?? {})) {
+    const slot = `live-news/${id}`;
+    const variants = Object.entries(surfaces.newsDefaults).filter(([, ids]) => ids.includes(id)).map(([variant]) => variant);
+    if (variants.length > 0) {
+      placements.set(slot, { surface: `Live News default (${variants.join(', ')})`, shownByDefault: true, shownInstead: null });
+    } else if (surfaces.newsOptional.includes(id)) {
+      placements.set(slot, { surface: 'Live News optional', shownByDefault: false, shownInstead: null });
+    } else {
+      throw new Error(`${slot} is not a channel in LiveNewsPanel.ts, so the audit cannot say where it shows`);
+    }
+  }
+  return placements;
+}
+
+/** The --report file: every slot with where it shows, its status and every attempt, plus the canaries. */
+export function buildAuditReport({ catalog, rows, surfaces, checkedAt }) {
+  const byName = new Map(rows.map((row) => [row.name, row]));
+  const slots = catalogSlots(catalog).map(([slot, entries]) => ({
+    slot,
+    attempts: entries.map((_, index) => attemptRecord(byName.get(entryName(slot, index)))),
+  }));
+  const statuses = new Map(slots.map(({ slot, attempts }) => [slot, slotStatus(attempts)]));
+  const placements = placeSlots(catalog, statuses, surfaces);
+  return {
+    checkedAt,
+    canaries: catalog.canaries.map((_, index) => attemptRecord(byName.get(`canary/${index + 1}`))),
+    slots: slots.map(({ slot, attempts }) => {
+      const { surface, shownByDefault, shownInstead } = placements.get(slot);
+      return { slot, surface, shownByDefault, status: statuses.get(slot), attempts, shownInstead };
+    }),
+  };
+}
+
+/** Checks bare entries and returns them as report attempts; the reporter re-checks the canaries with this. */
+export async function auditAttempts(entries, { probeYouTube = probeYouTubeWithBrowser, probeHls = probeHlsCandidates } = {}) {
+  const rows = entries.map((entry) => ({ name: null, parsed: parseSourceEntry(entry) }));
+  await probeRows(rows, { probeYouTube, probeHls });
+  return rows.map(attemptRecord);
+}
+
+export async function runCheck(argv, {
+  write = console.log,
+  probeYouTube = probeYouTubeWithBrowser,
+  probeHls = probeHlsCandidates,
+  catalog = DEFAULT_CATALOG,
+  surfaces,
+  writeReport = writeFileSync,
+  now = () => new Date(),
+} = {}) {
   let args;
   let targets;
   try {
@@ -372,23 +533,23 @@ export async function runCheck(argv, { write = console.log, probeYouTube = probe
     return 0;
   }
 
+  // Place every slot before the slow probe, so a panel list that can no longer be read fails first.
+  const placement = args.report ? surfaces ?? readLiveVideoSurfaces() : null;
+  if (placement) placeSlots(catalog, new Map(), placement);
+  const checkedAt = now().toISOString();
+
   const rows = targets.entries.map(({ name, entry }) => ({ name, parsed: parseSourceEntry(entry) }));
-  const youtubeRows = rows.filter((row) => row.parsed.ok && row.parsed.candidate.kind !== 'hls');
-  const hlsRows = rows.filter((row) => row.parsed.ok && row.parsed.candidate.kind === 'hls');
-  if (youtubeRows.length) {
-    const probed = await probeYouTube(youtubeRows.map((row) => row.parsed.candidate));
-    youtubeRows.forEach((row, index) => Object.assign(row, probed[index]));
-  }
-  if (hlsRows.length) {
-    const probed = await probeHls(hlsRows.map((row) => row.parsed.candidate));
-    hlsRows.forEach((row, index) => Object.assign(row, probed[index]));
-  }
+  await probeRows(rows, { probeYouTube, probeHls });
 
   for (const slot of targets.empty) write(formatEmptySlot(slot));
   for (const row of rows) write(formatCheckLine(row));
   const notLive = rows.filter((row) => !(row.parsed.ok && row.verdict?.verdict === 'live')).length;
   if (rows.length > 0) write(notLive ? `${notLive} of ${rows.length} entries are not live.` : `All ${rows.length} entries are live.`);
   if (targets.empty.length > 0) write(`${targets.empty.length} slot(s) have no entries.`);
+  if (args.report) {
+    const report = buildAuditReport({ catalog, rows, surfaces: placement, checkedAt });
+    writeReport(args.report, `${JSON.stringify(report, null, 2)}\n`);
+  }
   return targets.empty.length > 0 ? 1 : exitCodeFor(rows);
 }
 
