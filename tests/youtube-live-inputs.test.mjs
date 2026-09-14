@@ -1,33 +1,23 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { runInNewContext } from 'node:vm';
 import { afterEach, test } from 'node:test';
 import handler from '../api/youtube/live.js';
 import { __resetRateLimitForTest } from '../api/_rate-limit.js';
 const originalFetch = globalThis.fetch;
 const originalEnv = { ...process.env };
-const source = readFileSync(new URL('../scripts/ais-relay.cjs', import.meta.url), 'utf8');
-const region = source.slice(source.indexOf('const ytLiveCache ='), source.indexOf('// Periodic cleanup for YouTube cache'));
-const html = '{"channelId":"UCabcdefghijklmnopqrstuv","videoDetails":{"videoId":"abcdefghijk","isLive":true}}';
-function relay() {
-  const calls = [];
-  const run = runInNewContext(region + '\nhandleYouTubeLiveRequest', {
-    URL, Date, console, PORT: 3004,
-    ytFetch: async url => { calls.push(url); return { ok: true, body: html }; },
-    sendCompressed: (_req, res, status, _headers, body) => res.done({ status, body: JSON.parse(body) }),
-  });
-  return { calls, request: params => new Promise(resolve => run({ url: '/youtube-live?' + new URLSearchParams(params) }, { done: resolve })) };
-}
+const relaySource = readFileSync(new URL('../scripts/ais-relay.cjs', import.meta.url), 'utf8');
+const RETIRED = { error: 'channel_live_detection_retired' };
 function edge() {
   const calls = [];
   process.env.UPSTASH_REDIS_REST_URL = 'https://redis.example';
   process.env.UPSTASH_REDIS_REST_TOKEN = 'synthetic';
-  delete process.env.WS_RELAY_URL;
+  // A configured relay must not be called: it no longer serves YouTube lookups.
+  process.env.WS_RELAY_URL = 'https://relay.example';
   globalThis.fetch = async input => {
     const url = String(input);
     if (url.includes('redis.example')) return Response.json([{ result: [29, 30] }]);
     calls.push(url);
-    return new Response(html);
+    return Response.json({ author_name: 'Synthetic channel', title: 'Synthetic video' });
   };
   return { calls, request: params => handler(new Request('https://worldmonitor.app/api/youtube/live?' + new URLSearchParams(params))) };
 }
@@ -37,34 +27,46 @@ afterEach(() => {
   Object.assign(process.env, originalEnv);
   __resetRateLimitForTest();
 });
-test('Edge and direct relay reject path and query injection before provider work', async () => {
-  for (const surface of [edge(), relay()]) {
-    for (const channel of ['@x/../redirect?q=https://attacker.example', '..%2Fredirect%3Fq%3Dhttps:%2F%2Fattacker', '@abc?x=1', '@abc#x', '@abc\\x', '@abc\n', '@' + 'a'.repeat(1000), '@.abc', '@abc.']) {
-      assert.equal((await surface.request({ channel })).status, 400, channel);
-    }
-    for (const videoId of ['short', 'abcdefghijk\n', 'abcdefghij?']) {
-      assert.equal((await surface.request({ channel: '@Valid', videoId })).status, 400);
-    }
-    assert.deepEqual(surface.calls, []);
-  }
-});
-test('Edge rejects invalid input before forwarding to its configured relay', async () => {
+test('Edge rejects path and query injection before provider work', async () => {
   const surface = edge();
-  process.env.WS_RELAY_URL = 'https://relay.example';
-  assert.equal((await surface.request({ channel: '@abc/../redirect' })).status, 400);
+  for (const channel of ['@x/../redirect?q=https://attacker.example', '..%2Fredirect%3Fq%3Dhttps:%2F%2Fattacker', '@abc?x=1', '@abc#x', '@abc\\x', '@abc\n', '@' + 'a'.repeat(1000), '@.abc', '@abc.']) {
+    assert.equal((await surface.request({ channel })).status, 400, channel);
+  }
+  for (const videoId of ['short', 'abcdefghijk\n', 'abcdefghij?']) {
+    assert.equal((await surface.request({ channel: '@Valid', videoId })).status, 400);
+  }
   assert.deepEqual(surface.calls, []);
 });
-test('shipped handles, international handles and channel IDs keep safe paths', async () => {
+test('channel live detection is retired: shipped handles, international handles and channel IDs get a cacheable 410 without provider work', async () => {
+  // Tabs opened before the retirement still send these handles; they must read the retirement, not an input error.
   const panel = readFileSync(new URL('../src/components/LiveNewsPanel.ts', import.meta.url), 'utf8');
   const handles = new Set([...panel.matchAll(/handle:\s*'([^']+)'/g)].map(match => match[1]));
   assert.ok(handles.size > 50);
-  for (const surface of [edge(), relay()]) {
-    for (const channel of [...handles, '@中', '@あい', '@cafe\u0301', '@a·b', 'UCabcdefghijklmnopqrstuv']) {
-      assert.equal((await surface.request({ channel })).status, 200, channel);
-    }
-    const paths = surface.calls.map(url => new URL(url).pathname);
-    assert.ok(paths.every(path => path.endsWith('/live')));
-    assert.ok(paths.includes('/channel/UCabcdefghijklmnopqrstuv/live'));
-    assert.ok(paths.includes('/@%E4%B8%AD/live'));
+  const surface = edge();
+  for (const channel of [...handles, '@中', '@あい', '@café', '@a·b', 'UCabcdefghijklmnopqrstuv']) {
+    const response = await surface.request({ channel });
+    assert.equal(response.status, 410, channel);
+    assert.deepEqual(await response.json(), RETIRED, channel);
+    assert.match(response.headers.get('Cache-Control') ?? '', /\bmax-age=86400\b/, channel);
   }
+  assert.deepEqual(surface.calls, []);
+});
+test('a video is named from YouTube oEmbed alone, even when a channel is also given', async () => {
+  const surface = edge();
+  for (const params of [{ videoId: 'LuKwFajn37U' }, { channel: '@DWNews', videoId: 'LuKwFajn37U' }]) {
+    const response = await surface.request(params);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { channelName: 'Synthetic channel', title: 'Synthetic video', videoId: 'LuKwFajn37U' });
+  }
+  assert.equal(surface.calls.length, 2);
+  for (const call of surface.calls) {
+    const url = new URL(call);
+    assert.equal(`${url.hostname}${url.pathname}`, 'www.youtube.com/oembed');
+    assert.equal(url.searchParams.get('url'), 'https://www.youtube.com/watch?v=LuKwFajn37U');
+  }
+});
+test('the relay no longer serves, proxies or configures YouTube live detection', () => {
+  assert.doesNotMatch(relaySource, /['"]\/youtube-live['"]/, 'the /youtube-live route falls through to the relay 404');
+  assert.doesNotMatch(relaySource, /YOUTUBE_PROXY_URL/);
+  assert.doesNotMatch(relaySource, /function handleYouTubeLiveRequest|function ytFetchDirect|function ytFetch\(|ytLiveCache|YT_CACHE_TTL/);
 });
