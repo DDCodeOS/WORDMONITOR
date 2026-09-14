@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, extname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
+import { deferredDashboardAppDependencies } from '../scripts/bundle-budgets.mjs';
 import { guardBuiltOutput, shouldSkipBuiltOutput } from './_lib/built-output-guard.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -159,21 +160,14 @@ function stylesheetHrefs(html) {
   return hrefs;
 }
 
-function deferredAppStylesheetHrefs(html) {
-  const entryHref = html.match(/<script\b[^>]*\bsrc="([^"\s]+\/main-[^"\s]+\.js)"/)?.[1];
-  assert.ok(entryHref, 'Built dashboard must have its main module entry.');
-  const entry = builtSrc(`dist/${entryHref.replace(/^\//, '')}`);
+function deferredAppStylesheetHrefs() {
   // Vite awaits these CSS preloads before evaluating the dynamic App import.
-  const dependencyTable = entry.match(/m\.f=\[([^\]]*)\]/)?.[1];
-  const appDependencyIds = entry.match(
-    /import\(["']\.\/App-[^"']+\.js["']\)[\s\S]*?__vite__mapDeps\(\[([\d,]+)\]\)/,
-  )?.[1];
-  assert.ok(dependencyTable && appDependencyIds, 'Built App import must retain its Vite preload dependencies.');
-  const dependencies = JSON.parse(`[${dependencyTable}]`);
-  return appDependencyIds.split(',')
-    .map((index) => dependencies[Number(index)])
-    .filter((path) => path?.endsWith('.css'))
-    .map((path) => `/${path}`);
+  // The bundle gate owns the parser, so both checks read the same preload list.
+  const dependencies = deferredDashboardAppDependencies(resolve(repoRoot, 'dist'));
+  assert.ok(dependencies, 'Built dashboard entry must keep the application on its deferred App import.');
+  return dependencies
+    .filter((name) => name.endsWith('.css'))
+    .map((name) => `/assets/${name}`);
 }
 
 function stripNoscript(html) {
@@ -339,7 +333,7 @@ describe('dashboard critical CSS graph', () => {
 
     it('does not link or merge the settings-only stylesheet into built dashboard.html', () => {
     const dashboardHtml = builtSrc('dist/dashboard.html');
-    const hrefs = [...stylesheetHrefs(dashboardHtml), ...deferredAppStylesheetHrefs(dashboardHtml)];
+    const hrefs = [...stylesheetHrefs(dashboardHtml), ...deferredAppStylesheetHrefs()];
     const settingsStylesheets = hrefs.filter((href) =>
       /\/assets\/settings(?:-(?:persistence|window))?-[A-Za-z0-9_-]+\.css$/.test(href)
     );
@@ -412,7 +406,7 @@ describe('dashboard critical CSS graph', () => {
       }
     }
     assert.ok(
-      deferredHrefs.length + deferredAppStylesheetHrefs(dashboardHtml).length > 0,
+      deferredHrefs.length + deferredAppStylesheetHrefs().length > 0,
       'Built dashboard must load app CSS through deferred HTML links or the dynamic App preload.',
     );
 

@@ -1,5 +1,5 @@
 {
-  "comment": "Initial /dashboard bundle-size budgets (#7111). Gated on raw bytes: per chunk ±max(2048 B, 2%), total ±max(16384 B, 0.25%). Tolerance fields here are informational — the gate enforces its own constants and rejects a snapshot that disagrees. Regenerate after \"npm run build:pro && VITE_VARIANT=full ./node_modules/.bin/vite build\" with: npm run bundle:budgets",
+  "comment": "Initial /dashboard bundle-size budgets (#7111). Gated on raw bytes: per chunk ±max(2048 B, 2%), total ±max(16384 B, 0.25%). The \"deferred\" section gates the application graph the entry imports on every visit with the same tolerances. Tolerance fields here are informational — the gate enforces its own constants and rejects a snapshot that disagrees. Regenerate after \"npm run build:pro && VITE_VARIANT=full ./node_modules/.bin/vite build\" with: npm run bundle:budgets",
   "surface": "dashboard",
   "variant": "full",
   "tolerancePct": 2,
@@ -7,7 +7,7 @@
   "totalTolerancePct": 0.25,
   "totalToleranceBytes": 16384,
   "total": {
-    "raw": 439876
+    "raw": 440067
   },
   "chunks": {
     "clerk": {
@@ -47,7 +47,7 @@
       "files": 1
     },
     "main": {
-      "raw": 125912,
+      "raw": 126103,
       "files": 1
     },
     "panels": {
@@ -61,6 +61,101 @@
     "theme-manager": {
       "raw": 1477,
       "files": 1
+    }
+  },
+  "deferred": {
+    "total": {
+      "raw": 1362036
+    },
+    "chunks": {
+      "App": {
+        "raw": 871148,
+        "files": 1
+      },
+      "base": {
+        "raw": 2335,
+        "files": 1
+      },
+      "cached-risk-scores": {
+        "raw": 14915,
+        "files": 1
+      },
+      "checkout": {
+        "raw": 30441,
+        "files": 1
+      },
+      "continuous": {
+        "raw": 4507,
+        "files": 1
+      },
+      "cross-domain-storage": {
+        "raw": 418,
+        "files": 1
+      },
+      "data-freshness": {
+        "raw": 11151,
+        "files": 1
+      },
+      "feeds": {
+        "raw": 111294,
+        "files": 1
+      },
+      "gdelt-intel": {
+        "raw": 105467,
+        "files": 1
+      },
+      "index": {
+        "raw": 36600,
+        "files": 1
+      },
+      "layout-batch": {
+        "raw": 17357,
+        "files": 1
+      },
+      "panel-gating": {
+        "raw": 3206,
+        "files": 1
+      },
+      "panel-storage": {
+        "raw": 1748,
+        "files": 1
+      },
+      "persistent-cache": {
+        "raw": 3771,
+        "files": 1
+      },
+      "sanitize": {
+        "raw": 1146,
+        "files": 1
+      },
+      "source-provenance": {
+        "raw": 76020,
+        "files": 1
+      },
+      "storage-facility-registry-store": {
+        "raw": 14199,
+        "files": 1
+      },
+      "string": {
+        "raw": 20823,
+        "files": 1
+      },
+      "sync-keys": {
+        "raw": 984,
+        "files": 1
+      },
+      "timeout-signal": {
+        "raw": 776,
+        "files": 1
+      },
+      "user-location": {
+        "raw": 10386,
+        "files": 1
+      },
+      "widget-store": {
+        "raw": 23344,
+        "files": 1
+      }
     }
   }
 }
