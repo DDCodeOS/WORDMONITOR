@@ -1073,8 +1073,15 @@ function parseRssXml(xml: string, feed: ServerFeed, variant: string): ParseResul
     // regex accident.
     const originPublisher = isAtom ? '' : extractTag(block, 'source');
     if (!forDigest) {
-      if (title.length <= 1000 && link.length <= 2048 && originPublisher.length <= 200) {
-        countryItems.push({ source: feed.name, title, link, publishedAt, originPublisher, originPublisherTrusted });
+      // The country reader trusts origin metadata only from configured
+      // aggregators. Do not let ignored metadata from an ordinary feed discard
+      // an otherwise valid retained headline, while keeping cached fields bounded.
+      const countryOriginPublisher = originPublisherTrusted ? originPublisher : '';
+      if (title.length <= 1000 && link.length <= 2048 && countryOriginPublisher.length <= 200) {
+        countryItems.push({
+          source: feed.name, title, link, publishedAt,
+          originPublisher: countryOriginPublisher, originPublisherTrusted,
+        });
       }
       continue;
     }

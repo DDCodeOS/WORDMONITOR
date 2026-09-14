@@ -164,6 +164,24 @@ describe('country headlines from existing curated RSS caches', () => {
     assert.deepEqual(payload.countries.CM.items.map(row => row.link), ['https://www.theguardian.com/accepted']);
   });
 
+  it('retains a valid late headline when an ordinary feed has oversized source metadata', async () => {
+    const source = feed('Guardian Africa');
+    const date = new Date(Date.now() - 3600_000).toUTCString();
+    const preceding = '<item><title>Kenya forms a cabinet</title><link>https://www.theguardian.com/kenya</link>' +
+      `<pubDate>${date}</pubDate></item>`;
+    const untrustedSource = 'untrusted publisher metadata '.repeat(12);
+    const xml = `<rss><channel>${preceding.repeat(5)}<item><title>Cameroon forms a cabinet</title>` +
+      `<source>${untrustedSource}</source><link>https://www.theguardian.com/cameroon</link><pubDate>${date}</pubDate></item></channel></rss>`;
+    const parsed = digest.parseRssXml(xml, source, 'full');
+    assert.ok(parsed);
+    assert.equal(parsed.countryItems?.[0]?.originPublisher, '');
+    cache.set(rssFeedCacheKey('full', source.url), parsed);
+
+    const { payload } = await request(['CM']);
+    assert.deepEqual(payload.countries.CM.items.map(row => row.link), ['https://www.theguardian.com/cameroon']);
+    assert.equal(payload.countries.CM.items[0]?.source, source.name);
+  });
+
   it('carries a parsed regional article through the registered RPC into country grounding', async () => {
     const source = feed('Guardian Pacific');
     const publishedAt = new Date(Date.now() - 3600_000).toUTCString();
