@@ -7,6 +7,7 @@ import {
 import {
   CANCELLATION_REQUIRED_WEBMCP_TOOLS,
   WEBMCP_TOOL_CANCELLATION_POLICY,
+  buildWebMcpTools,
   registerWebMcpTools,
 } from '../src/services/webmcp.ts';
 import { waitForWebMcpUiReady } from '../src/app/webmcp-dashboard.ts';
@@ -308,6 +309,30 @@ async function executeRegistered(provider, name, inputJson = '{}', options = {})
 }
 
 describe('WebMCP registry behavioral contract', () => {
+  it('does not accumulate subscriptions to a stalled load after cancellation or timeout', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const pending = deferred();
+    const originalThen = pending.promise.then.bind(pending.promise);
+    let subscriptions = 0;
+    t.mock.method(pending.promise, 'then', (...args) => { subscriptions += 1; return originalThen(...args); });
+    let opened = 0;
+    const tool = buildWebMcpTools(pending.promise, () => {}).find(({ name }) => name === 'openSearch');
+    for (let i = 0; i < 20; i += 1) {
+      const controller = new AbortController();
+      const invocation = tool.execute({}, { signal: controller.signal });
+      const rejected = assert.rejects(invocation, i % 2 ? /World Monitor could not open search/ : { name: 'AbortError' });
+      if (i % 2) t.mock.timers.tick(30_000);
+      else controller.abort();
+      await rejected;
+    }
+    assert.equal(subscriptions, 1, 'Only the registry may subscribe to the unresolved load.');
+    pending.resolve(createBindings({ openSearch: () => { opened += 1; return true; } }));
+    await settlePromises();
+    assert.equal(opened, 0, 'Detached calls must not resume after the load resolves.');
+    assert.equal(await tool.execute({}, { signal: new AbortController().signal }), 'Opened search palette.');
+    assert.equal(opened, 1);
+  });
+
   it('publishes the complete inventory while App bindings are still loading', async () => {
     const pending = deferred();
     const provider = new FakeWebMcpModelContext({ supportsTargetExecutionSignal: true });

@@ -1783,25 +1783,42 @@ export function buildWebMcpTools(
   bindings: WebMcpAppBindings | Promise<WebMcpAppBindings>,
   trackEvent: WebMcpAnalytics = trackPrivacyRestricted,
 ): DashboardWebMcpTool[] {
-  // A failed load must be observed even when nobody has invoked a tool yet.
-  void Promise.resolve(bindings).catch(() => undefined);
+  type BindingsResult = { value: WebMcpAppBindings } | { error: unknown };
+  let bindingsResult: BindingsResult | undefined;
+  const bindingWaiters = new Set<(result: BindingsResult) => void>();
+  const settleBindings = (result: BindingsResult): void => {
+    bindingsResult = result;
+    for (const resolve of bindingWaiters) resolve(result);
+    bindingWaiters.clear();
+  };
+  // Observe the shared load once. Per-call waiters can detach even if it stalls.
+  void Promise.resolve(bindings).then(
+    (value) => settleBindings({ value }),
+    (error: unknown) => settleBindings({ error }),
+  );
   let app: WebMcpAppBindings;
   const withBindings = (...[name, fn, track, hooks = {}]: Parameters<typeof withInvocationLogging>) => (
     withInvocationLogging(name, fn, track, {
       ...hooks,
       // Every binding-dependent hook and callback runs after this bounded wait.
       preflight: async (args, extra) => {
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        try {
-          app = await raceWebMcpAbort(Promise.race([
-            Promise.resolve(bindings),
-            new Promise<never>((_, reject) => {
+        let result = bindingsResult;
+        if (!result) {
+          let resolveWaiter!: (result: BindingsResult) => void;
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            result = await raceWebMcpAbort(new Promise<BindingsResult>((resolve, reject) => {
+              resolveWaiter = resolve;
+              bindingWaiters.add(resolve);
               timer = setTimeout(() => reject(new Error('Dashboard application did not load.')), 30_000);
-            }),
-          ]), extra?.signal);
-        } finally {
-          clearTimeout(timer);
+            }), extra?.signal);
+          } finally {
+            bindingWaiters.delete(resolveWaiter);
+            clearTimeout(timer);
+          }
         }
+        if ('error' in result) throw result.error;
+        app = result.value;
         return hooks.preflight?.(args, extra);
       },
     })
