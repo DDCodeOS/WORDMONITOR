@@ -448,12 +448,12 @@ describe('audit report (--all --report)', () => {
   it('places each slot where customers see it and names the slot shown in its place', async () => {
     const { writes: [{ report }] } = await audit(['--all', '--report', 'audit.json']);
     assert.deepEqual(report.slots.map((slot) => [slot.slot, slot.surface, slot.shownByDefault, slot.status, slot.shownInstead]), [
-      ['webcams/jerusalem', 'Webcam grid #1', true, 'needs-replacement', 'webcams/taipei'],
-      ['webcams/middle-east', 'Webcam grid #2', true, 'empty', 'webcams/tokyo'],
-      ['webcams/kyiv', 'Webcam grid #3', true, 'degraded', null],
-      ['webcams/washington', 'Webcam grid #4', true, 'ok', null],
-      ['webcams/taipei', 'Webcam grid #1', true, 'ok', null],
-      ['webcams/tokyo', 'Webcam grid #2', true, 'ok', null],
+      ['webcams/jerusalem', 'Webcam grid cell 1', true, 'needs-replacement', 'webcams/taipei'],
+      ['webcams/middle-east', 'Webcam grid cell 2', true, 'empty', 'webcams/tokyo'],
+      ['webcams/kyiv', 'Webcam grid cell 3', true, 'degraded', null],
+      ['webcams/washington', 'Webcam grid cell 4', true, 'ok', null],
+      ['webcams/taipei', 'Webcam grid cell 1', true, 'ok', null],
+      ['webcams/tokyo', 'Webcam grid cell 2', true, 'ok', null],
       ['webcams/sydney', 'Webcam (Asia)', false, 'ok', null],
       ['live-news/bloomberg', 'Live News default (full, tech)', true, 'ok', null],
       ['live-news/bbc-news', 'Live News optional', false, 'unverifiable-from-runner', null],
@@ -525,10 +525,12 @@ describe('audit report (--all --report)', () => {
       ['not an HLS media playlist', false],
     ];
     for (const [detail, unverifiable] of cases) {
-      const { writes: [{ report }] } = await audit(['--all', '--report', 'audit.json'], { catalog: hlsOnly, probeHls: failWith(detail) });
+      const { lines, writes: [{ report }] } = await audit(['--all', '--report', 'audit.json'], { catalog: hlsOnly, probeHls: failWith(detail) });
       const [slot] = report.slots;
       assert.equal(slot.attempts[0].unverifiableFromRunner, unverifiable, detail);
       assert.equal(slot.status, unverifiable ? 'unverifiable-from-runner' : 'needs-replacement', detail);
+      assert.deepEqual([slot.attempts[0].why, slot.attempts[0].evidence.detail], ['stream failed', detail], 'the report keeps fetch text out of why');
+      assert.ok(lines.join('\n').includes(`why: stream failed: ${detail}`), 'the terminal still shows the detail');
     }
   });
 

@@ -125,7 +125,7 @@ function why(result) {
       }
       if (outcome.kind === 'timeout') return `no verdict within ${LIVE_VIDEO_TIMING.verdictDeadlineMs / 1000} s`;
       if (outcome.kind === 'hls-http') return `manifest returned HTTP ${outcome.status}`;
-      return `stream failed: ${outcome.detail}`;
+      return 'stream failed';
     }
     case 'unverifiable':
       if (verdict.reason === 'player-api-blocked') return 'the YouTube IFrame API did not load';
@@ -138,6 +138,12 @@ function why(result) {
   return 'unknown verdict';
 }
 
+/** What a failing stream reported (an error code or message). Kept out of `why`, which the audit issue renders as trusted text. */
+function failureDetail(result) {
+  const outcome = result.verdict?.verdict === 'failed' ? result.verdict.outcome : null;
+  return outcome?.kind === 'hls-fatal' ? outcome.detail : null;
+}
+
 /** One block per entry: verdict, what was checked, title/author, why, and the line to paste when live. */
 export function formatCheckLine(result) {
   const video = result.verdict?.video ?? null;
@@ -145,7 +151,8 @@ export function formatCheckLine(result) {
   if (result.parsed.ok && result.parsed.candidate.kind === 'channel' && video?.videoId) subject += ` → ${video.videoId}`;
   const byline = [video?.title && `"${video.title}"`, video?.author && `by ${video.author}`].filter(Boolean).join(' ') || null;
   const head = [verdictLabel(result).padEnd(10), result.name, subject, byline].filter(Boolean).join('  ');
-  const lines = [head, `${INDENT}why: ${why(result)}`];
+  const detail = failureDetail(result);
+  const lines = [head, `${INDENT}why: ${why(result)}${detail ? `: ${detail}` : ''}`];
   if (result.parsed.ok && result.verdict.verdict === 'live') lines.push(`${INDENT}paste: '${canonicalEntry(result.parsed.candidate)}'`);
   return lines.join('\n');
 }
@@ -439,6 +446,7 @@ function attemptRecord(row) {
       isLive: typeof video?.isLive === 'boolean' ? video.isLive : null,
       errorCode: outcome?.kind === 'player-error' ? outcome.code : null,
       httpStatus: outcome?.kind === 'hls-http' ? outcome.status : null,
+      detail: failureDetail(row),
       durationSeconds: row.durationSeconds ?? null,
       verdictAtMs: row.verdictAtMs ?? null,
       aloneChecks: row.aloneChecks ?? 0,
@@ -487,7 +495,7 @@ export function placeSlots(catalog, statusBySlot, surfaces) {
     const cell = intended.includes(id) ? intended.indexOf(id) : wall.indexOf(id);
     placements.set(slot, cell < 0
       ? { surface: `Webcam (${titleCase(region)})`, shownByDefault: false, shownInstead: null }
-      : { surface: `Webcam grid #${cell + 1}`, shownByDefault: true, shownInstead: intended[cell] === id && wall[cell] !== id ? `webcams/${wall[cell]}` : null });
+      : { surface: `Webcam grid cell ${cell + 1}`, shownByDefault: true, shownInstead: intended[cell] === id && wall[cell] !== id ? `webcams/${wall[cell]}` : null });
   }
 
   for (const id of Object.keys(catalog.news ?? {})) {

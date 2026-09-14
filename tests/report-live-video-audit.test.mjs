@@ -32,10 +32,10 @@ const baseCatalog = {
 };
 
 const SURFACES = {
-  'webcams/jerusalem': ['Webcam grid #1', true],
-  'webcams/kyiv': ['Webcam grid #2', true],
-  'webcams/taipei': ['Webcam grid #3', true],
-  'webcams/sydney': ['Webcam grid #4', true],
+  'webcams/jerusalem': ['Webcam grid cell 1', true],
+  'webcams/kyiv': ['Webcam grid cell 2', true],
+  'webcams/taipei': ['Webcam grid cell 3', true],
+  'webcams/sydney': ['Webcam grid cell 4', true],
   'webcams/tel-aviv': ['Webcam (Middle East)', false],
   'live-news/bloomberg': ['Live News default (full, tech)', true],
   'live-news/bbc-news': ['Live News optional', false],
@@ -100,7 +100,7 @@ describe('live video audit issue', () => {
     const { title, body } = calls[1].payload;
     assert.equal(title, ISSUE_TITLE);
     assert.match(body, /^\| Slot \| Where it shows \| Status \| Entry \| Why \| Shown instead \|$/m);
-    assert.match(body, /^\| webcams\/jerusalem \| Webcam grid #1 \| needs-replacement \| `https:\/\/www\.youtube\.com\/watch\?v=zp6LNSoq000` \| YouTube player error 150: [^|]+ \| webcams\/tel-aviv \|$/m);
+    assert.match(body, /^\| webcams\/jerusalem \| Webcam grid cell 1 \| needs-replacement \| `https:\/\/www\.youtube\.com\/watch\?v=zp6LNSoq000` \| YouTube player error 150: [^|]+ \| webcams\/tel-aviv \|$/m);
     assert.match(body, /actions\/runs\/7/);
     assert.match(body, /Canaries: 2 of 2 live/);
     assert.match(body, /npm run live-video:check -- <url>/);
@@ -244,6 +244,9 @@ describe('live video audit issue', () => {
       'no surface': mutate((slot) => { slot.surface = ''; }),
       'a non-boolean shownByDefault': mutate((slot) => { slot.shownByDefault = 'yes'; }),
       'a non-string shownInstead': mutate((slot) => { slot.shownInstead = 3; }),
+      'a why carrying Markdown': mutate((slot) => { slot.attempts[0].why = 'YouTube player error 150 @koala73'; }),
+      'a surface carrying an issue reference': mutate((slot) => { slot.surface = 'Webcam grid #2'; }),
+      'a shownInstead carrying a link': mutate((slot) => { slot.shownInstead = '[x](https://evil.example)'; }),
     });
 
     for (const [label, report] of Object.entries(variants)) {
@@ -323,7 +326,7 @@ describe('live video audit issue', () => {
     assert.deepEqual(await publish(report, { gh, catalog }), { findings: 2, action: 'created' });
     const { body } = calls[1].payload;
     const rows = body.split('\n').filter((line) => /^\| (webcams|live-news)\//.test(line));
-    assert.equal(rows[0], '| webcams/jerusalem | Webcam grid #1 | empty | — | no entries configured | webcams/tel-aviv |');
+    assert.equal(rows[0], '| webcams/jerusalem | Webcam grid cell 1 | empty | — | no entries configured | webcams/tel-aviv |');
     assert.match(rows[1], /^\| live-news\/bloomberg \|/);
     assert.match(body, /^Daily live video source audit: 2 slot\(s\) need attention, 2 of them shown by default\.$/m);
     assert.doesNotMatch(body, /### Unfilled slots/);
@@ -390,7 +393,48 @@ describe('live video audit issue', () => {
     const rows = calls[1].payload.body.split('\n').filter((line) => /^\| (webcams|live-news)\//.test(line));
     const shownInstead = rows.map((row) => row.split(' | ').at(-1).replace(/ \|$/, ''));
     assert.deepEqual(rows.map((row) => row.split(' | ')[0].slice(2)), ['webcams/jerusalem', 'webcams/kyiv', 'live-news/bloomberg']);
-    assert.deepEqual(shownInstead, ['webcams/tel-aviv', 'entry #2 (live)', '—']);
+    assert.deepEqual(shownInstead, ['webcams/tel-aviv', 'entry 2 (live)', '—']);
+  });
+
+  it('renders probe titles, authors, entries and error details as inert code in the issue and the step summary', async (t) => {
+    const hostile = "@koala73 @github/staff `tick` [x](https://evil.example) ![](https://evil.example/p.png) fixes #1 a\\|b | <script>alert(1)</script>\nsecond line";
+    const hostileHls = 'https://evil.example/@koala73/fixes-#1/a`b|c.m3u8';
+    const hostileGeo = 'https://evil.example/![](p)/[x](y).m3u8';
+    const catalog = { ...baseCatalog, news: { ...baseCatalog.news, 'bbc-news': [hostileGeo], rtve: [hostileHls] } };
+    const report = reportFor(catalog, {
+      'webcams/kyiv': {
+        status: 'needs-replacement',
+        attempts: [
+          attempt(watch('e2gC37ILQmk'), 'recording', { why: 'ended recording (isLive=false, duration 24,181 s)', evidence: { title: hostile, author: hostile } }),
+          attempt(watch('VGnFLdQW39A'), 'failed', { evidence: { errorCode: 150, title: hostile, author: hostile } }),
+        ],
+      },
+      'live-news/rtve': { status: 'needs-replacement', attempts: [attempt(hostileHls, 'failed', { why: 'stream failed', evidence: { detail: hostile } })] },
+      'live-news/bbc-news': {
+        status: 'unverifiable-from-runner',
+        attempts: [attempt(hostileGeo, 'failed', { why: 'stream failed', unverifiableFromRunner: true, evidence: { detail: hostile } })],
+      },
+    });
+    const dir = mkdtempSync(join(tmpdir(), 'live-video-audit-inert-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const summaryPath = join(dir, 'summary.md');
+    const { calls, gh } = fakeGh([]);
+
+    assert.deepEqual(await publish(report, { gh, catalog, summaryPath }), { findings: 2, action: 'created' });
+    const { body } = calls[1].payload;
+    assert.equal(readFileSync(summaryPath, 'utf8'), `${body}\n`, 'the step summary carries the same inert body');
+    const outsideCode = body.replace(/`[^`\n]*`/g, '');
+    assert.doesNotMatch(outsideCode, /@\w/, 'a mention outside a code span');
+    assert.doesNotMatch(outsideCode, /#\d/, 'an issue reference outside a code span');
+    assert.doesNotMatch(outsideCode, /evil\.example|<script|\]\(|!\[/, 'a link, image or HTML outside a code span');
+    assert.doesNotMatch(body, /^second line/m, 'a newline in probe text started a new Markdown line');
+    const cellCount = (row) => row.slice(2, -2).split(/(?<!\\)\|/).length;
+    const rowsFor = (slot) => body.split('\n').filter((line) => line.startsWith(`| ${slot} |`));
+    assert.equal(rowsFor('webcams/kyiv').length, 2);
+    for (const row of [...rowsFor('webcams/kyiv'), ...rowsFor('live-news/rtve')]) assert.equal(cellCount(row), 6, row);
+    assert.equal(rowsFor('live-news/bbc-news').length, 1);
+    for (const row of rowsFor('live-news/bbc-news')) assert.equal(cellCount(row), 4, row);
+    assert.match(body, /`@koala73 @github\/staff 'tick' \[x\]\(https:\/\/evil\.example\)/, 'the title stays readable inside its code span');
   });
 
   it('requires the repository before looking up the issue', async () => {

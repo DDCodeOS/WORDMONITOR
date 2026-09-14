@@ -32,13 +32,24 @@ function ghJson(args, payload) {
   return JSON.parse(result.stdout);
 }
 
-function cell(value) {
-  return String(value).replace(/[\r\n]+/g, ' ').replace(/[\\|]/g, '\\$&').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// Only text the checker composes from fixed words and numbers renders as Markdown. Anything a probe returned
+// (titles, authors, fetch errors) or an owner pasted (entries) renders as a code span, where GitHub turns no
+// @mention, #reference, link, image or HTML into anything live.
+const SAFE_TEXT = /^[A-Za-z0-9 ,.:;()='/+-]+$/;
+
+/** A table cell of trusted text: one line, pipes and backslashes escaped. */
+function text(value) {
+  return String(value).replace(/[\r\n]+/g, ' ').replace(/[\\|]/g, '\\$&');
+}
+
+/** Untrusted text as an inert code span: one line, backticks swapped for quotes, pipes escaped for the table. */
+function code(value) {
+  return `\`${String(value).replace(/[\r\n]+/g, ' ').replace(/`/g, "'").replace(/[\\|]/g, '\\$&')}\``;
 }
 
 function isAttempt(attempt, entry) {
   return Boolean(attempt) && attempt.entry === entry && VERDICTS.has(attempt.verdict)
-    && typeof attempt.why === 'string' && attempt.why !== '' && typeof attempt.unverifiableFromRunner === 'boolean';
+    && typeof attempt.why === 'string' && SAFE_TEXT.test(attempt.why) && typeof attempt.unverifiableFromRunner === 'boolean';
 }
 
 /** Every catalog slot exactly once, each attempt for the entry configured at that position, and a status its attempts agree with. */
@@ -58,9 +69,9 @@ function assertCompleteReport(report, catalog) {
     const entries = expected.get(slot?.slot);
     if (!entries || seen.has(slot.slot)) throw incomplete(`unexpected or repeated slot ${slot?.slot}`);
     seen.add(slot.slot);
-    const wellFormed = typeof slot.surface === 'string' && slot.surface !== ''
+    const wellFormed = typeof slot.surface === 'string' && SAFE_TEXT.test(slot.surface)
       && typeof slot.shownByDefault === 'boolean'
-      && (slot.shownInstead === null || typeof slot.shownInstead === 'string')
+      && (slot.shownInstead === null || (typeof slot.shownInstead === 'string' && SAFE_TEXT.test(slot.shownInstead)))
       && Array.isArray(slot.attempts) && slot.attempts.length === entries.length
       && slot.attempts.every((attempt, index) => isAttempt(attempt, entries[index]))
       && STATUSES.has(slot.status) && slotStatus(slot.attempts) === slot.status;
@@ -86,22 +97,24 @@ async function confirmProbeWorks(canaries, probeCanaries) {
   return `${liveCount(retried)} of ${retried.length} live on retry (none were live on the first check)`;
 }
 
+/** Why an attempt failed: the checker's fixed text, then anything the probe reported, as code. */
 function because(attempt) {
-  const { title, author } = attempt.evidence ?? {};
-  const byline = [title && `"${title}"`, author && `by ${author}`].filter(Boolean).join(' ');
-  return byline ? `${attempt.why}: ${byline}` : attempt.why;
+  const { detail, title, author } = attempt.evidence ?? {};
+  const reported = [detail && code(detail), title && code(title), author && `by ${code(author)}`].filter(Boolean).join(' ');
+  return reported ? `${text(attempt.why)}: ${reported}` : text(attempt.why);
 }
 
+// "entry 2", never "#2": GitHub links #N to an issue.
 function entryCell(attempt, index) {
-  return `${index > 0 ? `#${index + 1} ` : ''}\`${attempt.entry}\``;
+  return `${index > 0 ? `entry ${index + 1}: ` : ''}${code(attempt.entry)}`;
 }
 
 /** One row per entry that failed ahead of whatever plays; an empty slot gets one row. */
 function findingRows(slot) {
-  const lead = [slot.slot, slot.surface, slot.status];
-  if (slot.status === 'empty') return [[...lead, '—', 'no entries configured', slot.shownInstead ?? '—']];
+  const lead = [text(slot.slot), text(slot.surface), text(slot.status)];
+  if (slot.status === 'empty') return [[...lead, '—', 'no entries configured', text(slot.shownInstead ?? '—')]];
   const liveAt = slot.attempts.findIndex((attempt) => attempt.verdict === 'live');
-  const instead = liveAt > 0 ? `entry #${liveAt + 1} (live)` : slot.shownInstead ?? '—';
+  const instead = text(liveAt > 0 ? `entry ${liveAt + 1} (live)` : slot.shownInstead ?? '—');
   return slot.attempts
     .map((attempt, index) => ({ attempt, index }))
     .filter(({ attempt, index }) => (liveAt < 0 || index < liveAt) && !attempt.unverifiableFromRunner)
@@ -124,7 +137,7 @@ function table(header, rows) {
   return [
     `| ${header.join(' | ')} |`,
     `| ${header.map(() => '---').join(' | ')} |`,
-    ...rows.map((row) => `| ${row.map(cell).join(' | ')} |`),
+    ...rows.map((row) => `| ${row.join(' | ')} |`),
   ];
 }
 
@@ -137,7 +150,7 @@ export function renderAuditBody(report, { runUrl = '', canaries, gridPriority = 
   const lines = [
     `Daily live video source audit: ${findings.length} slot(s) need attention, ${shown.length} of them shown by default.`,
     '',
-    `- Checked: ${cell(report.checkedAt)}${runUrl ? ` — [Workflow run](${runUrl})` : ''}`,
+    `- Checked: ${new Date(report.checkedAt).toISOString()}${runUrl ? ` — [Workflow run](${runUrl})` : ''}`,
     `- Canaries: ${canaries}`,
     ...(recheckSkipped > 0
       ? [`- Not re-checked alone: ${recheckSkipped} never-ready ${recheckSkipped === 1 ? 'entry' : 'entries'}, because the audit time budget was used up`]
@@ -148,7 +161,7 @@ export function renderAuditBody(report, { runUrl = '', canaries, gridPriority = 
   if (shown.length > 0) lines.push('', '### Shown by default', '', ...table(FINDINGS_HEADER, shown.flatMap(findingRows)));
   if (hidden.length > 0) lines.push('', '### Not shown by default', '', ...table(FINDINGS_HEADER, hidden.flatMap(findingRows)));
   if (unverifiable.length > 0) {
-    const rows = unverifiable.flatMap((slot) => slot.attempts.map((attempt, index) => [slot.slot, slot.surface, entryCell(attempt, index), because(attempt)]));
+    const rows = unverifiable.flatMap((slot) => slot.attempts.map((attempt, index) => [text(slot.slot), text(slot.surface), entryCell(attempt, index), because(attempt)]));
     lines.push(
       '', '### Could not verify from the runner', '',
       'An HLS 403 or 451, an HLS timeout, a YouTube player that never became ready while no canary played, a player that stopped reporting whether a video is live, or a YouTube player API that did not load can depend on the runner (its network, its region, or YouTube itself). These slots may still play for viewers, so they are not counted above. A player that never became ready while a canary played is checked alone up to twice within the audit time budget, and is counted above only if both checks stall.',
@@ -180,7 +193,7 @@ function recoveredComment(report, runUrl) {
   const unverifiable = report.slots.filter((slot) => slot.status === 'unverifiable-from-runner').length;
   const unfilled = report.slots.filter(isUnfilled).length;
   return [
-    `Recovered: no live video slot needs attention as of ${report.checkedAt}.`,
+    `Recovered: no live video slot needs attention as of ${new Date(report.checkedAt).toISOString()}.`,
     unverifiable > 0 ? `${unverifiable} slot(s) could not be verified from the runner; the run summary lists them.` : '',
     unfilled > 0 ? `${unfilled} unfilled slot(s) stay hidden from viewers; the run summary lists them.` : '',
     runUrl ? `[Workflow run](${runUrl})` : '',
