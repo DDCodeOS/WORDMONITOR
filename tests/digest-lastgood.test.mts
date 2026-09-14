@@ -311,7 +311,7 @@ describe('durable last-good wiring (#7084)', () => {
     for (const lang of ['english', 'en-US', 'EN', 'en\n', ' en', 'a', 'a'.repeat(10_000), '../en', 'en:other', 1, null, {}, false]) {
       reset();
       stub.fetchMeta = { data: body(['https://a/1'], COVERAGE), source: 'cache', leader: false };
-      await assert.rejects(mod.listFeedDigest(ctx(), { variant: 'full', lang }), { status: 400 });
+      await assert.rejects(mod.listFeedDigest(ctx(), { variant: 'full', lang }), { statusCode: 400 });
       assert.deepEqual(stub.fetchKeys, []);
       assert.deepEqual(stub.readCalls, []);
       assert.deepEqual(stub.pipelineCalls, []);
