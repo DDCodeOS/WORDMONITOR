@@ -180,7 +180,8 @@ export async function initLiveChannelsWindow(containerEl?: HTMLElement): Promise
   }
 
   /**
-   * Applies edit form state to channels and returns the new array, or null if nothing to save.
+   * Applies edit form state to channels and returns the new array, 'invalid-source' when the edited
+   * source is not a channel, video or https stream URL, or null if nothing to save.
    * Used by the Save button in the edit form.
    */
   function applyEditFormToChannels(
@@ -188,7 +189,7 @@ export async function initLiveChannelsWindow(containerEl?: HTMLElement): Promise
     formRow: HTMLElement,
     isCustom: boolean,
     displayName: string,
-  ): LiveChannel[] | null {
+  ): LiveChannel[] | 'invalid-source' | null {
     const idx = channels.findIndex((c) => c.id === currentCh.id);
     if (idx === -1) return null;
 
@@ -197,7 +198,7 @@ export async function initLiveChannelsWindow(containerEl?: HTMLElement): Promise
       const sourceRaw = (formRow.querySelector('.live-news-manage-edit-handle') as HTMLInputElement | null)?.value?.trim();
       if (sourceRaw && sourceRaw !== customChannelEntry(currentCh)) {
         const parsed = parseSourceEntry(sourceRaw);
-        if (!parsed.ok) return null;
+        if (!parsed.ok) return 'invalid-source';
         const replacement = customChannelFor(parsed.candidate, displayName, currentCh);
         if (channels.some((c) => c.id === replacement.id && c.id !== currentCh.id)) return null;
         next[idx] = replacement;
@@ -213,13 +214,21 @@ export async function initLiveChannelsWindow(containerEl?: HTMLElement): Promise
     setTrustedHtml(row, trustedHtml('', "legacy direct innerHTML migration"));
     row.className = 'live-news-manage-row live-news-manage-row-editing';
 
-    if (isCustom) {
-      const sourceInput = document.createElement('input');
+    const sourceInput = isCustom ? document.createElement('input') : null;
+    const editHint = document.createElement('div');
+    editHint.className = 'live-news-manage-hint';
+    editHint.hidden = true;
+    if (sourceInput) {
       sourceInput.type = 'text';
       sourceInput.className = 'live-news-manage-edit-handle';
       sourceInput.value = customChannelEntry(ch) ?? '';
       sourceInput.placeholder = t('components.liveNews.channelOrVideoUrl') ?? 'YouTube channel or video URL';
+      sourceInput.addEventListener('input', () => {
+        sourceInput.classList.remove('invalid');
+        editHint.hidden = true;
+      });
       row.appendChild(sourceInput);
+      row.appendChild(editHint);
     }
 
     const nameInput = document.createElement('input');
@@ -247,6 +256,13 @@ export async function initLiveChannelsWindow(containerEl?: HTMLElement): Promise
     saveBtn.addEventListener('click', () => {
       const displayName = nameInput.value.trim() || ch.name || ch.handle || '';
       const next = applyEditFormToChannels(ch, row, isCustom, displayName);
+      if (next === 'invalid-source') {
+        // Keep the edit open and say why, the same guidance the add form gives.
+        sourceInput?.classList.add('invalid');
+        editHint.textContent = t('components.liveNews.channelUrlHint') ?? 'Paste a channel URL (youtube.com/channel/UC…) or a live video URL';
+        editHint.hidden = false;
+        return;
+      }
       if (next) {
         channels = next;
         saveChannelsToStorage(channels);

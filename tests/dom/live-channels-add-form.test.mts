@@ -90,6 +90,23 @@ describe('Live channels add form', () => {
     expect(hint()?.hidden).toBe(true);
   });
 
+  it('keeps an edit open and explains an unusable source instead of dropping the change', async () => {
+    await add({ source: 'https://www.youtube.com/watch?v=LuKwFajn37U' });
+    document.querySelector<HTMLElement>('.live-news-manage-row[data-channel-id="custom-vid-LuKwFajn37U"] .live-news-manage-row-name')?.click();
+    const source = document.querySelector<HTMLInputElement>('.live-news-manage-row-editing .live-news-manage-edit-handle');
+    if (!source) throw new Error('edit form did not open');
+    source.value = '@CNN';
+    document.querySelector<HTMLButtonElement>('.live-news-manage-row-editing .live-news-manage-save')?.click();
+
+    const editing = document.querySelector<HTMLElement>('.live-news-manage-row-editing');
+    expect(editing).not.toBeNull();
+    const editHint = editing?.querySelector<HTMLElement>('.live-news-manage-hint');
+    expect(editHint?.hidden).toBe(false);
+    expect(editHint?.textContent).toBe('Paste a channel URL (youtube.com/channel/UC…) or a live video URL');
+    expect(source.classList.contains('invalid')).toBe(true);
+    expect(stored().custom).toEqual([{ id: 'custom-vid-LuKwFajn37U', name: 'DW News', videoId: 'LuKwFajn37U' }]);
+  });
+
   it('rejects an http:// stream URL', async () => {
     await add({ hls: 'http://tv.example/live.m3u8', name: 'Local TV' });
 

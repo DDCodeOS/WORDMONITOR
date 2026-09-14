@@ -3029,6 +3029,15 @@ body.panel-resize-active iframe {
   white-space: normal;
 }
 
+.live-news-manage-row-editing .live-news-manage-hint {
+  flex-basis: 100%;
+  margin-top: 0;
+}
+
+.live-news-manage-row-editing .live-news-manage-edit-handle.invalid {
+  border-color: #f44;
+}
+
 .live-news-manage-row-editing .live-news-manage-edit-handle,
 .live-news-manage-row-editing .live-news-manage-edit-name {
   padding: 10px 12px;
