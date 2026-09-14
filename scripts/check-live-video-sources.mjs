@@ -416,12 +416,17 @@ async function probeRows(rows, { probeYouTube, probeHls }) {
   }
 }
 
-// A manifest that answers 403/451 or times out, and any player the probe could not verify (API not
-// loaded, never ready, no live signal), can depend on where the check runs: its region, its network,
-// or a busy batched headless page. The audit cannot call the entry dead from there.
-const RUNNER_BLOCKED_HLS_STATUSES = new Set([403, 451]);
-// fetch reports a connection or read timeout as a failure code, not as the probe's own deadline.
-const NETWORK_TIMEOUT_CODES = new Set(['UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'ETIMEDOUT']);
+// HLS answers that can depend on where the check runs rather than on the stream: a region block or rate limit,
+// an origin error, a slow, dropped or unreachable connection (fetch reports these as error codes, not as the
+// probe's own deadline), and a certificate chain Node cannot complete without fetching an intermediate, which
+// Chrome does. A missing host, a refused connection, a 400/404/410, a body that is not a playlist and an expired
+// certificate are broken for viewers too.
+const runnerDependentHlsStatus = (status) => status === 403 || status === 451 || status === 429 || (status >= 500 && status <= 599);
+const RUNNER_DEPENDENT_HLS_ERRORS = new Set([
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'ETIMEDOUT',
+  'EAI_AGAIN', 'ECONNRESET', 'UND_ERR_SOCKET', 'EPIPE', 'ENETUNREACH', 'EHOSTUNREACH',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY', 'SELF_SIGNED_CERT_IN_CHAIN',
+]);
 
 function unverifiableFromRunner(row) {
   if (!row.parsed.ok) return false;
@@ -433,8 +438,8 @@ function unverifiableFromRunner(row) {
   if (verdict.verdict !== 'failed' || row.parsed.candidate.kind !== 'hls') return false;
   const { outcome } = verdict;
   return outcome.kind === 'timeout'
-    || (outcome.kind === 'hls-http' && RUNNER_BLOCKED_HLS_STATUSES.has(outcome.status))
-    || (outcome.kind === 'hls-fatal' && NETWORK_TIMEOUT_CODES.has(outcome.detail));
+    || (outcome.kind === 'hls-http' && runnerDependentHlsStatus(outcome.status))
+    || (outcome.kind === 'hls-fatal' && RUNNER_DEPENDENT_HLS_ERRORS.has(outcome.detail));
 }
 
 /** One checked entry as the audit report records it: the verdict, why, and the evidence behind it. */

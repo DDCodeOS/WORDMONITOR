@@ -512,16 +512,29 @@ describe('audit report (--all --report)', () => {
     ]);
   });
 
-  it('counts an HLS network timeout as unverifiable from the runner, and a host that is gone as dead', async () => {
+  it('counts an HLS connection or runner-side TLS failure as unverifiable from the runner, and a stream that is gone as dead', async () => {
     const hlsOnly = { webcams: {}, gridPriority: [], news: { bloomberg: [BLOOMBERG_HLS] }, canaries: [CANARY] };
     const failWith = (detail) => async (candidates) => candidates.map(() => ({ verdict: { verdict: 'failed', outcome: { kind: 'hls-fatal', detail } } }));
     const cases = [
+      // Slow, dropped or unreachable from this network.
       ['UND_ERR_CONNECT_TIMEOUT', true],
       ['UND_ERR_HEADERS_TIMEOUT', true],
       ['UND_ERR_BODY_TIMEOUT', true],
       ['ETIMEDOUT', true],
+      ['EAI_AGAIN', true],
+      ['ECONNRESET', true],
+      ['UND_ERR_SOCKET', true],
+      ['EPIPE', true],
+      ['ENETUNREACH', true],
+      ['EHOSTUNREACH', true],
+      // Chains Node cannot complete without fetching an intermediate, which Chrome does.
+      ['UNABLE_TO_VERIFY_LEAF_SIGNATURE', true],
+      ['UNABLE_TO_GET_ISSUER_CERT_LOCALLY', true],
+      ['SELF_SIGNED_CERT_IN_CHAIN', true],
+      // Gone or broken for viewers too.
       ['ENOTFOUND', false],
       ['ECONNREFUSED', false],
+      ['CERT_HAS_EXPIRED', false],
       ['not an HLS media playlist', false],
     ];
     for (const [detail, unverifiable] of cases) {
@@ -532,6 +545,22 @@ describe('audit report (--all --report)', () => {
       assert.deepEqual([slot.attempts[0].why, slot.attempts[0].evidence.detail], ['stream failed', detail], 'the report keeps fetch text out of why');
       assert.ok(lines.join('\n').includes(`why: stream failed: ${detail}`), 'the terminal still shows the detail');
     }
+  });
+
+  it('counts an HLS rate limit, origin error or region block as unverifiable from the runner, and a missing playlist as dead', async () => {
+    const hlsOnly = { webcams: {}, gridPriority: [], news: { bloomberg: [BLOOMBERG_HLS] }, canaries: [CANARY] };
+    const answer = (status) => async (candidates) => candidates.map(() => ({ verdict: { verdict: 'failed', outcome: { kind: 'hls-http', status } } }));
+    const cases = [[403, true], [451, true], [429, true], [500, true], [502, true], [503, true], [504, true], [400, false], [404, false], [410, false]];
+    for (const [status, unverifiable] of cases) {
+      const { writes: [{ report }] } = await audit(['--all', '--report', 'audit.json'], { catalog: hlsOnly, probeHls: answer(status) });
+      const [slot] = report.slots;
+      assert.equal(slot.attempts[0].unverifiableFromRunner, unverifiable, `HTTP ${status}`);
+      assert.equal(slot.status, unverifiable ? 'unverifiable-from-runner' : 'needs-replacement', `HTTP ${status}`);
+    }
+
+    const withBackup = { ...hlsOnly, news: { bloomberg: [BLOOMBERG_HLS, watch('QB5BNdBFujE')] } };
+    const { writes: [{ report }] } = await audit(['--all', '--report', 'audit.json'], { catalog: withBackup, probeHls: answer(503) });
+    assert.equal(report.slots[0].status, 'ok', 'an origin error on the first entry does not file a degraded default slot');
   });
 
   it('counts a stream that never started, or a player never ready even alone, as dead; a missing live signal or blocked API stays unverifiable', async () => {
