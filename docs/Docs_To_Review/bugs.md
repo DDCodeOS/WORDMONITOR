@@ -75,7 +75,7 @@ The `youtubeLivePlugin()` Vite middleware hardcodes `{ videoId: null, channel }`
 This means the LiveNewsPanel falls back to static channel-level video IDs during local development, never resolving the actual live stream.
 
 **AI instructions**
-Implement the pending live-stream detection using the `youtubei.js` library already in `package.json`, or remove the dev plugin and proxy to the production API route (`/api/youtube/live.js`).
+None: resolved by deleting the dev plugin. The `youtubei.js` dependency this entry once suggested was removed from `package.json` at the same time.
 
 ---
 
