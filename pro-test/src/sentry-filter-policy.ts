@@ -482,6 +482,12 @@ const PLAIN_OBJECT_REJECTION = /^Object captured as promise rejection with keys:
  */
 const JSON_RPC_RESERVED_MIN = -32768;
 const JSON_RPC_RESERVED_MAX = -32000;
+/**
+ * EIP-1193 provider error codes: 4001 user rejected, 4100 unauthorized, 4200
+ * unsupported method, 4900 disconnected, 4901 chain disconnected. Exact values,
+ * not a range — the protocol defines these five and nothing between them.
+ */
+const EIP1193_PROVIDER_CODES: ReadonlySet<number> = new Set([4001, 4100, 4200, 4900, 4901]);
 
 /**
  * Stack-gated suppressors for messages that our own minified bundle COULD
@@ -693,9 +699,13 @@ export function marketingBeforeSend<T extends PolicyEvent>(event: T): T | null {
   // `tests/pro-sentry-filter-policy.test.mts` fails if a JSON-RPC client is
   // ever added to this surface, rather than letting the rule silently widen.
   //
-  // Deliberately narrow on the CODE: EIP-1193's own `4001` (user rejected the
-  // request) is outside the reserved range and keeps reporting, as does any
-  // non-integer, string, or absent code.
+  // EIP-1193's own provider codes (4001, 4100, 4200, 4900, 4901) are dropped
+  // on the same argument. They were first left reporting in case our bundle
+  // ever minted one, but no first-party code here talks to a wallet provider,
+  // and 8 of the issue's 9 events were a wallet extension's `{code: 4001,
+  // message}` — the rule had matched only the minority -32603 event. `tests/pro-sentry-filter-policy.test.mts` pins the bundle as
+  // wallet-free so the codes stay proof of origin. Any other number, a
+  // non-integer, a string, or an absent code keeps reporting.
   //
   // The payload's own `message` is deliberately NOT consulted, so
   // `{code: -32603, message: 'checkout failed'}` is dropped too (raised in
@@ -712,8 +722,8 @@ export function marketingBeforeSend<T extends PolicyEvent>(event: T): T | null {
   if (PLAIN_OBJECT_REJECTION.test(msg)
       && typeof rejectedCode === 'number'
       && Number.isInteger(rejectedCode)
-      && rejectedCode >= JSON_RPC_RESERVED_MIN
-      && rejectedCode <= JSON_RPC_RESERVED_MAX) return null;
+      && ((rejectedCode >= JSON_RPC_RESERVED_MIN && rejectedCode <= JSON_RPC_RESERVED_MAX)
+        || EIP1193_PROVIDER_CODES.has(rejectedCode))) return null;
 
   // An injected script attributed to the document URL, dereferencing an iframe
   // this bundle does not have. Instagram's in-app browser was the observed case
