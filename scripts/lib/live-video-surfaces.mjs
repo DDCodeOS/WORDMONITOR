@@ -6,9 +6,12 @@ import { readFileSync } from 'node:fs';
 const WEBCAMS_PANEL = 'src/components/LiveWebcamsPanel.ts';
 const NEWS_PANEL = 'src/components/LiveNewsPanel.ts';
 
-/** The body of every `const <NAME> ... = [ ... \n];` array whose name matches `pattern`. */
+/**
+ * The body of every `const <NAME>: Type = [` array whose name matches `pattern`. The `[` must end the
+ * declaration line, so `const DEFAULT_LIVE_CHANNELS = x ? [] : y;` never swallows the next array.
+ */
 function arrays(source, pattern) {
-  return [...source.matchAll(new RegExp(`const (${pattern})\\b[^=]*=[^\\[]*\\[([\\s\\S]*?)\\n\\];`, 'g'))]
+  return [...source.matchAll(new RegExp(`const (${pattern})\\b[^=\\n]*=[ \\t]*\\[[ \\t]*\\n([\\s\\S]*?)\\n\\];`, 'g'))]
     .map(([, name, body]) => ({ name, body }));
 }
 

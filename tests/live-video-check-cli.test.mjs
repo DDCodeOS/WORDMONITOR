@@ -770,6 +770,24 @@ describe('live video surfaces', () => {
     assert.deepEqual([...newsIds].sort(), Object.keys(LIVE_NEWS_SOURCES).sort());
   });
 
+  it('reads only arrays that open on their declaration line, never a ternary that mentions []', () => {
+    const webcamsPanel = "const WEBCAM_FEEDS: WebcamFeed[] = [\n  { id: 'kyiv', city: 'Ukraine', country: 'Ukraine', region: 'europe' },\n];\nconst MAX_GRID_CELLS = 4;\n";
+    const newsPanel = [
+      'const FULL_LIVE_CHANNELS: LiveChannel[] = [',
+      "  { id: 'bloomberg', name: 'Bloomberg' },",
+      '];',
+      'export const OPTIONAL_LIVE_CHANNELS: LiveChannel[] = [',
+      "  { id: 'bloomberg', name: 'Bloomberg' },",
+      '];',
+      "const DEFAULT_LIVE_CHANNELS = SITE_VARIANT === 'tech' ? TECH_LIVE_CHANNELS : SITE_VARIANT === 'happy' ? [] : FULL_LIVE_CHANNELS;",
+      'const _REGION_ENTRIES: { key: string; channelIds: string[] }[] = [',
+      "  { id: 'decoy', key: 'na', channelIds: ['cnn'] },",
+      '];',
+      '',
+    ].join('\n');
+    assert.deepEqual(extractLiveVideoSurfaces({ webcamsPanel, newsPanel }).newsDefaults, { full: ['bloomberg'] });
+  });
+
   it('fails loudly when a panel list can no longer be read', () => {
     const webcamsPanel = "const WEBCAM_FEEDS: WebcamFeed[] = [\n  { id: 'kyiv', city: 'Ukraine', country: 'Ukraine', region: 'europe' },\n];\nconst MAX_GRID_CELLS = 4;\n";
     const newsPanel = "const FULL_LIVE_CHANNELS: LiveChannel[] = [\n  { id: 'bloomberg', name: 'Bloomberg' },\n];\nexport const OPTIONAL_LIVE_CHANNELS: LiveChannel[] = [\n  { id: 'bloomberg', name: 'Bloomberg' },\n];\n";
