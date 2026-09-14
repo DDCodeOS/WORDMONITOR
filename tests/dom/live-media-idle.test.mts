@@ -43,7 +43,7 @@ describe('live media idle clock', () => {
     expect(listener).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
     expect(listener).toHaveBeenCalledTimes(1);
-    expect(listener).toHaveBeenCalledWith({ idleAfterMs: HOUR });
+    expect(listener).toHaveBeenCalledWith(HOUR);
   });
 
   it('pushes the deadline out on every kind of user activity', () => {
@@ -118,7 +118,7 @@ describe('live media idle clock', () => {
     vi.advanceTimersByTime(20 * MINUTE - 1);
     expect(listener).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
-    expect(listener).toHaveBeenCalledWith({ idleAfterMs: 30 * MINUTE });
+    expect(listener).toHaveBeenCalledWith(30 * MINUTE);
   });
 
   it('fires on the next tick when a shorter policy is already past due', () => {
@@ -127,7 +127,7 @@ describe('live media idle clock', () => {
     setLiveMediaIdleStop(15);
     expect(listener).not.toHaveBeenCalled();
     vi.advanceTimersByTime(0);
-    expect(listener).toHaveBeenCalledWith({ idleAfterMs: 15 * MINUTE });
+    expect(listener).toHaveBeenCalledWith(15 * MINUTE);
   });
 
   it('starts counting when another tab turns never into a duration', () => {
@@ -139,7 +139,7 @@ describe('live media idle clock', () => {
     vi.advanceTimersByTime(HOUR - 1);
     expect(listener).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
-    expect(listener).toHaveBeenCalledWith({ idleAfterMs: 4 * HOUR });
+    expect(listener).toHaveBeenCalledWith(4 * HOUR);
   });
 
   it('isolates a throwing subscriber from the others', () => {

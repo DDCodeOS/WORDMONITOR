@@ -74,7 +74,7 @@ Fix (branch `feat/live-media-idle-notice`, unmerged as of 2026-09-14):
 
 - One owner, `src/services/live-media-idle.ts`, replaces the two panel timers. It listens once, suspends while the tab is hidden, and fires once per idle episode.
 - A "Stop live video when idle" preference (`wm-live-media-idle-stop`: 15/30/60/120/240 minutes or never, default 60) lives in `src/services/live-stream-settings.ts`. It is cloud-synced and absence-tolerant during rolling deploys. A user who had saved always-on reads as never, and always-on now means autoplay only.
-- An idle stop renders an in-panel notice naming inactivity, with Resume and "Keep playing when idle". Input no longer restarts video. Fullscreen panels and a native video the viewer paused are not stopped.
+- An idle stop renders an in-panel notice naming inactivity, with Resume and "Keep playing when idle". Input no longer restarts video, and neither does autoplay on tab return or scroll-back for a user who has auto-play on with a chosen idle duration. Fullscreen panels and a native video the viewer paused are not stopped.
 - The app-shell animation pause keeps its own 5-minute timer.
 - Verified with vitest DOM tests on fake timers and a real-browser drive using Playwright `page.clock`. After 6 minutes idle playback continues. After 66 minutes the notice shows and a mouse move does not resume. Resume restores Live News and the webcam wall, and Never keeps playing through 5 hours.
 

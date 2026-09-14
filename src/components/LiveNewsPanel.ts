@@ -9,7 +9,7 @@ import { escapeHtml, sanitizeUrl } from '@/utils/sanitize';
 
 import { getStreamQuality } from '@/services/ai-flow-settings';
 import { getActiveLiveMedia, playAllLiveMedia, registerLiveMediaStarter, releaseLiveMediaPlayback, requestLiveMediaPlayback, stopLiveMediaPlayback, unregisterLiveMediaStarter, type LiveMediaStopReason } from '@/services/live-media-controller';
-import { getLiveStreamsAlwaysOn, subscribeLiveStreamsSettingsChange } from '@/services/live-stream-settings';
+import { getLiveStreamsAlwaysOn, subscribeLiveStreamsAlwaysOnChange } from '@/services/live-stream-settings';
 import { subscribeLiveMediaIdle } from '@/services/live-media-idle';
 import { track } from '@/services/analytics';
 import { createLiveMediaIdleNotice, trackLiveMediaIdleStop } from './live-media-idle-notice';
@@ -436,12 +436,10 @@ export class LiveNewsPanel extends Panel {
     this.renderPlaceholder();
     this.setupLazyInit();
     document.addEventListener('visibilitychange', this.boundVisibilityHandler);
-    this.unsubscribeIdle = subscribeLiveMediaIdle(({ idleAfterMs }) => this.stopForIdle(idleAfterMs));
-    this.unsubscribeStreamSettings = subscribeLiveStreamsSettingsChange(({ alwaysOn }) => {
-      if (alwaysOn === this.alwaysOn) return;
-      const wasAlwaysOn = this.alwaysOn;
+    this.unsubscribeIdle = subscribeLiveMediaIdle((idleAfterMs) => this.stopForIdle(idleAfterMs));
+    this.unsubscribeStreamSettings = subscribeLiveStreamsAlwaysOnChange((alwaysOn) => {
       this.alwaysOn = alwaysOn;
-      if (wasAlwaysOn && !alwaysOn) {
+      if (!alwaysOn) {
         // Cancel any pending lazy-init so leaving always-on cannot auto-start playback without intent.
         // Anything already playing keeps running — feeds coexist; the idle stop still applies.
         if (this.lazyObserver) { this.lazyObserver.disconnect(); this.lazyObserver = null; }
@@ -590,7 +588,8 @@ export class LiveNewsPanel extends Panel {
 
   private startAlwaysOnPlaybackIfVisible(): void {
     if (!this.alwaysOn || document.hidden || !this.element.isConnected || !this.isPanelVisible()) return;
-    if (this.ownsActiveLiveMedia()) return;
+    // An idle stop ends only through Resume or Play, so autoplay must not restart it on tab return.
+    if (this.idleStoppedAfterMs !== null || this.ownsActiveLiveMedia()) return;
     this.requestPlaybackForActiveChannel();
   }
 

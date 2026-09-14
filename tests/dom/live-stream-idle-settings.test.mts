@@ -6,6 +6,7 @@ import {
   LIVE_MEDIA_IDLE_STOP_STORAGE_KEY,
   setLiveMediaIdleStop,
   setLiveStreamsAlwaysOn,
+  subscribeLiveStreamsAlwaysOnChange,
   subscribeLiveStreamsSettingsChange,
   type LiveStreamSettings,
 } from '@/services/live-stream-settings';
@@ -137,6 +138,29 @@ describe('live stream settings subscription', () => {
       { alwaysOn: false, idleStop: 120 },
       { alwaysOn: false, idleStop: 120 },
     ]);
+  });
+
+  it('delivers only autoplay changes to an always-on subscriber, whatever the source', () => {
+    const alwaysOnChanges: boolean[] = [];
+    const stop = subscribeLiveStreamsAlwaysOnChange((alwaysOn) => alwaysOnChanges.push(alwaysOn));
+
+    setLiveMediaIdleStop(15);
+    localStorage.setItem(LIVE_MEDIA_IDLE_STOP_STORAGE_KEY, '30');
+    dispatchStorage(LIVE_MEDIA_IDLE_STOP_STORAGE_KEY);
+    dispatchCloudApplied([LIVE_MEDIA_IDLE_STOP_STORAGE_KEY]);
+    expect(alwaysOnChanges).toEqual([]);
+
+    setLiveStreamsAlwaysOn(true);
+    setLiveStreamsAlwaysOn(true);
+    localStorage.setItem(ALWAYS_ON_KEY, 'false');
+    dispatchStorage(ALWAYS_ON_KEY);
+    localStorage.setItem(ALWAYS_ON_KEY, 'true');
+    dispatchCloudApplied([ALWAYS_ON_KEY]);
+    expect(alwaysOnChanges).toEqual([true, false, true]);
+
+    stop();
+    setLiveStreamsAlwaysOn(false);
+    expect(alwaysOnChanges).toEqual([true, false, true]);
   });
 
   it('stops delivering after unsubscribe, and unsubscribe is idempotent', () => {

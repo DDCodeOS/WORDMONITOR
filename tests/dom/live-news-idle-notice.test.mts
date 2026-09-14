@@ -63,6 +63,11 @@ function setHidden(hidden: boolean): void {
   document.dispatchEvent(new Event('visibilitychange'));
 }
 
+function placePanelOnScreen(): void {
+  const rect = { x: 0, y: 0, top: 0, left: 0, width: 640, height: 360, right: 640, bottom: 360, toJSON: () => ({}) };
+  internals().element.getBoundingClientRect = () => rect as DOMRect;
+}
+
 beforeAll(async () => {
   await initTestI18n();
 });
@@ -159,6 +164,26 @@ describe('Live News idle stop', () => {
     mount();
     playFromPlaceholder();
     vi.advanceTimersByTime(10 * HOUR);
+    expect(isPlaying()).toBe(true);
+    expect(notice()).toBeNull();
+  });
+
+  it('keeps the notice on tab return for an auto-play user who chose an idle duration', () => {
+    localStorage.setItem('wm-live-streams-always-on', 'true');
+    localStorage.setItem('wm-live-media-idle-stop', '60');
+    mount();
+    placePanelOnScreen();
+    playFromPlaceholder();
+    vi.advanceTimersByTime(HOUR);
+    expect(isPlaying()).toBe(false);
+    expect(notice()).not.toBeNull();
+
+    setHidden(true);
+    setHidden(false);
+    expect(isPlaying()).toBe(false);
+    expect(notice()).not.toBeNull();
+
+    button('Resume').click();
     expect(isPlaying()).toBe(true);
     expect(notice()).toBeNull();
   });

@@ -7,7 +7,7 @@ import { track, trackWebcamSelected, trackWebcamRegionFiltered } from '@/service
 import { getStreamQuality, subscribeStreamQualityChange } from '@/services/ai-flow-settings';
 import { isMobileDevice, loadFromStorage, saveToStorage } from '@/utils';
 import { playAllLiveMedia, registerLiveMediaStarter, unregisterLiveMediaStarter } from '@/services/live-media-controller';
-import { getLiveStreamsAlwaysOn, subscribeLiveStreamsSettingsChange } from '@/services/live-stream-settings';
+import { getLiveStreamsAlwaysOn, subscribeLiveStreamsAlwaysOnChange } from '@/services/live-stream-settings';
 import { subscribeLiveMediaIdle } from '@/services/live-media-idle';
 import { createLiveMediaIdleNotice, trackLiveMediaIdleStop } from './live-media-idle-notice';
 import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
@@ -143,10 +143,9 @@ export class LiveWebcamsPanel extends Panel {
     this.createToolbar();
     this.setupIntersectionObserver();
     document.addEventListener('visibilitychange', this.boundVisibilityHandler);
-    this.unsubscribeIdle = subscribeLiveMediaIdle(({ idleAfterMs }) => this.stopForIdle(idleAfterMs));
+    this.unsubscribeIdle = subscribeLiveMediaIdle((idleAfterMs) => this.stopForIdle(idleAfterMs));
     subscribeStreamQualityChange(() => this.render());
-    this.unsubscribeStreamSettings = subscribeLiveStreamsSettingsChange(({ alwaysOn }) => {
-      if (alwaysOn === this.alwaysOn) return;
+    this.unsubscribeStreamSettings = subscribeLiveStreamsAlwaysOnChange((alwaysOn) => {
       this.alwaysOn = alwaysOn;
       // Leaving always-on keeps whatever is playing; the idle stop still applies.
       if (alwaysOn && this.isVisible && !document.hidden) {
@@ -442,6 +441,8 @@ export class LiveWebcamsPanel extends Panel {
   /** Ensure the always-on feed(s) are in the active set. Returns true if it rendered (so callers don't double-render). */
   private startAlwaysOnPlayback(): boolean {
     if (!this.alwaysOn || document.hidden || !this.element.isConnected || !this.isVisible) return false;
+    // An idle stop ends only through Resume or Play, so autoplay must not rebuild the wall on tab return or scroll-back.
+    if (this.idleStopped) return false;
     // In grid view auto-start the whole wall; single view auto-starts only the selected feed.
     const feeds = (this.viewMode === 'grid' && !this.forceSingleView) ? this.gridFeeds : [this.activeFeed];
     let added = false;

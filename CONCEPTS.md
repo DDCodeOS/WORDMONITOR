@@ -930,7 +930,7 @@ The pause keys on input, not on whether anyone is watching, so input inside an e
 
 ### Always-On Playback
 
-A viewer preference that starts live news and webcams as soon as their panels are visible instead of waiting for Play. It governs autoplay only; how long video keeps playing without input is the Idle Pause preference. A viewer who saved it before the Idle Pause preference existed is treated as never pausing until they choose a duration, which preserves what the preference used to imply. See also: Idle Pause.
+A viewer preference that starts live news and webcams as soon as their panels are visible instead of waiting for Play. It governs autoplay only; how long video keeps playing without input is the Idle Pause preference, and once an Idle Pause has happened it does not restart video on tab return or scroll-back either. A viewer who saved it before the Idle Pause preference existed is treated as never pausing until they choose a duration, which preserves what the preference used to imply. See also: Idle Pause.
 
 ## Flagged ambiguities
 

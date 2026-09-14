@@ -5,11 +5,8 @@ import {
   type LiveStreamSettings,
 } from '@/services/live-stream-settings';
 
-export interface LiveMediaIdleEpisode {
-  readonly idleAfterMs: number;
-}
-
-type IdleListener = (episode: LiveMediaIdleEpisode) => void;
+/** Receives the idle-stop duration that elapsed, in milliseconds. */
+type IdleListener = (idleAfterMs: number) => void;
 
 interface IdleClock {
   lastActivityAt: number;
@@ -53,10 +50,10 @@ function onTimer(): void {
     return;
   }
   clock.notified = true;
-  const episode: LiveMediaIdleEpisode = { idleAfterMs: clock.policyMs };
+  const idleAfterMs = clock.policyMs;
   for (const listener of [...listeners]) {
     try {
-      listener(episode);
+      listener(idleAfterMs);
     } catch (error) {
       console.error('[live-media-idle] idle listener failed', error);
     }
@@ -112,8 +109,16 @@ function stopClock(): void {
   clock = null;
 }
 
+/**
+ * Subscribes to the single idle clock shared by every live media panel.
+ *
+ * The first subscriber installs document-wide activity and visibility listeners and starts the
+ * clock; the last unsubscribe removes them. The clock fires once per idle episode, after the
+ * idle-stop preference elapses without activity, and never signals "active again": ending an
+ * idle stop is each panel's decision. A throwing subscriber is logged and does not block the rest.
+ */
 export function subscribeLiveMediaIdle(onIdle: IdleListener): () => void {
-  const listener: IdleListener = (episode) => onIdle(episode);
+  const listener: IdleListener = (idleAfterMs) => onIdle(idleAfterMs);
   listeners.add(listener);
   if (!clock) startClock();
   return () => {

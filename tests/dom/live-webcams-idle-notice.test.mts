@@ -211,6 +211,30 @@ describe('Live Webcams idle stop', () => {
     expect(playingFeeds()).toEqual(ALL_REGIONS_WALL);
   });
 
+  it('keeps the notice on tab return and scroll-back for an auto-play user who chose an idle duration', () => {
+    localStorage.setItem('wm-live-streams-always-on', 'true');
+    localStorage.setItem('wm-live-media-idle-stop', '60');
+    mountOnScreen();
+    expect(playingFeeds()).toEqual(ALL_REGIONS_WALL);
+    vi.advanceTimersByTime(HOUR);
+    expect(playingFeeds()).toEqual([]);
+    expect(notice()).not.toBeNull();
+
+    setHidden(true);
+    setHidden(false);
+    expect(playingFeeds()).toEqual([]);
+    expect(notice()).not.toBeNull();
+
+    setOnScreen(false);
+    setOnScreen(true);
+    expect(playingFeeds()).toEqual([]);
+    expect(notice()).not.toBeNull();
+
+    contentButton('Resume').click();
+    expect(playingFeeds()).toEqual(ALL_REGIONS_WALL);
+    expect(notice()).toBeNull();
+  });
+
   it('never idle-stops a fullscreen wall', () => {
     const mounted = mountOnScreen();
     playFromPreview();

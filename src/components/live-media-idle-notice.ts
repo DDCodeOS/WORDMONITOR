@@ -16,6 +16,7 @@ function toIdleMinutes(idleAfterMs: number): number {
   return Math.round(idleAfterMs / 60_000);
 }
 
+/** Records an idle stop for one panel, with the duration that elapsed in minutes. */
 export function trackLiveMediaIdleStop(panel: LiveMediaIdlePanelId, idleAfterMs: number): void {
   track('live-media-idle-stopped', { panel, idleMinutes: toIdleMinutes(idleAfterMs) });
 }
@@ -29,6 +30,11 @@ function actionButton(label: string, onClick: () => void): HTMLButtonElement {
   return button;
 }
 
+/**
+ * Builds the "paused for inactivity" notice a live panel shows in place of its media after an idle
+ * stop. Resume restarts through the play-all cascade; "Keep playing when idle" saves `never`,
+ * confirms with a toast, and then resumes.
+ */
 export function createLiveMediaIdleNotice({ panel, heading, idleAfterMs }: LiveMediaIdleNoticeOptions): HTMLElement {
   const idleMinutes = toIdleMinutes(idleAfterMs);
 
