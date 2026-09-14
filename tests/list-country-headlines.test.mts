@@ -141,6 +141,27 @@ describe('country headlines from existing curated RSS caches', () => {
     assert.equal(payload.countries.VU.items[0].source, source.name);
   });
 
+  it('retains a late headline when an untrusted source element is oversized', async () => {
+    const source = feed('Guardian Africa');
+    const date = new Date(Date.now() - 3600_000).toUTCString();
+    const oversized = 'X'.repeat(201);
+    const xml = `<rss><channel>${Array.from({ length: 6 }, (_, index) => {
+      const country = index === 5 ? 'Cameroon' : 'Kenya';
+      const origin = index === 5 ? `<source>${oversized}</source>` : '';
+      return `<item><title>${country} announces cabinet changes</title><link>https://www.theguardian.com/world/item-${index}</link><pubDate>${date}</pubDate>${origin}</item>`;
+    }).join('')}</channel></rss>`;
+    const parsed = digest.parseRssXml(xml, source, 'full');
+    assert.ok(parsed);
+    assert.equal(parsed.countryItems?.length, 1);
+    assert.equal(parsed.countryItems?.[0]?.title, 'Cameroon announces cabinet changes');
+    assert.equal(parsed.countryItems?.[0]?.originPublisher, '');
+    assert.equal(parsed.countryItems?.[0]?.originPublisherTrusted, false);
+    cache.set(rssFeedCacheKey('full', source.url), parsed);
+    const { payload } = await request(['CM']);
+    assert.equal(payload.countries.CM.items[0].source, source.name);
+    assert.equal(payload.countries.CM.items[0].title, 'Cameroon announces cabinet changes');
+  });
+
   it('applies date, country, URL and revocation gates to retained entries after the digest cap', async () => {
     const source = feed('Guardian Africa');
     const date = new Date(Date.now() - 3600_000).toUTCString();
