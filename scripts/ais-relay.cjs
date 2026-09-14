@@ -10996,6 +10996,14 @@ function cachePolymarketResult(key, entry) {
   polymarketCache.set(key, entry);
 }
 
+function backoffPolymarketResult(key) {
+  const cached = polymarketCache.get(key);
+  const now = Date.now();
+  cachePolymarketResult(key, cached?.data
+    ? { ...cached, retryAt: now + POLYMARKET_NEG_TTL_MS }
+    : { data: null, timestamp: now - POLYMARKET_CACHE_TTL_MS + POLYMARKET_NEG_TTL_MS });
+}
+
 // Circuit breaker — stops upstream requests after repeated failures to prevent OOM
 const polymarketCircuitBreaker = { failures: 0, openUntil: 0 };
 const POLYMARKET_CB_THRESHOLD = 5;
@@ -11038,9 +11046,7 @@ function acquirePolymarketSlot() {
 function fetchPolymarketUpstream(cacheKey, endpoint, params, tag) {
   return acquirePolymarketSlot().catch(() => 'REJECTED').then((slotResult) => {
     if (slotResult === 'REJECTED') {
-      if (!polymarketCache.get(cacheKey)?.data) {
-        cachePolymarketResult(cacheKey, { data: null, timestamp: Date.now() - POLYMARKET_CACHE_TTL_MS + POLYMARKET_NEG_TTL_MS });
-      }
+      backoffPolymarketResult(cacheKey);
       return null;
     }
     const gammaUrl = `https://gamma-api.polymarket.com/${endpoint}?${params}`;
@@ -11056,9 +11062,7 @@ function fetchPolymarketUpstream(cacheKey, endpoint, params, tag) {
           polymarketCircuitBreaker.failures = 0;
         } else {
           tripPolymarketCircuitBreaker();
-          if (!polymarketCache.get(cacheKey)?.data) {
-            cachePolymarketResult(cacheKey, { data: null, timestamp: Date.now() - POLYMARKET_CACHE_TTL_MS + POLYMARKET_NEG_TTL_MS });
-          }
+          backoffPolymarketResult(cacheKey);
         }
       }
       const request = https.get(gammaUrl, {
@@ -11163,15 +11167,17 @@ function handlePolymarketRequest(req, res) {
     }, sliceToLimit(cached.data));
   }
 
-  if (Date.now() < polymarketCircuitBreaker.openUntil) {
+  const circuitOpen = Date.now() < polymarketCircuitBreaker.openUntil;
+  if (circuitOpen || Date.now() < (cached?.retryAt || 0)) {
     if (cached?.data) {
       return sendCompressed(req, res, 200, {
         'Content-Type': 'application/json',
         'Cache-Control': 'no-store',
+        'CDN-Cache-Control': 'no-store',
         'X-Cache': 'STALE',
-        'X-Circuit': 'OPEN',
+        ...(circuitOpen ? { 'X-Circuit': 'OPEN' } : {}),
         'X-Polymarket-Source': 'railway-stale',
-      }, cached.data);
+      }, sliceToLimit(cached.data));
     }
     return safeEnd(res, 503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Circuit': 'OPEN' }, JSON.stringify({ error: 'Polymarket upstream unavailable' }));
   }
@@ -11243,7 +11249,7 @@ setInterval(() => {
     if (now - entry.timestamp > WORLDBANK_CACHE_TTL_MS * 2) worldbankCache.delete(key);
   }
   for (const [key, entry] of polymarketCache) {
-    if (now - entry.timestamp > POLYMARKET_CACHE_TTL_MS * 2) polymarketCache.delete(key);
+    if (now - entry.timestamp > POLYMARKET_CACHE_TTL_MS * 2 && now >= (entry.retryAt || 0)) polymarketCache.delete(key);
   }
   for (const [key, entry] of yahooChartCache) {
     if (now - entry.ts > YAHOO_CHART_CACHE_TTL_MS * 2) yahooChartCache.delete(key);
