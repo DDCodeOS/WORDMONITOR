@@ -59,10 +59,11 @@ repository tool mapping, without an independent model-review claim.
 | Reload during interruption | Restore validated saved data while attempting a live read. Storage failure or a stuck read cannot block network recovery. |
 | No usable snapshot | Neutral waiting text, no count, no assertion of no activity. |
 | Offline | Retain valid saved data with an offline label; do not issue offline requests; retry on reconnect. |
-| Delayed cache/network result | Do not replace a newer computation. |
+| Delayed cache/network result | Keep the newer result within one source; fresh seed data takes precedence over partial local calculations. Stale seeds cannot displace newer local fallback. |
 | Local empty result | Do not clear known activity or claim confirmed absence; local adapters lack input-completeness metadata. A valid server empty can clear it. |
 | Local calculation or LLM assessment | Identify loaded dashboard inputs; assessment repaint does not advance computation time. |
 | Last panel closes | Remove timers/listeners and ignore late completion. Cleanup is idempotent. |
+| Subscriber throws | Log the failure and continue notifying other panels and scheduling recovery. |
 
 Freshness becomes stale after 15 minutes, matching the producer's declared
 threshold. Clearly labeled historical snapshots can remain visible for one hour.
@@ -70,6 +71,11 @@ This display ceiling is a conservative UI fallback policy, not an extension to
 upstream health or Redis TTL. Each minute the service rechecks age, including
 while a panel stays mounted. Local computation time is not proof of source-feed
 freshness or completeness.
+
+A fresh server snapshot, including confirmed empty, takes precedence over local
+calculations. Local computation time cannot establish that all inputs loaded.
+When the seed passes its freshness threshold, a newer non-empty local calculation
+can supply fallback cards until a fresh seed arrives.
 
 Successful shared reads recur every five minutes. Failures back off through
 15, 30, 60, 120, and 180 seconds. The public helper retains its ten-second request

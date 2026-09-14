@@ -79,13 +79,29 @@ function stateFor(domain: CorrelationDomain): CorrelationSnapshotState {
 function notify(): void {
   for (const [domain, callbacks] of listeners) {
     const state = stateFor(domain);
-    for (const callback of callbacks) callback(state);
+    for (const callback of callbacks) notifyListener(callback, state);
+  }
+}
+
+function notifyListener(listener: Listener, state: CorrelationSnapshotState): void {
+  try {
+    listener(state);
+  } catch (error) {
+    console.warn('[CorrelationSnapshot] Listener failed', error);
   }
 }
 
 function accept(domain: CorrelationDomain, snapshot: CorrelationSnapshot): boolean {
   const previous = snapshots.get(domain);
-  if (previous && previous.computedAt >= snapshot.computedAt) return false;
+  if (previous) {
+    // A fresh seed has complete domain semantics, including confirmed absence.
+    // Local computation time alone cannot supersede it with partial inputs.
+    if (previous.origin === 'seed' && snapshot.origin === 'local'
+      && Date.now() - previous.computedAt < FRESH_MS) return false;
+    const freshSeedOverLocal = snapshot.origin === 'seed' && previous.origin === 'local'
+      && Date.now() - snapshot.computedAt < FRESH_MS;
+    if (!freshSeedOverLocal && previous.computedAt >= snapshot.computedAt) return false;
+  }
   snapshots.set(domain, snapshot);
   return true;
 }
@@ -201,7 +217,7 @@ export function subscribeCorrelationSnapshot(domain: CorrelationDomain, listener
   const callbacks = listeners.get(domain) ?? new Set<Listener>();
   callbacks.add(listener);
   listeners.set(domain, callbacks);
-  listener(stateFor(domain));
+  notifyListener(listener, stateFor(domain));
   if (!active) {
     active = true;
     generation++;

@@ -181,7 +181,7 @@ describe('correlation snapshot recovery', () => {
     expect(result.latest()).toEqual({ status: 'waiting', snapshot: null });
   });
 
-  it('does not let delayed storage or network data replace a newer local computation', async () => {
+  it('does not let delayed stale seed data replace a newer local computation', async () => {
     const cache = deferred<ReturnType<typeof saved>>();
     const network = deferred<ReturnType<typeof payload>>();
     mocks.read.mockReturnValue(cache.promise);
@@ -189,8 +189,8 @@ describe('correlation snapshot recovery', () => {
     const result = watch();
     await settle();
     service.publishLocalCorrelationCards('economic', [card('economic', 'New local analysis')]);
-    network.resolve(payload());
-    cache.resolve(saved());
+    network.resolve(payload([card()], NOW - 20 * MINUTE));
+    cache.resolve(saved([card()], NOW - 25 * MINUTE));
     await settle();
     expect(result.latest().snapshot?.cards[0]?.title).toBe('New local analysis');
     expect(result.latest().snapshot?.origin).toBe('local');
@@ -198,6 +198,7 @@ describe('correlation snapshot recovery', () => {
   });
 
   it('replays a local result to a late subscriber and keeps raw source objects out of storage', async () => {
+    mocks.fetch.mockResolvedValue(undefined);
     const local = card();
     local.assessment = 'Session-specific premium assessment';
     local.signals[0]!.rawData = { bulky: 'source payload' };
@@ -226,6 +227,40 @@ describe('correlation snapshot recovery', () => {
     const result = watch();
     await settle();
     expect(result.latest()).toEqual({ status: 'waiting', snapshot: null });
+  });
+
+  it('lets a fresh confirmed-empty seed clear newer local cards and prevents local revival', async () => {
+    const request = deferred<ReturnType<typeof payload>>();
+    mocks.fetch.mockReturnValueOnce(request.promise);
+    const result = watch();
+    await settle();
+    service.publishLocalCorrelationCards('economic', [card()]);
+    expect(result.latest().snapshot?.origin).toBe('local');
+    request.resolve(payload([]));
+    await settle();
+    expect(result.latest().snapshot).toEqual({ cards: [], computedAt: NOW - MINUTE, origin: 'seed' });
+    service.publishLocalCorrelationCards('economic', [card('economic', 'Partial local inputs')]);
+    expect(result.latest().snapshot?.cards).toEqual([]);
+    expect(mocks.write.mock.calls.at(-1)?.[1].economic.cards).toEqual([]);
+
+    mocks.fetch.mockResolvedValue(undefined);
+    await vi.advanceTimersByTimeAsync(15 * MINUTE);
+    service.publishLocalCorrelationCards('economic', [card('economic', 'Local fallback')]);
+    expect(result.latest().snapshot?.origin).toBe('local');
+    expect(result.latest().snapshot?.cards[0]?.title).toBe('Local fallback');
+  });
+
+  it('keeps recovery and other subscribers running when a listener throws', async () => {
+    mocks.fetch.mockResolvedValueOnce(undefined).mockResolvedValue(payload([]));
+    stops.push(service.subscribeCorrelationSnapshot('economic', () => { throw new Error('broken listener'); }));
+    const result = watch();
+    await settle();
+    expect(result.latest()).toEqual({ status: 'waiting', snapshot: null });
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(result.latest().status).toBe('current');
+    expect(result.latest().snapshot?.cards).toEqual([]);
+    expect(mocks.fetch).toHaveBeenCalledTimes(2);
+    expect(console.warn).toHaveBeenCalledWith('[CorrelationSnapshot] Listener failed', expect.any(Error));
   });
 
   it('makes no offline requests and recovers on reconnect', async () => {
@@ -257,6 +292,7 @@ describe('correlation snapshot recovery', () => {
   });
 
   it('keeps a remounted panel subscribed if the old cleanup runs twice', async () => {
+    mocks.fetch.mockResolvedValue(undefined);
     const first = watch();
     await settle();
     first.stop();
