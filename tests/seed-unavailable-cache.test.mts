@@ -130,3 +130,11 @@ it('preserves a valid empty crypto sector collection', async () => {
   assert.match(response.headers.get('Cache-Control') ?? '', /^private, max-age=300(?:,|$)/);
   assert.deepEqual(await response.json(), { sectors: [] });
 });
+
+it('keeps an oil mapping exception out of HTTP caches without a fresh timestamp', async () => {
+  mode = 'hit';
+  cache.set('economic:crude-inventories:v1', { weeks: [null] });
+  const response = await request('economic/v1/get-oil-inventories');
+  assertNoStore(response);
+  assert.deepEqual(await response.json(), { crudeWeeks: [], natGasWeeks: [], updatedAt: '' });
+});
