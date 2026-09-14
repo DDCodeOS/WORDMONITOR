@@ -540,8 +540,14 @@ const CABLE_HEALTH_REPAIR_SCRIPT = [
   'end',
   'return 1',
 ].join('\n');
+// PINNED COPY of server/worldmonitor/shipping/v2/webhook-owner-index.ts
+// REMOVE_EXPIRED_MEMBER. Exact-text pin: whitespace changes must land in both.
+const WEBHOOK_OWNER_INDEX_REMOVE_EXPIRED_SCRIPT = [
+  "if redis.call('EXISTS', KEYS[2]) == 0 then return redis.call('SREM', KEYS[1], ARGV[1]) else return 0 end",
+].join('\n');
 const ALLOWED_EVAL_SCRIPTS = new Set([
   CABLE_HEALTH_REPAIR_SCRIPT,
+  WEBHOOK_OWNER_INDEX_REMOVE_EXPIRED_SCRIPT,
   SOURCE_RETRY_CLAIM_SCRIPT,
   DIGEST_LASTGOOD_PUBLISH_SCRIPT,
   STORY_ALIAS_PUBLISH_SCRIPT,

@@ -291,4 +291,17 @@ describe('redis-rest-proxy command gate', () => {
     assert.notEqual(gate.LEGACY_X_POST_BUDGET_RESERVE_SCRIPT, RESERVE_LUA);
     assert.notEqual(gate.LEGACY_X_POST_BUDGET_STATUS_SCRIPT, STATUS_LUA);
   });
+
+  it('pins the webhook owner-index remove-expired script by exact bytes', () => {
+    const gate = buildGate();
+    // Must match server/worldmonitor/shipping/v2/webhook-owner-index.ts REMOVE_EXPIRED_MEMBER.
+    const script = "if redis.call('EXISTS', KEYS[2]) == 0 then return redis.call('SREM', KEYS[1], ARGV[1]) else return 0 end";
+    assert.equal(gate.ALLOWED_EVAL_SCRIPTS.has(script), true);
+    assert.equal(accepts(gate, ['EVAL', script, '2', 'owner', 'record']), true);
+    assert.equal(
+      accepts(gate, ['EVAL', `${script} `, '2', 'owner', 'record']),
+      false,
+      'a one-character script variant must stay blocked',
+    );
+  });
 });
