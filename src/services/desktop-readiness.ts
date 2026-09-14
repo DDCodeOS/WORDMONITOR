@@ -40,11 +40,11 @@ export const DESKTOP_PARITY_FEATURES: DesktopParityFeature[] = [
   {
     id: 'live-news',
     panel: 'LiveNewsPanel',
-    serviceFiles: ['src/services/live-news.ts'],
+    serviceFiles: ['src/services/live-video/session.ts'],
     apiRoutes: ['/api/youtube/live'],
     apiHandlers: ['api/youtube/live.js'],
     locality: 'fully-local',
-    fallback: 'Channel fallback video IDs are used when live detection fails.',
+    fallback: 'Each channel tries its broadcaster stream, then verified YouTube streams; a channel with nothing live says why.',
     priority: 1,
   },
   {

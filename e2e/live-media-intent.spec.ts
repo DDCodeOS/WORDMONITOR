@@ -31,7 +31,7 @@ async function installAlwaysOnLiveMediaPrefs(page: Page, webcamPrefs?: Record<st
 async function liveNewsTransportCount(page: Page): Promise<number> {
   return page.evaluate(() => (
     document.querySelectorAll(
-      '.panel[data-panel="live-news"] iframe[src*="youtube"], .panel[data-panel="live-news"] iframe[src*="/api/youtube-embed"], .panel[data-panel="live-news"] video.live-news-native-video',
+      '.panel[data-panel="live-news"] iframe[src*="youtube"], .panel[data-panel="live-news"] iframe[src*="/api/youtube-embed"], .panel[data-panel="live-news"] video.live-news-media',
     ).length
   ));
 }

@@ -36,12 +36,20 @@ const sparklineSrc = read('src', 'utils', 'sparkline.ts');
 const consumerPrices = read('src', 'components', 'ConsumerPricesPanel.ts');
 
 const switchChannel = liveNews.slice(
-  liveNews.indexOf('private async switchChannel'),
+  liveNews.indexOf('private switchChannel'),
   liveNews.indexOf('private showOfflineMessage'),
 );
 const clearLoading = liveNews.slice(
   liveNews.indexOf('private resetChannelButtonLoading'),
-  liveNews.indexOf('private async switchChannel'),
+  liveNews.indexOf('private switchChannel'),
+);
+const onVideoState = liveNews.slice(
+  liveNews.indexOf('private onVideoState'),
+  liveNews.indexOf('private showPlayerStatus'),
+);
+const stopFromController = liveNews.slice(
+  liveNews.indexOf('private stopPlaybackFromController'),
+  liveNews.indexOf('private saveChannels'),
 );
 const applyStoredTheme = themeManager.slice(
   themeManager.indexOf('export function applyStoredTheme'),
@@ -78,24 +86,21 @@ describe('LiveNews channel loading lifecycle', () => {
     assert.match(clearLoading, /\.disabled\s*=\s*false/);
   });
 
-  it('switchChannel bumps a generation token and ignores stale completions', () => {
-    assert.match(liveNews, /channelSwitchGeneration\s*=\s*0/);
-    assert.match(switchChannel, /const generation = \+\+this\.channelSwitchGeneration/);
-    assert.match(switchChannel, /if \(generation !== this\.channelSwitchGeneration\) return/);
+  it('switchChannel marks the target busy only while its live session is connecting', () => {
+    const beginPos = switchChannel.indexOf("this.beginPlayback('explicit')");
+    const markPos = switchChannel.indexOf('this.markChannelButtonLoading(channel.id)');
+    assert.ok(beginPos > 0, 'switchChannel must start the selected channel');
+    assert.ok(markPos > beginPos, 'switchChannel must mark loading after the session starts');
+    assert.match(switchChannel, /if \(this\.videoPhase === 'connecting'\) this\.markChannelButtonLoading\(channel\.id\)/);
   });
 
-  it('clears prior loading before marking the new target, then try/finally-clears the current generation', () => {
-    const markPos = switchChannel.indexOf('this.markChannelButtonLoading');
-    const tryPos = switchChannel.indexOf('try {');
-    const resolvePos = switchChannel.indexOf('await this.resolveChannelVideo(channel)');
-    const finallyPos = switchChannel.indexOf('finally {');
-    const finallyClear = switchChannel.slice(finallyPos);
-    assert.ok(markPos > 0, 'switchChannel must mark the target loading');
-    assert.ok(tryPos > markPos, 'try must wrap resolve after marking loading');
-    assert.ok(resolvePos > tryPos, 'resolveChannelVideo must run inside try');
-    assert.ok(finallyPos > resolvePos, 'finally must run after resolve');
-    assert.match(finallyClear, /generation === this\.channelSwitchGeneration/);
-    assert.match(finallyClear, /this\.clearChannelLoadingState\(\)/);
+  it('clears prior loading before marking the new target, and clears it once the session settles or playback stops', () => {
+    assert.match(clearLoading, /private markChannelButtonLoading\(channelId: string\): void \{\s*this\.clearChannelLoadingState\(\);/);
+    assert.match(onVideoState, /if \(state\.phase !== 'connecting'\) this\.clearChannelLoadingState\(\)/);
+    assert.match(stopFromController, /this\.clearChannelLoadingState\(\)/);
+    const previewOnly = switchChannel.slice(switchChannel.indexOf('if (!shouldStartMedia)'));
+    assert.ok(previewOnly.indexOf('this.clearChannelLoadingState()') < previewOnly.indexOf('this.renderPlaceholder()'),
+      'a switch that starts no media must clear loading before rendering the preview');
   });
 
   it('success path no longer drops only the loading class', () => {
