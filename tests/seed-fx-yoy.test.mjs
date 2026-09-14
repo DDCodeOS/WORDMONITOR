@@ -68,6 +68,15 @@ describe('Yahoo request path', () => {
     // Ran at 120 ms until 2026-09: below the repo-wide floor every other Yahoo
     // seeder keeps, on the one seeder that sweeps ~60 symbols back to back.
     assert.ok(PER_CURRENCY_DELAY_MS >= 150, `stagger is ${PER_CURRENCY_DELAY_MS} ms`);
+    // The constant only protects the sweep if the loop actually waits on it
+    // between currencies; pin the wait to the same identifier so neither can
+    // drift without the other.
+    assert.match(
+      seedSource,
+      /for \(const \[currency, countryCode\] of Object\.entries\(CURRENCY_COUNTRY\)\) \{[\s\S]*?await new Promise\(\(r\) => setTimeout\(r, PER_CURRENCY_DELAY_MS\)\);[\s\S]*?\n  \}/,
+      'the currency loop must await PER_CURRENCY_DELAY_MS between requests',
+    );
+    assert.doesNotMatch(seedSource, /setTimeout\(r, \d+\)/, 'no literal delay may bypass the constant');
   });
 
   it('fetches Yahoo through the shared helper, never a bare fetch', () => {
