@@ -14,6 +14,7 @@
 
 import { strict as assert } from 'node:assert';
 import { describe, it, beforeEach, afterEach } from 'node:test';
+import { ApiError } from '../src/generated/server/worldmonitor/forecast/v1/service_server.ts';
 
 const originalFetch = globalThis.fetch;
 const originalEnv = { ...process.env };
@@ -83,6 +84,19 @@ describe('getSimulationOutcome runId filter (#3734 U6)', () => {
       if (!(k in originalEnv)) delete process.env[k];
     });
     Object.assign(process.env, originalEnv);
+  });
+
+  it('rejects malformed and oversized run IDs before any Redis work', async () => {
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      return Response.json({ result: null });
+    }) as typeof fetch;
+    for (const runId of ['arbitrary', '../latest', '1734567890123-abc\n', '9'.repeat(1000) + '-abc', '1734567890123-' + 'a'.repeat(65), null, 123]) {
+      await assert.rejects(getSimulationOutcome(makeCtx(), { runId: runId as string }),
+        (error: unknown) => error instanceof ApiError && error.statusCode === 400);
+    }
+    assert.equal(calls, 0);
   });
 
   /**
