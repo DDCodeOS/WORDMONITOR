@@ -147,7 +147,7 @@ export function renderAuditBody(report, { runUrl = '', canaries, gridPriority = 
     const rows = unverifiable.flatMap((slot) => slot.attempts.map((attempt, index) => [slot.slot, slot.surface, entryCell(attempt, index), because(attempt)]));
     lines.push(
       '', '### Could not verify from the runner', '',
-      'An HLS 403 or 451, an HLS timeout, a YouTube player that never became ready or stopped reporting whether a video is live, or a YouTube player API that did not load can depend on the runner (its network, its region, or a busy headless page). These slots may still play for viewers, so they are not counted above.',
+      'An HLS 403 or 451, an HLS timeout, a YouTube player that never became ready while no canary played, a player that stopped reporting whether a video is live, or a YouTube player API that did not load can depend on the runner (its network, its region, or YouTube itself). These slots may still play for viewers, so they are not counted above. A player that never became ready while a canary played is checked again alone, and is counted above if it still fails.',
       '', ...table(['Slot', 'Where it shows', 'Entry', 'Why'], rows),
     );
   }

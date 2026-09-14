@@ -29,7 +29,8 @@ youtube.com/channel/UC... URL (plays whatever that channel has live), or an http
 Label an entry with name=, e.g. kyiv=https://www.youtube.com/watch?v=e2gC37ILQmk
 
 --slot checks every entry of one slot in ${CATALOG_FILE}.
---all checks every slot and the audit canaries, and lists slots with no entries.
+--all checks every slot and the audit canaries, and lists slots with no entries. The canaries are
+  checked first; while one plays, a player that never became ready is checked again on its own page.
 --report also writes the --all result as JSON: where each slot shows, its status and every attempt.
   scripts/report-live-video-audit.mjs turns that file into the daily audit issue.
 
@@ -122,7 +123,7 @@ function why(result) {
     case 'unverifiable':
       if (verdict.reason === 'player-api-blocked') return 'the YouTube IFrame API did not load';
       if (verdict.reason === 'live-signal-missing') return 'the player no longer reports whether a video is live (isLive missing)';
-      return 'the player frame loaded but never became ready';
+      return result.checkedAlone ? 'the player never became ready, even when checked alone' : 'the player frame loaded but never became ready';
   }
   return 'unknown verdict';
 }
@@ -288,15 +289,16 @@ async function openProbePage(browser) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function probeYouTubeWithBrowser(candidates) {
+/** Plays the candidates in one headless browser, `batchSize` players per page, one page after another. */
+export async function probeYouTubeWithBrowser(candidates, { batchSize = BATCH_SIZE } = {}) {
   const { chromium } = await import('@playwright/test');
   const browser = await chromium.launch({ headless: true, args: ['--autoplay-policy=no-user-gesture-required'] });
   try {
     const results = [];
-    for (let start = 0; start < candidates.length; start += BATCH_SIZE) {
+    for (let start = 0; start < candidates.length; start += batchSize) {
       const page = await openProbePage(browser);
       try {
-        results.push(...await probeYouTubeCandidates(candidates.slice(start, start + BATCH_SIZE), { page, sleep }));
+        results.push(...await probeYouTubeCandidates(candidates.slice(start, start + batchSize), { page, sleep }));
       } finally {
         await page.close();
       }
@@ -399,8 +401,9 @@ const NETWORK_TIMEOUT_CODES = new Set(['UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADE
 function unverifiableFromRunner(row) {
   if (!row.parsed.ok) return false;
   const { verdict } = row;
-  // Channel embeds in a batched page have come back never-ready while the same channels played as canaries.
-  if (verdict.verdict === 'unverifiable') return true;
+  // A player that never became ready is dead only once it failed again alone while a canary played
+  // (reprobeNeverReadyAlone): in a batched page the stall can be the page, not the stream.
+  if (verdict.verdict === 'unverifiable') return !(verdict.reason === 'player-api-silent' && row.checkedAlone);
   if (verdict.verdict !== 'failed' || row.parsed.candidate.kind !== 'hls') return false;
   const { outcome } = verdict;
   return outcome.kind === 'timeout'
@@ -428,6 +431,7 @@ function attemptRecord(row) {
       httpStatus: outcome?.kind === 'hls-http' ? outcome.status : null,
       durationSeconds: row.durationSeconds ?? null,
       verdictAtMs: row.verdictAtMs ?? null,
+      checkedAlone: row.checkedAlone === true,
     },
   };
 }
@@ -508,6 +512,22 @@ export function buildAuditReport({ catalog, rows, surfaces, checkedAt }) {
   };
 }
 
+const isCanary = (row) => row.name?.startsWith('canary/') === true;
+const neverBecameReady = (row) => row.parsed.ok && row.verdict?.verdict === 'unverifiable' && row.verdict.reason === 'player-api-silent';
+
+/**
+ * Re-checks every entry whose player never became ready, one player per page with the full deadline:
+ * a crowded batched page can stall a player that plays fine alone. The verdict it settles on alone
+ * replaces the batched one. Callers run this only while a canary plays, so a runner-wide stall never
+ * turns into rot.
+ */
+async function reprobeNeverReadyAlone(rows, probeYouTube) {
+  const stalled = rows.filter(neverBecameReady);
+  if (stalled.length === 0) return;
+  const probed = await probeYouTube(stalled.map((row) => row.parsed.candidate), { batchSize: 1 });
+  stalled.forEach((row, index) => Object.assign(row, probed[index], { checkedAlone: true }));
+}
+
 /** Checks bare entries and returns them as report attempts; the reporter re-checks the canaries with this. */
 export async function auditAttempts(entries, { probeYouTube = probeYouTubeWithBrowser, probeHls = probeHlsCandidates } = {}) {
   const rows = entries.map((entry) => ({ name: null, parsed: parseSourceEntry(entry) }));
@@ -544,7 +564,12 @@ export async function runCheck(argv, {
   const checkedAt = now().toISOString();
 
   const rows = targets.entries.map(({ name, entry }) => ({ name, parsed: parseSourceEntry(entry) }));
-  await probeRows(rows, { probeYouTube, probeHls });
+  // Canaries first, on their own page: whether one plays decides how a never-ready slot player is read.
+  const canaryRows = rows.filter(isCanary);
+  const slotRows = rows.filter((row) => !isCanary(row));
+  await probeRows(canaryRows, { probeYouTube, probeHls });
+  await probeRows(slotRows, { probeYouTube, probeHls });
+  if (canaryRows.some((row) => row.verdict?.verdict === 'live')) await reprobeNeverReadyAlone(slotRows, probeYouTube);
 
   for (const slot of targets.empty) write(formatEmptySlot(slot));
   for (const row of rows) write(formatCheckLine(row));

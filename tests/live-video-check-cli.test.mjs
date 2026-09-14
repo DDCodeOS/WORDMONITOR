@@ -456,7 +456,7 @@ describe('audit report (--all --report)', () => {
       ['webcams/sydney', 'Webcam (Asia)', false, 'ok', null],
       ['live-news/bloomberg', 'Live News default (full, tech)', true, 'ok', null],
       ['live-news/bbc-news', 'Live News optional', false, 'unverifiable-from-runner', null],
-      ['live-news/yahoo', 'Live News default (tech)', true, 'unverifiable-from-runner', null],
+      ['live-news/yahoo', 'Live News default (tech)', true, 'needs-replacement', null],
       ['live-news/rtve', 'Live News optional', false, 'empty', null],
     ]);
   });
@@ -500,7 +500,10 @@ describe('audit report (--all --report)', () => {
 
     const [silent] = bySlot.get('live-news/yahoo').attempts;
     assert.equal(silent.verdict, 'unverifiable');
-    assert.equal(silent.unverifiableFromRunner, true, 'a player that never became ready can be the busy headless page, not the stream');
+    assert.equal(silent.unverifiableFromRunner, false, 'still never ready when checked alone while the canaries play');
+    assert.equal(silent.why, 'the player never became ready, even when checked alone');
+    assert.equal(silent.evidence.checkedAlone, true);
+    assert.equal(jerusalem.evidence.checkedAlone, false);
 
     assert.deepEqual(bySlot.get('live-news/rtve').attempts, []);
     assert.deepEqual(report.canaries.map((canary) => [canary.entry, canary.kind, canary.verdict, canary.evidence.author]), [
@@ -528,12 +531,12 @@ describe('audit report (--all --report)', () => {
     }
   });
 
-  it('counts a stream that never started as dead, and every unverifiable player verdict as unverifiable from the runner', async () => {
+  it('counts a stream that never started, or a player never ready even alone, as dead; a missing live signal or blocked API stays unverifiable', async () => {
     const videoOnly = { webcams: {}, gridPriority: [], news: { bloomberg: [watch('QB5BNdBFujE')] }, canaries: [CANARY] };
     const cases = [
       [{ verdict: 'failed', outcome: { kind: 'not-started' } }, false, 'needs-replacement', /scheduled or not started/],
       [{ verdict: 'unverifiable', reason: 'live-signal-missing' }, true, 'unverifiable-from-runner', /isLive missing/],
-      [{ verdict: 'unverifiable', reason: 'player-api-silent' }, true, 'unverifiable-from-runner', /never became ready/],
+      [{ verdict: 'unverifiable', reason: 'player-api-silent' }, false, 'needs-replacement', /never became ready, even when checked alone/],
       [{ verdict: 'unverifiable', reason: 'player-api-blocked' }, true, 'unverifiable-from-runner', /IFrame API did not load/],
     ];
     for (const [verdict, unverifiable, status, why] of cases) {
@@ -547,6 +550,80 @@ describe('audit report (--all --report)', () => {
       assert.equal(slot.status, status, label);
       assert.match(slot.attempts[0].why, why, label);
     }
+  });
+
+  const SECOND_CANARY = 'https://www.youtube.com/channel/UCknLrEdhRCp1aegoMqRaCZg';
+  const silentVerdict = { verdict: { verdict: 'unverifiable', reason: 'player-api-silent' }, durationSeconds: null, verdictAtMs: 15_000 };
+  const idOf = (candidate) => candidate.videoId ?? candidate.channelId;
+  /** An injected YouTube probe that records each call: the ids it got, in order, and its batch size. */
+  function recordingProbe(verdictFor) {
+    const calls = [];
+    const probeYouTube = async (candidates, options = {}) => {
+      calls.push({ ids: candidates.map(idOf), batchSize: options.batchSize ?? null });
+      return candidates.map((candidate) => verdictFor(candidate, calls.length));
+    };
+    return { calls, probeYouTube };
+  }
+
+  it('probes the canaries in their own call before any slot entry', async () => {
+    const catalog = {
+      webcams: { taipei: [watch('z_fY1pj1VBw')] },
+      gridPriority: ['taipei'],
+      news: { bloomberg: [watch('QB5BNdBFujE'), 'https://www.youtube.com/channel/UCIALMKvObZNtJ6AmdCLP7Lg'] },
+      canaries: [CANARY, SECOND_CANARY],
+    };
+    const { calls, probeYouTube } = recordingProbe((candidate) => live(candidate.videoId ?? 'gCNeDWCI0vo'));
+    await audit(['--all', '--report', 'audit.json'], { catalog, probeYouTube });
+    assert.deepEqual(calls, [
+      { ids: ['UCNye-wNBqNL5ZzHSJj3l8Bg', 'UCknLrEdhRCp1aegoMqRaCZg'], batchSize: null },
+      { ids: ['z_fY1pj1VBw', 'QB5BNdBFujE', 'UCIALMKvObZNtJ6AmdCLP7Lg'], batchSize: null },
+    ]);
+  });
+
+  it('uses the verdict of a player re-checked alone when it never became ready in the batch', async () => {
+    const catalog = { webcams: { taipei: [watch('z_fY1pj1VBw')] }, gridPriority: ['taipei'], news: { bloomberg: [watch('QB5BNdBFujE')] }, canaries: [CANARY] };
+    const { calls, probeYouTube } = recordingProbe((candidate, call) => (candidate.videoId === 'QB5BNdBFujE' && call === 2
+      ? silentVerdict
+      : live(candidate.videoId ?? 'gCNeDWCI0vo')));
+    const { lines, writes: [{ report }] } = await audit(['--all', '--report', 'audit.json'], { catalog, probeYouTube });
+    assert.deepEqual(calls.slice(2), [{ ids: ['QB5BNdBFujE'], batchSize: 1 }]);
+    const bySlot = new Map(report.slots.map((slot) => [slot.slot, slot]));
+    const [bloomberg] = bySlot.get('live-news/bloomberg').attempts;
+    assert.equal(bySlot.get('live-news/bloomberg').status, 'ok');
+    assert.deepEqual([bloomberg.verdict, bloomberg.evidence.checkedAlone], ['live', true]);
+    assert.equal(bySlot.get('webcams/taipei').attempts[0].evidence.checkedAlone, false);
+    assert.match(lines.join('\n'), /^LIVE\s+live-news\/bloomberg/m);
+  });
+
+  it('counts a player that never became ready, even alone, as dead while the canaries play; a missing live signal is not re-checked', async () => {
+    const catalog = { webcams: {}, gridPriority: [], news: { bloomberg: [watch('QB5BNdBFujE')], yahoo: [watch('KQp-e_XQnDE')] }, canaries: [CANARY] };
+    const { calls, probeYouTube } = recordingProbe((candidate) => {
+      if (candidate.kind === 'channel') return live('gCNeDWCI0vo');
+      if (candidate.videoId === 'KQp-e_XQnDE') return { verdict: { verdict: 'unverifiable', reason: 'live-signal-missing' }, durationSeconds: null, verdictAtMs: 15_000 };
+      return silentVerdict;
+    });
+    const { lines, writes: [{ report }] } = await audit(['--all', '--report', 'audit.json'], { catalog, probeYouTube });
+    assert.deepEqual(calls.slice(2), [{ ids: ['QB5BNdBFujE'], batchSize: 1 }]);
+    const [bloomberg, yahoo] = report.slots;
+    assert.equal(bloomberg.status, 'needs-replacement');
+    assert.deepEqual(
+      [bloomberg.attempts[0].verdict, bloomberg.attempts[0].unverifiableFromRunner, bloomberg.attempts[0].why, bloomberg.attempts[0].evidence.checkedAlone],
+      ['unverifiable', false, 'the player never became ready, even when checked alone', true],
+    );
+    assert.equal(yahoo.status, 'unverifiable-from-runner');
+    assert.equal(yahoo.attempts[0].evidence.checkedAlone, false);
+    assert.match(lines.join('\n'), /why: the player never became ready, even when checked alone/);
+  });
+
+  it('skips the re-check and keeps a never-ready player unverifiable when no canary plays', async () => {
+    const catalog = { webcams: {}, gridPriority: [], news: { bloomberg: [watch('QB5BNdBFujE')] }, canaries: [CANARY] };
+    const { calls, probeYouTube } = recordingProbe(() => silentVerdict);
+    const { writes: [{ report }] } = await audit(['--all', '--report', 'audit.json'], { catalog, probeYouTube });
+    assert.equal(calls.length, 2);
+    const [slot] = report.slots;
+    assert.equal(slot.status, 'unverifiable-from-runner');
+    assert.deepEqual([slot.attempts[0].unverifiableFromRunner, slot.attempts[0].evidence.checkedAlone], [true, false]);
+    assert.equal(report.canaries[0].verdict, 'unverifiable');
   });
 
   it('records a live HLS playlist as live with playback not checked', async () => {
