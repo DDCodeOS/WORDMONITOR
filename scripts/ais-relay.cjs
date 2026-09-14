@@ -11534,11 +11534,20 @@ async function ytFetch(url) {
 
 const ytLiveCache = new Map();
 const YT_CACHE_TTL = 5 * 60 * 1000;
+const YT_CHANNEL_ID_RE = /^UC[A-Za-z0-9_-]{22}$/;
+const YT_HANDLE_RE = /^[\p{L}\p{N}](?:[\p{L}\p{N}\p{M}._·-]{0,28}[\p{L}\p{N}\p{M}])?$/u;
 
 function handleYouTubeLiveRequest(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const channel = url.searchParams.get('channel');
   const videoIdParam = url.searchParams.get('videoId');
+  const handle = channel?.replace(/^@/, '').normalize('NFC') || '';
+  if ((channel && (channel.length > 128 || channel !== channel.trim()
+    || (!YT_CHANNEL_ID_RE.test(channel) && !YT_HANDLE_RE.test(handle))))
+    || (videoIdParam && (videoIdParam.length !== 11 || !/^[A-Za-z0-9_-]{11}$/.test(videoIdParam)))) {
+    return sendCompressed(req, res, 400, { 'Content-Type': 'application/json' },
+      JSON.stringify({ error: 'Invalid YouTube handle, channel ID or video ID' }));
+  }
 
   if (videoIdParam && /^[A-Za-z0-9_-]{11}$/.test(videoIdParam)) {
     const cacheKey = `vid:${videoIdParam}`;
@@ -11571,7 +11580,7 @@ function handleYouTubeLiveRequest(req, res) {
       JSON.stringify({ error: 'Missing channel parameter' }));
   }
 
-  const channelHandle = channel.startsWith('@') ? channel : `@${channel}`;
+  const channelHandle = YT_CHANNEL_ID_RE.test(channel) ? channel : `@${handle.toLowerCase()}`;
   const cacheKey = `ch:${channelHandle}`;
   const cached = ytLiveCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < YT_CACHE_TTL) {
@@ -11581,7 +11590,8 @@ function handleYouTubeLiveRequest(req, res) {
     }, cached.json);
   }
 
-  const liveUrl = `https://www.youtube.com/${channelHandle}/live`;
+  const channelPath = YT_CHANNEL_ID_RE.test(channel) ? `channel/${channel}` : `@${encodeURIComponent(handle)}`;
+  const liveUrl = `https://www.youtube.com/${channelPath}/live`;
   ytFetch(liveUrl)
     .then(r => {
       if (!r.ok) {
