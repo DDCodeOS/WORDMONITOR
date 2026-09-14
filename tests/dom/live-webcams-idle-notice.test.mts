@@ -11,6 +11,11 @@ vi.mock('@/services/live-video/youtube-iframe-api', () => ({
   loadYouTubeIframeApi: () => Promise.resolve(loader.api?.namespace ?? null),
 }));
 
+vi.mock('@/config/live-video-sources', async (importOriginal) => {
+  const { withFixtureWebcamCatalog } = await import('./helpers/webcam-catalog.mts');
+  return withFixtureWebcamCatalog(await importOriginal<typeof import('@/config/live-video-sources')>());
+});
+
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const ALL_REGIONS_WALL = [

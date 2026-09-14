@@ -18,10 +18,11 @@ vi.mock('@/services/live-video/youtube-iframe-api', () => ({
 }));
 
 vi.mock('@/config/live-video-sources', async (importOriginal) => {
-  const real = await importOriginal<typeof import('@/config/live-video-sources')>();
-  Object.assign(catalog.original, real.WEBCAM_SOURCES);
-  Object.assign(catalog.sources, real.WEBCAM_SOURCES);
-  return { ...real, WEBCAM_SOURCES: catalog.sources };
+  const { withFixtureWebcamCatalog } = await import('./helpers/webcam-catalog.mts');
+  const fixture = withFixtureWebcamCatalog(await importOriginal<typeof import('@/config/live-video-sources')>());
+  Object.assign(catalog.original, fixture.WEBCAM_SOURCES);
+  Object.assign(catalog.sources, fixture.WEBCAM_SOURCES);
+  return { ...fixture, WEBCAM_SOURCES: catalog.sources };
 });
 
 const HOUR = 60 * 60_000;
@@ -175,6 +176,13 @@ describe('Live Webcams live verification', () => {
     expect(content().querySelector('.webcam-preview-tile .webcam-live-dot')).toBeNull();
     expect(content().querySelector('.webcam-iframe')).toBeNull();
     expect(api().players).toHaveLength(0);
+  });
+
+  it('opens the wall on the first four priority slots that have entries', () => {
+    catalog.sources.kyiv = [];
+    mountOnScreen();
+
+    expect(gridFeedIds()).toEqual(['jerusalem', 'middle-east', 'washington', 'taipei']);
   });
 
   it('connects without a live dot until YouTube reports the stream live', async () => {
