@@ -18,10 +18,12 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-latest
-    # Worst case stays inside 15 minutes: about 3 for checkout, npm ci and Chromium; about 4 for the batched
-    # check (7 pages of up to 8 players at up to 31 s each, HLS fetches capped at 15 s); at most 4 for alone
-    # re-checks (ALONE_RECHECK_BUDGET_MS); about 2 for the reporter (one canary retry, GitHub calls capped at 30 s).
-    timeout-minutes: 15
+    # Worst case that still reaches the reporter, inside 25 minutes: about 3 for checkout and npm ci; at most 8 for
+    # the Chromium install (a hung install fails the run instead); about 4 for the batched check (7 pages of up to
+    # 8 players at up to 31 s each, HLS fetches capped at 15 s); at most 8 for alone re-checks
+    # (ALONE_RECHECK_BUDGET_MS, about 10 checks at 45 s each); about 2 for the reporter (one canary page, GitHub
+    # calls capped at 30 s). tests/report-live-video-audit.test.mjs checks this sum against timeout-minutes.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -32,7 +34,10 @@ jobs:
 
       - run: npm ci --ignore-scripts
 
-      - run: npx playwright install --with-deps chromium
+      # A stuck apt mirror has hung this install for a whole job budget before (see test.yml).
+      - name: Install Chromium
+        timeout-minutes: 8
+        run: npx playwright install --with-deps chromium
 
       # Exits 1 whenever a slot needs attention, which is the normal case the reporter handles.
       # A run that writes no report still fails the job at the reporter.

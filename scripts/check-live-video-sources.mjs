@@ -15,8 +15,8 @@ const BATCH_SIZE = 8;
 const MAX_POLLS = Math.ceil((2 * LIVE_VIDEO_TIMING.verdictDeadlineMs) / LIVE_VIDEO_TIMING.pollMs);
 /** A player that never became ready counts as dead only after this many checks alone stall too. */
 export const ALONE_RECHECKS = 2;
-/** Total time the alone checks may take, so the audit workflow always reaches its reporter inside the job timeout. */
-export const ALONE_RECHECK_BUDGET_MS = 4 * 60_000;
+/** Total time the alone checks may take (about 10 at their 45 s worst case), so the audit workflow reaches its reporter inside the job timeout. */
+export const ALONE_RECHECK_BUDGET_MS = 8 * 60_000;
 /** The longest one alone check can take: a browser launch, the page and every poll. A check starts only if this still fits. */
 const ALONE_CHECK_MAX_MS = MAX_POLLS * LIVE_VIDEO_TIMING.pollMs + 15_000;
 const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';

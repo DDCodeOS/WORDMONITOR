@@ -6,7 +6,7 @@ import { delimiter, join } from 'node:path';
 import { describe, it } from 'node:test';
 import YAML from 'yaml';
 
-import { runCheck } from '../scripts/check-live-video-sources.mjs';
+import { ALONE_RECHECK_BUDGET_MS, runCheck } from '../scripts/check-live-video-sources.mjs';
 import { ISSUE_TITLE, MAX_ISSUE_BODY_CHARS, publishAudit } from '../scripts/report-live-video-audit.mjs';
 
 const watch = (id) => `https://www.youtube.com/watch?v=${id}`;
@@ -573,10 +573,11 @@ describe('live video source audit workflow', () => {
   it('checks every slot, then reports from the same file even when the check exits 1', () => {
     const [job, ...others] = Object.values(workflow.jobs);
     assert.deepEqual(others, []);
-    assert.equal(job['timeout-minutes'], 15);
+    assert.equal(job['timeout-minutes'], 25);
     const runs = job.steps.map((step) => step.run ?? '');
     const install = runs.indexOf('npm ci --ignore-scripts');
     const browser = runs.indexOf('npx playwright install --with-deps chromium');
+    assert.equal(job.steps[browser]?.['timeout-minutes'], 8, 'a hung Chromium install must not eat the job budget');
     const check = job.steps.findIndex((step) => /scripts\/check-live-video-sources\.mjs/.test(step.run ?? ''));
     const report = job.steps.findIndex((step) => /scripts\/report-live-video-audit\.mjs/.test(step.run ?? ''));
     assert.ok(install >= 0 && install < browser && browser < check && check < report, runs.join('\n'));
@@ -590,5 +591,16 @@ describe('live video source audit workflow', () => {
     assert.equal(reportStep.env.LIVE_VIDEO_AUDIT_REPORT, '${{ runner.temp }}/live-video-audit.json');
     assert.equal(reportStep.env.GH_TOKEN, '${{ github.token }}');
     assert.equal(reportStep['continue-on-error'], undefined, 'a broken report or failed canaries must turn the run red');
+  });
+
+  it('reaches the reporter inside the job timeout even when every capped phase runs long', () => {
+    const [job] = Object.values(workflow.jobs);
+    const install = job.steps.find((step) => step.run === 'npx playwright install --with-deps chromium')?.['timeout-minutes'];
+    // Checkout and npm ci (about 3), the Chromium install cap, the batched check (7 pages of up to 8 players at up
+    // to about 31 s, HLS fetches capped at 15 s: about 4), every alone re-check (the budget), and the reporter
+    // (one canary page and GitHub calls capped at 30 s: about 2).
+    const worstCase = 3 + install + 4 + ALONE_RECHECK_BUDGET_MS / 60_000 + 2;
+    assert.equal(ALONE_RECHECK_BUDGET_MS, 8 * 60_000);
+    assert.ok(worstCase <= job['timeout-minutes'], `worst case ${worstCase} min against a ${job['timeout-minutes']} min job timeout`);
   });
 });
