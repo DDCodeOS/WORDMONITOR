@@ -396,6 +396,22 @@ describe('live video audit issue', () => {
     assert.deepEqual(shownInstead, ['webcams/tel-aviv', 'entry 2 (live)', '—']);
   });
 
+  it('files a dead entry ahead of an unverifiable one as degraded, shown instead by the unverified entry', async () => {
+    const unverified = attempt(watch('VGnFLdQW39A'), 'unverifiable', {
+      why: 'the player no longer reports whether a video is live (isLive missing)',
+      unverifiableFromRunner: true,
+    });
+    const report = reportFor(baseCatalog, { 'webcams/kyiv': { status: 'degraded', attempts: [dead(watch('e2gC37ILQmk')), unverified] } });
+    const { calls, gh } = fakeGh([]);
+
+    assert.deepEqual(await publish(report, { gh }), { findings: 1, action: 'created' });
+    const { body } = calls[1].payload;
+    assert.deepEqual(body.split('\n').filter((line) => line.startsWith('| webcams/kyiv |')), [
+      '| webcams/kyiv | Webcam grid cell 2 | degraded | `https://www.youtube.com/watch?v=e2gC37ILQmk` | YouTube player error 150: the owner does not allow embedding, or the video is unavailable here | entry 2 (unverified) |',
+    ]);
+    assert.doesNotMatch(body, /### Could not verify from the runner/);
+  });
+
   it('renders probe titles, authors, entries and error details as inert code in the issue and the step summary', async (t) => {
     const hostile = "@koala73 @github/staff `tick` [x](https://evil.example) ![](https://evil.example/p.png) fixes #1 a\\|b | <script>alert(1)</script>\nsecond line";
     const hostileHls = 'https://evil.example/@koala73/fixes-#1/a`b|c.m3u8';

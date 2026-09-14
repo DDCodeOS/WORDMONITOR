@@ -471,14 +471,17 @@ function attemptRecord(row) {
 
 /**
  * What a slot needs, from its attempts in try order:
- *  no entries → empty; first entry live → ok; a later entry live after a failure → degraded;
- *  nothing live → needs-replacement, or unverifiable-from-runner when the runner could not verify an entry.
+ *  no entries → empty; first entry live → ok; a dead entry ahead of a live or unverifiable one → degraded;
+ *  nothing live and nothing unverifiable → needs-replacement; the first entry the runner could not verify,
+ *  with no dead entry ahead of it → unverifiable-from-runner.
  */
 export function slotStatus(attempts) {
   if (attempts.length === 0) return 'empty';
   const liveAt = attempts.findIndex((attempt) => attempt.verdict === 'live');
   if (liveAt >= 0) return attempts.slice(0, liveAt).some((attempt) => !attempt.unverifiableFromRunner) ? 'degraded' : 'ok';
-  return attempts.some((attempt) => attempt.unverifiableFromRunner) ? 'unverifiable-from-runner' : 'needs-replacement';
+  const unverifiedAt = attempts.findIndex((attempt) => attempt.unverifiableFromRunner);
+  if (unverifiedAt < 0) return 'needs-replacement';
+  return unverifiedAt > 0 ? 'degraded' : 'unverifiable-from-runner';
 }
 
 const NOTHING_LIVE = new Set(['empty', 'needs-replacement']);

@@ -109,16 +109,21 @@ function entryCell(attempt, index) {
   return `${index > 0 ? `entry ${index + 1}: ` : ''}${code(attempt.entry)}`;
 }
 
-/** One row per entry that failed ahead of whatever plays; an empty slot gets one row. */
+/** One row per dead entry ahead of whatever plays or could not be verified; an empty slot gets one row. */
 function findingRows(slot) {
   const lead = [text(slot.slot), text(slot.surface), text(slot.status)];
   if (slot.status === 'empty') return [[...lead, '—', 'no entries configured', text(slot.shownInstead ?? '—')]];
   const liveAt = slot.attempts.findIndex((attempt) => attempt.verdict === 'live');
-  const instead = text(liveAt > 0 ? `entry ${liveAt + 1} (live)` : slot.shownInstead ?? '—');
+  const unverifiedAt = slot.attempts.findIndex((attempt) => attempt.unverifiableFromRunner);
+  const stopAt = liveAt >= 0 ? liveAt : unverifiedAt >= 0 ? unverifiedAt : slot.attempts.length;
+  let instead = slot.shownInstead ?? '—';
+  if (liveAt > 0) instead = `entry ${liveAt + 1} (live)`;
+  else if (liveAt < 0 && unverifiedAt > 0) instead = `entry ${unverifiedAt + 1} (unverified)`;
   return slot.attempts
+    .slice(0, stopAt)
     .map((attempt, index) => ({ attempt, index }))
-    .filter(({ attempt, index }) => (liveAt < 0 || index < liveAt) && !attempt.unverifiableFromRunner)
-    .map(({ attempt, index }) => [...lead, entryCell(attempt, index), because(attempt), instead]);
+    .filter(({ attempt }) => !attempt.unverifiableFromRunner)
+    .map(({ attempt, index }) => [...lead, entryCell(attempt, index), because(attempt), text(instead)]);
 }
 
 /** Hotspot wall slots first, in grid priority order; everything else keeps the report's order. */

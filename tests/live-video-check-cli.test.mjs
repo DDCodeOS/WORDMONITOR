@@ -352,11 +352,13 @@ describe('slotStatus', () => {
     assert.equal(slotStatus([dead, dead]), 'needs-replacement');
   });
 
-  it('never counts an attempt the runner could not verify as a failure', () => {
+  it('never counts an attempt the runner could not verify as a failure, and never lets it hide a dead entry ahead of it', () => {
     assert.equal(slotStatus([geo, live]), 'ok');
     assert.equal(slotStatus([geo, dead, live]), 'degraded');
     assert.equal(slotStatus([geo]), 'unverifiable-from-runner');
-    assert.equal(slotStatus([dead, geo]), 'unverifiable-from-runner');
+    assert.equal(slotStatus([geo, dead]), 'unverifiable-from-runner');
+    assert.equal(slotStatus([dead, geo]), 'degraded');
+    assert.equal(slotStatus([dead, dead, geo]), 'degraded');
   });
 });
 
