@@ -57,6 +57,11 @@ async function settle() {
 beforeEach(async () => {
   vi.resetModules();
   vi.useFakeTimers();
+  // Happy DOM's frame scheduling is independent of the fake timeout clock.
+  // Route paints through that clock so suite load cannot delay the assertion.
+  vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) =>
+    Number(setTimeout(() => callback(performance.now()), 1)));
+  vi.stubGlobal('cancelAnimationFrame', (id: number) => clearTimeout(id));
   vi.setSystemTime(NOW);
   stops = [];
   Object.values(mocks).forEach(mock => mock.mockReset());
@@ -73,6 +78,7 @@ beforeEach(async () => {
 afterEach(() => {
   stops.forEach(stop => stop());
   document.body.innerHTML = '';
+  vi.unstubAllGlobals();
   vi.useRealTimers();
 });
 
