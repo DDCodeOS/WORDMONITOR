@@ -557,6 +557,8 @@ describe('audit report (--all --report)', () => {
 
   const SECOND_CANARY = 'https://www.youtube.com/channel/UCknLrEdhRCp1aegoMqRaCZg';
   const silentVerdict = { verdict: { verdict: 'unverifiable', reason: 'player-api-silent' }, durationSeconds: null, verdictAtMs: 15_000 };
+  const timeoutVerdict = { verdict: { verdict: 'failed', outcome: { kind: 'timeout' } }, durationSeconds: null, verdictAtMs: null };
+  const notStartedVerdict = { verdict: { verdict: 'failed', outcome: { kind: 'not-started' } }, durationSeconds: null, verdictAtMs: 15_000 };
   const idOf = (candidate) => candidate.videoId ?? candidate.channelId;
   /** An injected YouTube probe that records each call: the ids it got, in order, and its batch size. */
   function recordingProbe(verdictFor) {
@@ -645,6 +647,37 @@ describe('audit report (--all --report)', () => {
     assert.equal(report.canaries[0].verdict, 'unverifiable');
   });
 
+  it('re-checks every YouTube stall alone: plays alone is ok, stalls in both alone checks is dead, no live canary leaves it unverifiable', async () => {
+    const catalog = { webcams: {}, gridPriority: [], news: { bloomberg: [watch('QB5BNdBFujE')] }, canaries: [CANARY] };
+    const stalls = [
+      ['player-api-silent', silentVerdict, 'the player never became ready, in the batch or in two checks alone'],
+      ['timeout', timeoutVerdict, 'no verdict within 15 s, in the batch or in two checks alone'],
+      ['not-started', notStartedVerdict, 'scheduled or not started: YouTube lists it as live but it did not play within 15 s, in the batch or in two checks alone'],
+    ];
+    const run = async (verdictFor) => {
+      const { calls, probeYouTube } = recordingProbe(verdictFor);
+      const { writes: [{ report }] } = await audit(['--all', '--report', 'audit.json'], { catalog, probeYouTube });
+      return { calls, status: report.slots[0].status, attempt: report.slots[0].attempts[0] };
+    };
+    const canaryLive = (candidate) => (candidate.kind === 'channel' ? live('gCNeDWCI0vo') : null);
+    for (const [kind, stall, deadWhy] of stalls) {
+      const playsAlone = await run((candidate, call) => canaryLive(candidate) ?? (call === 3 ? live('QB5BNdBFujE') : stall));
+      assert.deepEqual([playsAlone.status, playsAlone.attempt.verdict, playsAlone.attempt.evidence.aloneChecks], ['ok', 'live', 1], `${kind}: plays alone`);
+
+      const stallsAlone = await run((candidate) => canaryLive(candidate) ?? stall);
+      assert.equal(stallsAlone.calls.length, 4, `${kind}: the canary page, the batch and two alone checks`);
+      assert.deepEqual(
+        [stallsAlone.status, stallsAlone.attempt.why, stallsAlone.attempt.unverifiableFromRunner],
+        ['needs-replacement', deadWhy, false],
+        `${kind}: stalls alone`,
+      );
+
+      const noCanary = await run(() => stall);
+      assert.equal(noCanary.calls.length, 2, `${kind}: no alone check without a live canary`);
+      assert.deepEqual([noCanary.status, noCanary.attempt.unverifiableFromRunner], ['unverifiable-from-runner', true], `${kind}: no live canary`);
+    }
+  });
+
   it('stops checking alone once the audit time budget is used up, and leaves the rest unverifiable', async () => {
     const catalog = {
       webcams: {},
@@ -652,24 +685,25 @@ describe('audit report (--all --report)', () => {
       news: { bloomberg: [watch('QB5BNdBFujE')], yahoo: [watch('KQp-e_XQnDE')], rtve: [watch('-xzg3wujOVM')] },
       canaries: [CANARY],
     };
-    // Each alone check takes half the budget, so two run and nothing fits after them.
+    // Each alone check takes half the budget, so two run and nothing fits after them. Every kind of stall shares the budget.
     let nowMs = 0;
+    const stallFor = { QB5BNdBFujE: silentVerdict, 'KQp-e_XQnDE': timeoutVerdict, '-xzg3wujOVM': notStartedVerdict };
     const { calls, probeYouTube } = recordingProbe((candidate, call) => {
       if (call > 2) nowMs += ALONE_RECHECK_BUDGET_MS / 2;
-      return candidate.kind === 'channel' ? live('gCNeDWCI0vo') : silentVerdict;
+      return candidate.kind === 'channel' ? live('gCNeDWCI0vo') : stallFor[candidate.videoId];
     });
     const { lines, writes: [{ report }] } = await audit(['--all', '--report', 'audit.json'], { catalog, probeYouTube, clock: () => nowMs });
     assert.deepEqual(calls.slice(2).map((call) => call.ids), [['QB5BNdBFujE'], ['KQp-e_XQnDE']]);
-    for (const slot of report.slots) {
-      const [attempt] = slot.attempts;
-      assert.equal(slot.status, 'unverifiable-from-runner', slot.slot);
-      assert.deepEqual(
-        [attempt.why, attempt.unverifiableFromRunner, attempt.evidence.recheckSkipped],
-        ['not re-checked: audit time budget used up', true, true],
-        slot.slot,
-      );
-    }
-    assert.deepEqual(report.slots.map((slot) => slot.attempts[0].evidence.aloneChecks), [1, 1, 0]);
+    const once = 'checked alone once, second check skipped: audit time budget used up';
+    const never = 'not re-checked: audit time budget used up';
+    assert.deepEqual(
+      report.slots.map((slot) => [slot.status, slot.attempts[0].why, slot.attempts[0].unverifiableFromRunner, slot.attempts[0].evidence.recheckSkipped, slot.attempts[0].evidence.aloneChecks]),
+      [
+        ['unverifiable-from-runner', once, true, true, 1],
+        ['unverifiable-from-runner', once, true, true, 1],
+        ['unverifiable-from-runner', never, true, true, 0],
+      ],
+    );
     assert.match(lines.join('\n'), /why: not re-checked: audit time budget used up/);
   });
 

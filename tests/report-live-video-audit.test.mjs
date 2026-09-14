@@ -307,11 +307,11 @@ describe('live video audit issue', () => {
 
     const summaryPath = join(dir, 'summary.md');
     await publish(report, { gh: fakeGh([]).gh, summaryPath });
-    assert.match(readFileSync(summaryPath, 'utf8'), /^- Not re-checked alone: 2 never-ready entries, because the audit time budget was used up$/m);
+    assert.match(readFileSync(summaryPath, 'utf8'), /^- Alone checks skipped: 2 stalled YouTube entries, because the audit time budget was used up$/m);
 
     const quietPath = join(dir, 'quiet.md');
     await publish(reportFor(baseCatalog), { gh: fakeGh([]).gh, summaryPath: quietPath });
-    assert.doesNotMatch(readFileSync(quietPath, 'utf8'), /Not re-checked alone/);
+    assert.doesNotMatch(readFileSync(quietPath, 'utf8'), /Alone checks skipped/);
   });
 
   it('counts an empty grid hotspot as "no entries configured", first, with the slot shown in its cell', async () => {
