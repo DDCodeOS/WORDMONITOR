@@ -103,7 +103,12 @@ export class CrossSourceSignalsPanel extends Panel {
   }
 
   public setData(data: CrossSourceSignalsData): void {
-    this.signals = data.signals ?? [];
+    // Defense in depth for bootstrap/raw payloads that bypass RPC normalize.
+    this.signals = (data.signals ?? []).filter(
+      (signal): signal is CrossSourceSignal => (
+        Boolean(signal) && typeof signal === 'object' && !Array.isArray(signal)
+      ),
+    );
     this.evaluatedAt = data.evaluatedAt ? new Date(data.evaluatedAt) : null;
     this.compositeCount = data.compositeCount ?? 0;
     this.setCount(this.signals.length);
