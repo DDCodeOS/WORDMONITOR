@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { describe, it } from 'node:test';
+import YAML from 'yaml';
 
 import { runCheck } from '../scripts/check-live-video-sources.mjs';
 import { ISSUE_TITLE, publishAudit } from '../scripts/report-live-video-audit.mjs';
@@ -331,5 +332,39 @@ if (process.argv.includes('--paginate')) {
     const missing = runReporter({ LIVE_VIDEO_AUDIT_REPORT: join(dir, 'missing.json') });
     assert.equal(missing.status, 1);
     assert.match(missing.stderr, /Live video audit could not report/);
+  });
+});
+
+describe('live video source audit workflow', () => {
+  const workflow = YAML.parse(readFileSync(new URL('../.github/workflows/live-video-source-audit.yml', import.meta.url), 'utf8'));
+
+  it('runs daily and on demand, never on pull requests or pushes', () => {
+    assert.deepEqual(Object.keys(workflow.on).sort(), ['schedule', 'workflow_dispatch']);
+    assert.deepEqual(workflow.on.schedule, [{ cron: '17 5 * * *' }]);
+    assert.deepEqual(workflow.permissions, { contents: 'read', issues: 'write' });
+    assert.equal(workflow.concurrency.group, 'live-video-source-audit');
+    assert.equal(workflow.concurrency['cancel-in-progress'], false);
+  });
+
+  it('checks every slot, then reports from the same file even when the check exits 1', () => {
+    const [job, ...others] = Object.values(workflow.jobs);
+    assert.deepEqual(others, []);
+    assert.equal(job['timeout-minutes'], 15);
+    const runs = job.steps.map((step) => step.run ?? '');
+    const install = runs.indexOf('npm ci --ignore-scripts');
+    const browser = runs.indexOf('npx playwright install --with-deps chromium');
+    const check = job.steps.findIndex((step) => /scripts\/check-live-video-sources\.mjs/.test(step.run ?? ''));
+    const report = job.steps.findIndex((step) => /scripts\/report-live-video-audit\.mjs/.test(step.run ?? ''));
+    assert.ok(install >= 0 && install < browser && browser < check && check < report, runs.join('\n'));
+
+    const checkStep = job.steps[check];
+    assert.equal(checkStep.run, 'node --import tsx scripts/check-live-video-sources.mjs --all --report "$RUNNER_TEMP/live-video-audit.json"');
+    assert.equal(checkStep['continue-on-error'], true, 'the checker exits 1 on findings; the reporter must still run');
+
+    const reportStep = job.steps[report];
+    assert.equal(reportStep.run, 'node --import tsx scripts/report-live-video-audit.mjs');
+    assert.equal(reportStep.env.LIVE_VIDEO_AUDIT_REPORT, '${{ runner.temp }}/live-video-audit.json');
+    assert.equal(reportStep.env.GH_TOKEN, '${{ github.token }}');
+    assert.equal(reportStep['continue-on-error'], undefined, 'a broken report or failed canaries must turn the run red');
   });
 });

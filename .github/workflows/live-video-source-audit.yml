@@ -1,0 +1,48 @@
+name: Live Video Source Audit
+
+# Curated webcam and Live News streams rot (ended, deleted, unembeddable). This keeps one issue
+# listing the slots that need a replacement, outside PR and deployment gates.
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: live-video-source-audit
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - run: npm ci --ignore-scripts
+
+      - run: npx playwright install --with-deps chromium
+
+      # Exits 1 whenever a slot needs attention, which is the normal case the reporter handles.
+      # A run that writes no report still fails the job at the reporter.
+      - name: Check every live video slot
+        id: check
+        continue-on-error: true
+        run: node --import tsx scripts/check-live-video-sources.mjs --all --report "$RUNNER_TEMP/live-video-audit.json"
+
+      # Findings become the issue. A missing or incomplete report, or canaries that fail twice
+      # (broken probing, not rot), fail this monitor visibly and leave the issue alone.
+      - name: Report slots needing a replacement
+        id: report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LIVE_VIDEO_AUDIT_REPORT: ${{ runner.temp }}/live-video-audit.json
+        run: node --import tsx scripts/report-live-video-audit.mjs
