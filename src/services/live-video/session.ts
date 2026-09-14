@@ -246,7 +246,7 @@ function mountYouTubeWeb(container: HTMLElement, candidate: YouTubeCandidate, co
         player?.destroy();
       } catch { /* the frame is removed below either way */ }
       player = null;
-      iframe.src = 'about:blank';
+      // Removing the frame discards its document, which stops playback.
       iframe.remove();
     },
   };
@@ -352,7 +352,6 @@ function mountYouTubeSidecar(container: HTMLElement, candidate: YouTubeCandidate
     destroy() {
       destroyed = true;
       window.removeEventListener('message', onMessage);
-      iframe.src = 'about:blank';
       iframe.remove();
     },
   };
