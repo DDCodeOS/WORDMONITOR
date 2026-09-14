@@ -7519,7 +7519,9 @@ async function seedSocialVelocity() {
         let postUrl;
         try {
           postUrl = new URL(p.permalink, 'https://reddit.com');
-          if (postUrl.origin !== 'https://reddit.com' || !postUrl.pathname.startsWith('/r/') || postUrl.href.length > 2048) continue;
+          if (postUrl.origin !== 'https://reddit.com'
+            || !/^\/r\/[A-Za-z0-9_]+\/comments\/[A-Za-z0-9]+(?:\/|$)/.test(postUrl.pathname)
+            || postUrl.href.length > 2048) continue;
         } catch { continue; }
         // Deduplicate cross-subreddit reposts of the same article URL.
         const articleUrl = p.url || '';

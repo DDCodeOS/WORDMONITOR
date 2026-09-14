@@ -12,7 +12,7 @@ const originalFetch = globalThis.fetch;
 const originalEnv = { ...process.env };
 const key = 'intelligence:social:reddit:v1';
 const post = { id: 'abc123', title: 'A report', subreddit: 'worldnews', url: 'https://reddit.com/r/worldnews/comments/abc123/a_report/', score: 10, upvoteRatio: 0.9, numComments: 2, velocityScore: 3.5, createdAt: 1700000000000 };
-const badUrls = ['https://reddit.com@attacker.example/r/x', 'https://reddit.com.attacker.example/r/x', 'javascript:alert(1)', 'https://reddit.com:8443/r/x', 'https://attacker.example', 'https://reddit.com/redirect'];
+const badUrls = ['https://reddit.com@attacker.example/r/x', 'https://reddit.com.attacker.example/r/x', 'javascript:alert(1)', 'https://reddit.com:8443/r/x', 'https://attacker.example', 'https://reddit.com/redirect', 'https://reddit.com/r/worldnews/', 'https://reddit.com/r/worldnews/comments/', 'https://reddit.com/r/worldnews/comments/abc123%2Fother'];
 async function read(value: unknown) {
   process.env.UPSTASH_REDIS_REST_URL = 'https://redis.example';
   process.env.UPSTASH_REDIS_REST_TOKEN = 'synthetic';
@@ -51,6 +51,21 @@ test('bounds posts and normalizes malformed scalar fields to the public shape', 
   assert.equal(result.fetchedAt, 0);
 });
 
+test('malformed leading rows do not consume the valid-post limit', async () => {
+  const valid = Array.from({ length: 40 }, (_, index) => ({ ...post, id: String(index) }));
+  const value = { posts: [...Array(30).fill(null), ...valid], fetchedAt: 123 };
+  const expected = { posts: valid.slice(0, 30), fetchedAt: 123 };
+  assert.deepEqual(await read(value), expected);
+  assert.deepEqual(sanitizeBootstrapValue('socialVelocity', value), expected);
+  const tool = TOOL_REGISTRY.find(t => t.name === 'get_social_velocity')!;
+  assert.deepEqual(tool._postFilter!({ reddit: value }, {}), { reddit: expected });
+  const payload = await assembleBootstrapTierPayload({ socialVelocity: key }, {
+    env: { UPSTASH_REDIS_REST_URL: 'https://redis.example', UPSTASH_REDIS_REST_TOKEN: 'synthetic' },
+    fetchFn: async () => Response.json([{ result: JSON.stringify(value) }]),
+  });
+  assert.deepEqual(payload, { data: { socialVelocity: expected }, missing: [] });
+});
+
 test('bootstrap and MCP sanitize the same cached posts while preserving missing data', async () => {
   const bad = { posts: [null, false, { ...post, extra: 'secret' }, ...badUrls.map(url => ({ ...post, url }))], fetchedAt: 123 };
   const expected = { posts: [post], fetchedAt: 123 };
@@ -77,7 +92,7 @@ test('real seeder publishes only Reddit permalinks and the reader accepts its ou
     setTimeout: (fn: () => void, ms: number) => { if (ms === 500) fn(); return 1; }, clearTimeout() {},
     fetchRedditHotListing: async () => ({ ok: true, posts: [
       { id: 'abc123', title: 'A report', permalink: '/r/worldnews/comments/abc123/a_report/', score: 10, upvote_ratio: 0.9, num_comments: 2, created_utc: 1700000000 },
-      ...['@attacker.example/r/x', '.attacker.example/r/x', '//attacker.example/r/x', '/r/../../redirect', '/r/worldnews\\..\\..\\redirect'].map(permalink => ({ id: 'bad', permalink })),
+      ...['@attacker.example/r/x', '.attacker.example/r/x', '//attacker.example/r/x', '/r/../../redirect', '/r/worldnews\\..\\..\\redirect', '/r/worldnews/', '/r/worldnews/comments/'].map(permalink => ({ id: 'bad', permalink })),
     ] }),
     envelopeWrite: async (_key: string, value: unknown) => { payload = value; return true; },
     upstashSet: async () => true, upstashExpire: async () => true,
