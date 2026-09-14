@@ -14,7 +14,7 @@ function relay() {
   let body = '[{"id":"one"},{"id":"two"}]';
   let destroyed = false;
   const context = {
-    URL, URLSearchParams, Date, Buffer, PORT: 3004, process: { env: {} },
+    URL, URLSearchParams, Date, Buffer, PORT: 3004, CHROME_UA: 'WorldMonitor-test', process: { env: {} },
     console: { log() {}, error() {} },
     sendCompressed: (_req, res, status, headers, data) => res.done({ status, headers, data }),
     safeEnd: (res, status, headers, data) => res.done({ status, headers, data }),
@@ -60,7 +60,7 @@ test('Edge forwards only canonical query fields', async () => {
   process.env.WS_RELAY_URL = 'https://relay.example';
   process.env.UPSTASH_REDIS_REST_URL = 'https://redis.example';
   process.env.UPSTASH_REDIS_REST_TOKEN = 'synthetic';
-  process.env.WORLDMONITOR_API_KEY = 'synthetic';
+  process.env.WORLDMONITOR_VALID_KEYS = 'synthetic';
   const calls = [];
   globalThis.fetch = async input => {
     const url = new URL(String(input));
@@ -72,6 +72,15 @@ test('Edge forwards only canonical query fields', async () => {
   assert.equal(response.status, 200);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].search, '?endpoint=markets&closed=false&order=volume&ascending=false&limit=100');
+  for (const status of [200, 502]) {
+    globalThis.fetch = async input => String(input).includes('redis.example')
+      ? Response.json([{ result: [29, 30] }])
+      : Response.json(status === 200 ? [] : { error: 'unavailable' }, { status, headers: { 'Cache-Control': 'no-store' } });
+    const response = await handler(new Request('https://worldmonitor.app/api/polymarket', { headers: { 'X-WorldMonitor-Key': 'synthetic' } }));
+    assert.equal(response.status, status);
+    assert.equal(response.headers.get('Cache-Control'), 'no-store');
+    assert.equal(response.headers.get('CDN-Cache-Control'), 'no-store');
+  }
 });
 test('oversized and malformed responses fail without becoming successful cached empties', async () => {
   for (const body of ['x'.repeat(2 * 1024 * 1024 + 1), '{"error":"bad"}', 'invalid json']) {
@@ -93,4 +102,24 @@ test('distinct event tags cannot grow the relay cache beyond its entry bound', a
   const app = relay();
   for (let i = 0; i < 80; i++) await app.request({ endpoint: 'events', tag: `topic-${i}` });
   assert.equal(app.cache.size, 64);
+});
+
+test('oversized refresh retains valid stale data and a cold failure recovers after backoff', async () => {
+  const app = relay();
+  const first = await app.request({});
+  const cached = [...app.cache.values()][0];
+  cached.timestamp -= 600001;
+  app.setBody('x'.repeat(2 * 1024 * 1024 + 1));
+  const stale = await app.request({});
+  assert.equal(stale.status, 200);
+  assert.equal(stale.data, first.data);
+  assert.equal(stale.headers['X-Cache'], 'STALE');
+  assert.equal([...app.cache.values()][0].data, first.data);
+  const cold = relay();
+  cold.setBody('invalid');
+  assert.equal((await cold.request({})).status, 502);
+  [...cold.cache.values()][0].timestamp -= 600001;
+  cold.setBody('[]');
+  assert.equal((await cold.request({})).status, 200);
+  assert.equal((await cold.request({})).data, '[]');
 });

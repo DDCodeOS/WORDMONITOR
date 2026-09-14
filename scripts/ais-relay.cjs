@@ -10985,6 +10985,16 @@ const polymarketCache = new Map(); // key: query string → { data, timestamp }
 const polymarketInflight = new Map(); // key → Promise (dedup concurrent requests)
 const POLYMARKET_CACHE_TTL_MS = 10 * 60 * 1000; // 10 min — reduce upstream pressure
 const POLYMARKET_NEG_TTL_MS = 5 * 60 * 1000; // 5 min negative cache on 429/error
+const POLYMARKET_MAX_BODY_BYTES = 2 * 1024 * 1024;
+const POLYMARKET_MAX_CACHE_ENTRIES = 64;
+
+function cachePolymarketResult(key, entry) {
+  polymarketCache.delete(key);
+  while (polymarketCache.size >= POLYMARKET_MAX_CACHE_ENTRIES) {
+    polymarketCache.delete(polymarketCache.keys().next().value);
+  }
+  polymarketCache.set(key, entry);
+}
 
 // Circuit breaker — stops upstream requests after repeated failures to prevent OOM
 const polymarketCircuitBreaker = { failures: 0, openUntil: 0 };
@@ -11028,7 +11038,9 @@ function acquirePolymarketSlot() {
 function fetchPolymarketUpstream(cacheKey, endpoint, params, tag) {
   return acquirePolymarketSlot().catch(() => 'REJECTED').then((slotResult) => {
     if (slotResult === 'REJECTED') {
-      polymarketCache.set(cacheKey, { data: '[]', timestamp: Date.now() - POLYMARKET_CACHE_TTL_MS + POLYMARKET_NEG_TTL_MS });
+      if (!polymarketCache.get(cacheKey)?.data) {
+        cachePolymarketResult(cacheKey, { data: null, timestamp: Date.now() - POLYMARKET_CACHE_TTL_MS + POLYMARKET_NEG_TTL_MS });
+      }
       return null;
     }
     const gammaUrl = `https://gamma-api.polymarket.com/${endpoint}?${params}`;
@@ -11044,11 +11056,13 @@ function fetchPolymarketUpstream(cacheKey, endpoint, params, tag) {
           polymarketCircuitBreaker.failures = 0;
         } else {
           tripPolymarketCircuitBreaker();
-          polymarketCache.set(cacheKey, { data: '[]', timestamp: Date.now() - POLYMARKET_CACHE_TTL_MS + POLYMARKET_NEG_TTL_MS });
+          if (!polymarketCache.get(cacheKey)?.data) {
+            cachePolymarketResult(cacheKey, { data: null, timestamp: Date.now() - POLYMARKET_CACHE_TTL_MS + POLYMARKET_NEG_TTL_MS });
+          }
         }
       }
       const request = https.get(gammaUrl, {
-        headers: { 'Accept': 'application/json' },
+        headers: { 'Accept': 'application/json', 'User-Agent': CHROME_UA },
         timeout: 10000,
       }, (response) => {
         if (response.statusCode !== 200) {
@@ -11059,10 +11073,30 @@ function fetchPolymarketUpstream(cacheKey, endpoint, params, tag) {
           return;
         }
         let data = '';
-        response.on('data', chunk => data += chunk);
+        let bytes = 0;
+        response.on('data', chunk => {
+          if (finalized) return;
+          bytes += Buffer.byteLength(chunk);
+          if (bytes > POLYMARKET_MAX_BODY_BYTES) {
+            finalize(false);
+            response.destroy();
+            request.destroy();
+            resolve(null);
+            return;
+          }
+          data += chunk;
+        });
         response.on('end', () => {
+          if (finalized) return;
+          try {
+            if (!Array.isArray(JSON.parse(data))) throw new Error('Expected market list');
+          } catch {
+            finalize(false);
+            resolve(null);
+            return;
+          }
           finalize(true);
-          polymarketCache.set(cacheKey, { data, timestamp: Date.now() });
+          cachePolymarketResult(cacheKey, { data, timestamp: Date.now() });
           resolve(data);
         });
         response.on('error', () => { finalize(false); resolve(null); });
@@ -11094,16 +11128,17 @@ function handlePolymarketRequest(req, res) {
   // query-string ordering, tag vs tag_slug alias, or varying limit values.
   // Cache key excludes limit — always fetch upstream with limit=50, slice on serve.
   // This prevents cache fragmentation from different callers (limit=20 vs limit=30).
-  const endpoint = url.searchParams.get('endpoint') || 'markets';
+  const endpoint = url.searchParams.get('endpoint') === 'events' ? 'events' : 'markets';
   const requestedLimit = Math.max(1, Math.min(100, parseInt(url.searchParams.get('limit') || '50', 10) || 50));
   const upstreamLimit = 50; // canonical upstream limit for cache sharing
   const params = new URLSearchParams();
-  params.set('closed', url.searchParams.get('closed') || 'false');
-  params.set('order', url.searchParams.get('order') || 'volume');
-  params.set('ascending', url.searchParams.get('ascending') || 'false');
+  params.set('closed', url.searchParams.get('closed') === 'true' ? 'true' : 'false');
+  const order = url.searchParams.get('order');
+  params.set('order', ['volume', 'liquidity', 'startDate', 'endDate', 'spread'].includes(order) ? order : 'volume');
+  params.set('ascending', url.searchParams.get('ascending') === 'true' ? 'true' : 'false');
   params.set('limit', String(upstreamLimit));
-  const tag = url.searchParams.get('tag') || url.searchParams.get('tag_slug');
-  if (tag && endpoint === 'events') params.set('tag_slug', tag.replace(/[^a-z0-9-]/gi, '').slice(0, 100));
+  const tag = (url.searchParams.get('tag') || url.searchParams.get('tag_slug') || '').replace(/[^a-z0-9-]/gi, '').slice(0, 100);
+  if (tag && endpoint === 'events') params.set('tag_slug', tag);
 
   const cacheKey = endpoint + ':' + params.toString();
 
@@ -11118,6 +11153,7 @@ function handlePolymarketRequest(req, res) {
 
   const cached = polymarketCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < POLYMARKET_CACHE_TTL_MS) {
+    if (cached.data === null) return safeEnd(res, 502, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }, JSON.stringify({ error: 'Polymarket upstream unavailable' }));
     return sendCompressed(req, res, 200, {
       'Content-Type': 'application/json',
       'Cache-Control': 'public, max-age=600',
@@ -11127,9 +11163,8 @@ function handlePolymarketRequest(req, res) {
     }, sliceToLimit(cached.data));
   }
 
-  // Circuit breaker open — serve stale cache or empty, skip upstream
   if (Date.now() < polymarketCircuitBreaker.openUntil) {
-    if (cached) {
+    if (cached?.data) {
       return sendCompressed(req, res, 200, {
         'Content-Type': 'application/json',
         'Cache-Control': 'no-store',
@@ -11138,7 +11173,7 @@ function handlePolymarketRequest(req, res) {
         'X-Polymarket-Source': 'railway-stale',
       }, cached.data);
     }
-    return safeEnd(res, 200, { 'Content-Type': 'application/json', 'X-Circuit': 'OPEN' }, JSON.stringify([]));
+    return safeEnd(res, 503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Circuit': 'OPEN' }, JSON.stringify({ error: 'Polymarket upstream unavailable' }));
   }
 
   let inflight = polymarketInflight.get(cacheKey);
@@ -11158,7 +11193,7 @@ function handlePolymarketRequest(req, res) {
         'X-Cache': 'MISS',
         'X-Polymarket-Source': 'railway',
       }, sliceToLimit(data));
-    } else if (cached) {
+    } else if (cached?.data) {
       sendCompressed(req, res, 200, {
         'Content-Type': 'application/json',
         'Cache-Control': 'no-store',
@@ -11167,7 +11202,7 @@ function handlePolymarketRequest(req, res) {
         'X-Polymarket-Source': 'railway-stale',
       }, sliceToLimit(cached.data));
     } else {
-      safeEnd(res, 200, { 'Content-Type': 'application/json' }, JSON.stringify([]));
+      safeEnd(res, 502, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }, JSON.stringify({ error: 'Polymarket upstream unavailable' }));
     }
   });
 }
