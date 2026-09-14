@@ -392,6 +392,8 @@ async function probeRows(rows, { probeYouTube, probeHls }) {
 // A manifest that answers 403/451 or times out, or a player API that never loaded, can depend on
 // where the check runs (region, network), so the audit cannot call the entry dead from there.
 const RUNNER_BLOCKED_HLS_STATUSES = new Set([403, 451]);
+// fetch reports a connection or read timeout as a failure code, not as the probe's own deadline.
+const NETWORK_TIMEOUT_CODES = new Set(['UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'ETIMEDOUT']);
 
 function unverifiableFromRunner(row) {
   if (!row.parsed.ok) return false;
@@ -400,7 +402,9 @@ function unverifiableFromRunner(row) {
   if (verdict.verdict === 'unverifiable') return verdict.reason !== 'player-api-silent';
   if (verdict.verdict !== 'failed' || row.parsed.candidate.kind !== 'hls') return false;
   const { outcome } = verdict;
-  return outcome.kind === 'timeout' || (outcome.kind === 'hls-http' && RUNNER_BLOCKED_HLS_STATUSES.has(outcome.status));
+  return outcome.kind === 'timeout'
+    || (outcome.kind === 'hls-http' && RUNNER_BLOCKED_HLS_STATUSES.has(outcome.status))
+    || (outcome.kind === 'hls-fatal' && NETWORK_TIMEOUT_CODES.has(outcome.detail));
 }
 
 /** One checked entry as the audit report records it: the verdict, why, and the evidence behind it. */

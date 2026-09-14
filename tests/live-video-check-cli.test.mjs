@@ -508,6 +508,26 @@ describe('audit report (--all --report)', () => {
     ]);
   });
 
+  it('counts an HLS network timeout as unverifiable from the runner, and a host that is gone as dead', async () => {
+    const hlsOnly = { webcams: {}, gridPriority: [], news: { bloomberg: [BLOOMBERG_HLS] }, canaries: [CANARY] };
+    const failWith = (detail) => async (candidates) => candidates.map(() => ({ verdict: { verdict: 'failed', outcome: { kind: 'hls-fatal', detail } } }));
+    const cases = [
+      ['UND_ERR_CONNECT_TIMEOUT', true],
+      ['UND_ERR_HEADERS_TIMEOUT', true],
+      ['UND_ERR_BODY_TIMEOUT', true],
+      ['ETIMEDOUT', true],
+      ['ENOTFOUND', false],
+      ['ECONNREFUSED', false],
+      ['not an HLS media playlist', false],
+    ];
+    for (const [detail, unverifiable] of cases) {
+      const { writes: [{ report }] } = await audit(['--all', '--report', 'audit.json'], { catalog: hlsOnly, probeHls: failWith(detail) });
+      const [slot] = report.slots;
+      assert.equal(slot.attempts[0].unverifiableFromRunner, unverifiable, detail);
+      assert.equal(slot.status, unverifiable ? 'unverifiable-from-runner' : 'needs-replacement', detail);
+    }
+  });
+
   it('fails before probing when a slot has no place on the dashboard', async () => {
     let probed = false;
     const unplaced = { ...surfaces, webcamFeeds: surfaces.webcamFeeds.filter((feed) => feed.id !== 'sydney') };
