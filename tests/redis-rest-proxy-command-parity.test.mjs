@@ -294,8 +294,13 @@ describe('redis-rest-proxy command gate', () => {
 
   it('pins the webhook owner-index remove-expired script by exact bytes', () => {
     const gate = buildGate();
-    // Must match server/worldmonitor/shipping/v2/webhook-owner-index.ts REMOVE_EXPIRED_MEMBER.
-    const script = "if redis.call('EXISTS', KEYS[2]) == 0 then return redis.call('SREM', KEYS[1], ARGV[1]) else return 0 end";
+    const ownerIndexSrc = readFileSync(
+      resolve(repoRoot, 'server/worldmonitor/shipping/v2/webhook-owner-index.ts'),
+      'utf8',
+    );
+    const match = ownerIndexSrc.match(/const REMOVE_EXPIRED_MEMBER = "([^"]+)";/);
+    assert.ok(match, 'webhook-owner-index.ts must define REMOVE_EXPIRED_MEMBER');
+    const script = match[1];
     assert.equal(gate.ALLOWED_EVAL_SCRIPTS.has(script), true);
     assert.equal(accepts(gate, ['EVAL', script, '2', 'owner', 'record']), true);
     assert.equal(
