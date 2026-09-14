@@ -100,7 +100,7 @@ export async function fetchArxivPapers({ fetchFn = fetch, retries = 1, sleepFn =
 
 // ─── Hacker News ───
 
-async function fetchHackerNews() {
+export async function fetchHackerNews() {
   const feeds = ['top', 'best'];
   const results = {};
 
