@@ -899,10 +899,11 @@ paths:
             tags:
                 - AviationService
             summary: GetYoutubeLiveStreamInfo
-            description: 'GetYoutubeLiveStreamInfo names a YouTube video (title and channel name) through YouTube oEmbed. Deprecated: channel live detection is retired, so a channel-only query returns error "channel_live_detection_retired".'
+            description: 'GetYoutubeLiveStreamInfo names a YouTube video (title and channel name) through YouTube oEmbed. Channel live detection is retired: a channel-only query returns error "channel_live_detection_retired", and the channel, is_live and hls_url fields are deprecated.'
             operationId: GetYoutubeLiveStreamInfo
             parameters:
                 - name: channel
+                  deprecated: true
                   in: query
                   description: 'Deprecated: YouTube channel handle or ID. Channel live detection is retired; a channel-only query returns error "channel_live_detection_retired".'
                   required: false
@@ -37456,6 +37457,7 @@ components:
             type: object
             properties:
                 channel:
+                    deprecated: true
                     type: string
                     description: 'Deprecated: YouTube channel handle or ID. Channel live detection is retired; a channel-only query returns error "channel_live_detection_retired".'
                 videoId:
@@ -37469,6 +37471,7 @@ components:
                     type: string
                     description: Video ID that was looked up.
                 isLive:
+                    deprecated: true
                     type: boolean
                     description: 'Always false: oEmbed does not report whether a video is live.'
                 channelExists:
@@ -37478,6 +37481,7 @@ components:
                     type: string
                     description: Human-readable channel name.
                 hlsUrl:
+                    deprecated: true
                     type: string
                     description: 'Always empty: YouTube manifest URLs are no longer returned.'
                 title:
