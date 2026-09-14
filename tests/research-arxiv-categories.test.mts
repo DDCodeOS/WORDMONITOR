@@ -59,3 +59,16 @@ test('partial cache misses remain no-store while valid empty snapshots are disti
   assert.deepEqual(await listArxivPapers(emptyCtx, req('cs.AI')), { papers: [], pagination: undefined });
   assert.equal(drainResponseHeaders(emptyCtx.request), undefined);
 });
+
+test('malformed and failed sibling snapshots do not discard available papers', async () => {
+  globalThis.fetch = async (url) => {
+    const key = decodeURIComponent(String(url).split('/get/')[1]);
+    if (key.includes('cs.CL')) throw new Error('fixture network failure');
+    if (key.includes('cs.CR')) return Response.json({ result: '{' });
+    return Response.json({ result: JSON.stringify({ papers: [null, { id: 'available', publishedAt: 20 }] }) });
+  };
+  const context = ctx();
+  const response = await listArxivPapers(context, req());
+  assert.deepEqual(response.papers.map((paper) => paper.id), ['available']);
+  assert.equal(drainResponseHeaders(context.request)?.['X-No-Cache'], '1');
+});

@@ -8,6 +8,8 @@
  * - listTrendingRepos (python, javascript, typescript daily)
  */
 
+import ARXIV_CATEGORIES from './shared/research-arxiv-categories.json' with { type: 'json' };
+
 import { loadEnvFile, CHROME_UA, runSeed, writeExtraKeyWithMeta, sleep } from './_seed-utils.mjs';
 
 loadEnvFile(import.meta.url);
@@ -25,7 +27,6 @@ const TRENDING_TTL = 3600;
 
 // ─── arXiv Papers ───
 
-const ARXIV_CATEGORIES = ['cs.AI', 'cs.CL', 'cs.CR'];
 
 // Parse arXiv Atom XML into paper records. Pure — split out so the fetch path stays testable.
 function parseArxivEntries(xml) {
