@@ -908,6 +908,30 @@ The detection of a sharp collapse in a waterway's daily transit counts against i
 
 The comparison needs enough accumulated history to be meaningful and is suppressed below a baseline traffic floor, so a quiet waterway reports no signal rather than a dramatic percentage of a tiny number. See also: Disruption Score, Score Input.
 
+## Live Media
+
+### Live Detection
+
+Working out which broadcast a news channel is airing at the moment a viewer asks, instead of trusting an identifier recorded when the channel was added. A channel with its own stream address plays that first; detection runs when there is none or it fails, and a Fallback Stream plays when detection returns nothing.
+
+Broken detection does not look broken on the dashboard. An empty answer cannot be told apart from "this channel is not live right now", so every channel that depends on detection quietly falls through to its Fallback Stream at once, and the only visible symptom is pinned broadcasts playing ended or unrelated video. Detection health must be checked against channels known to be live, never inferred from the absence of errors. See also: Fallback Stream.
+
+### Fallback Stream
+
+A specific broadcast identifier pinned to a channel or camera and played when Live Detection yields nothing. Webcam tiles play only their Fallback Streams. News channels marked to skip detection play their own stream address when they have one, otherwise their Fallback Stream, and never run Live Detection.
+
+A Fallback Stream decays with no code change. The provider ends the broadcast, restarts it under a new identifier, deletes it, or reassigns it, and the pinned identifier then plays an error card, a years-old recording under a live label, or another channel's content. For news channels that run detection, a dead Fallback Stream stays hidden until Live Detection fails, and then every dead one surfaces together. Keeping them honest takes a recurring liveness check against the provider, not code review. See also: Live Detection.
+
+### Idle Pause
+
+The dashboard's resource-saving stop after a stretch with no pointer, keyboard, scroll, or touch input. Live news and webcam playback end, live news returns to its Play prompt, webcams show a paused message, and page animation freezes. The next input resumes whatever playback the pause interrupted.
+
+The pause keys on input, not on whether anyone is watching. A dashboard left running on an unattended display therefore goes dark a fixed interval after the last touch, which reads to that viewer as the product failing rather than saving power. See also: Always-On Playback.
+
+### Always-On Playback
+
+A viewer preference that starts live news and webcams as soon as their panels are visible instead of waiting for Play. It also exempts those panels from the Idle Pause, which makes it the only way to keep video running on an unattended display; page animation still freezes. See also: Idle Pause.
+
 ## Flagged ambiguities
 
 - *"Pool"* had been used for both a labelled market category and the complete set of markets — these are distinct. A pool is always a labelled subset; the complete set has no pool and must be requested as an explicit union.
