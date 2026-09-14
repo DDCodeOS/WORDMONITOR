@@ -39,9 +39,9 @@ describe('sanitizeCrossSourceSignalsPayload (bootstrap hydrate)', () => {
 
   it('coerces non-finite numerics to zero for panel-safe hydration', () => {
     const sanitized = sanitizeCrossSourceSignalsPayload({
-      signals: [{ severityScore: Number.POSITIVE_INFINITY, detectedAt: Number.NaN, signalCount: 1e400 }],
+      signals: [{ severityScore: Number.POSITIVE_INFINITY, detectedAt: Number.NaN, signalCount: Number.POSITIVE_INFINITY }],
       evaluatedAt: Number.POSITIVE_INFINITY,
-      compositeCount: -1e400,
+      compositeCount: Number.NEGATIVE_INFINITY,
     });
 
     assert.deepEqual(sanitized, {
