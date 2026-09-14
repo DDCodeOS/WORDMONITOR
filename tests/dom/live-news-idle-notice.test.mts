@@ -170,6 +170,17 @@ describe('Live News idle stop', () => {
     expect(content().textContent).toContain('Ready when you are');
   });
 
+  it('does not stop or explain a native video the viewer paused', () => {
+    const mounted = mount();
+    playFromPlaceholder();
+    (mounted as unknown as { isPlaying: boolean }).isPlaying = false;
+
+    vi.advanceTimersByTime(2 * HOUR);
+
+    expect(getActiveLiveMedia('live-news')).not.toBeNull();
+    expect(notice()).toBeNull();
+  });
+
   it('never idle-stops fullscreen playback', () => {
     const mounted = mount();
     playFromPlaceholder();

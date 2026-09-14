@@ -700,7 +700,7 @@ export class LiveNewsPanel extends Panel {
 
 
   private stopForIdle(idleAfterMs: number): void {
-    if (this.isFullscreen || !getActiveLiveMedia('live-news')) return;
+    if (this.isFullscreen || !this.isPlaying || !getActiveLiveMedia('live-news')) return;
     this.idleStoppedAfterMs = idleAfterMs;
     trackLiveMediaIdleStop('live-news', idleAfterMs);
     stopLiveMediaPlayback('live-news', 'idle');
