@@ -85,6 +85,39 @@ afterEach(() => {
 });
 
 describe('reverse-geocode shared cache contract', () => {
+  for (const failure of ['fetch', 'json', 'http']) {
+    it(`returns a fixed error for ${failure} failures and permits recovery`, async () => {
+      configurePreviewRedis();
+      let fail = true;
+      let writes = 0;
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes('/get/')) return json({ result: null });
+        if (url.endsWith('/pipeline')) return allowLimiter(init);
+        if (url === 'https://redis.example.test/') {
+          writes++;
+          return json({ result: 'OK' });
+        }
+        assert.match(url, /^https:\/\/nominatim\.openstreetmap\.org\/reverse\?/);
+        if (fail) {
+          if (failure === 'fetch') throw new Error('synthetic private transport detail');
+          if (failure === 'json') return new Response('synthetic private response body');
+          return new Response('synthetic provider failure', { status: 503 });
+        }
+        return json({ address: { country: 'Canada', country_code: 'ca' } });
+      }) as typeof fetch;
+      assert.deepEqual(await reverseGeocode(context, { lat: 49, lon: -97 }), {
+        country: '', code: '', displayName: '', error: 'Nominatim request failed',
+      });
+      assert.equal(writes, 0);
+      fail = false;
+      assert.deepEqual(await reverseGeocode(context, { lat: 49, lon: -97 }), {
+        country: 'Canada', code: 'CA', displayName: 'Canada', error: '',
+      });
+      assert.equal(writes, 1);
+    });
+  }
+
   it('reads the edge route deployment-scoped key in preview and normalizes its value', async () => {
     configurePreviewRedis();
     const urls: string[] = [];
