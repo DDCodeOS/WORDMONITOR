@@ -624,6 +624,7 @@ if (urlParams.get('settings') === '1') {
 } else {
   installUtmInterceptor();
   markLcpDebug('wm:boot:app-construct');
+  // Import and constructor failures must reach the global startup error monitors.
   void import('./App').then(({ App }) => {
     const app = new App('app');
     app
@@ -644,8 +645,6 @@ if (urlParams.get('settings') === '1') {
           console.error('[App] Failed to clean up after initialization failure:', cleanupError);
         }
       });
-  }).catch((error: unknown) => {
-    console.error(error);
   });
 }
 

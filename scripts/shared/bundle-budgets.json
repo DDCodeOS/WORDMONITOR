@@ -7,95 +7,51 @@
   "totalTolerancePct": 0.25,
   "totalToleranceBytes": 16384,
   "total": {
-    "raw": 1755552
+    "raw": 292990
   },
   "chunks": {
     "analytics": {
-      "raw": 133239,
-      "files": 1
-    },
-    "cached-risk-scores": {
-      "raw": 24604,
+      "raw": 132393,
       "files": 1
     },
     "clerk": {
-      "raw": 18223,
+      "raw": 18618,
       "files": 1
     },
-    "continuous": {
-      "raw": 4933,
-      "files": 1
-    },
-    "cross-domain-storage": {
-      "raw": 415,
-      "files": 1
-    },
-    "data-freshness": {
-      "raw": 85940,
+    "debugbear-rum": {
+      "raw": 2675,
       "files": 1
     },
     "dom-utils": {
-      "raw": 3856,
-      "files": 1
-    },
-    "embed-url": {
-      "raw": 63771,
+      "raw": 3140,
       "files": 1
     },
     "font-settings": {
-      "raw": 1440,
+      "raw": 862,
       "files": 1
     },
-    "gdelt-intel": {
-      "raw": 133788,
+    "geo-convergence": {
+      "raw": 10076,
+      "files": 1
+    },
+    "geo-distance": {
+      "raw": 28869,
+      "files": 1
+    },
+    "globe-marker-probe": {
+      "raw": 829,
       "files": 1
     },
     "i18n": {
-      "raw": 52460,
-      "files": 1
-    },
-    "layout-batch": {
-      "raw": 17352,
+      "raw": 52848,
       "files": 1
     },
     "main": {
-      "raw": 985080,
-      "files": 1
-    },
-    "panel-gating": {
-      "raw": 3144,
-      "files": 1
-    },
-    "panels": {
-      "raw": 147801,
-      "files": 1
-    },
-    "persistent-cache": {
-      "raw": 3697,
-      "files": 1
-    },
-    "storage-facility-registry-store": {
-      "raw": 14203,
-      "files": 1
-    },
-    "string": {
-      "raw": 20823,
+      "raw": 40809,
       "files": 1
     },
     "theme-manager": {
-      "raw": 1474,
-      "files": 1
-    },
-    "timeout-signal": {
-      "raw": 776,
-      "files": 1
-    },
-    "user-location": {
-      "raw": 12676,
-      "files": 1
-    },
-    "widget-store": {
-      "raw": 25857,
+      "raw": 1871,
       "files": 1
     }
   }
