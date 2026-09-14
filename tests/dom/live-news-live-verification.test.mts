@@ -70,7 +70,7 @@ vi.mock('@/config/live-video-sources', async (importOriginal) => {
 
 const HOUR = 60 * 60_000;
 const POLL = LIVE_VIDEO_TIMING.pollMs;
-const RECORDING_VERDICT_MS = LIVE_VIDEO_TIMING.durationGrowthWindowMs + 3 * LIVE_VIDEO_TIMING.pollMs;
+const RECORDING_VERDICT_MS = LIVE_VIDEO_TIMING.recordingConfirmMs + 3 * LIVE_VIDEO_TIMING.pollMs;
 const BLOOMBERG_HLS = 'https://streams.example/bloomberg/live.m3u8';
 
 class FakeIntersectionObserver {
@@ -172,6 +172,20 @@ async function playFromPlaceholder(): Promise<void> {
   await flush();
 }
 
+function mediaVideo(): HTMLVideoElement {
+  const video = content().querySelector<HTMLVideoElement>('video.live-news-media');
+  if (!video) throw new Error('no HLS video element mounted');
+  return video;
+}
+
+/** A live playlist counts as live only once the media clock has played a full second. */
+async function playHlsLive(): Promise<void> {
+  latestHls().emit('hlsLevelLoaded', { details: { live: true } });
+  await flush(POLL);
+  mediaVideo().currentTime += 1;
+  await flush(POLL);
+}
+
 let clock = Date.UTC(2030, 0, 1);
 
 beforeAll(async () => {
@@ -221,8 +235,12 @@ describe('Live News live verification', () => {
     expect(latestHls().url).toBe(BLOOMBERG_HLS);
     expect(status()?.textContent).toBe('Connecting to Bloomberg…');
 
+    // A live playlist alone is not enough: the media clock has to play a full second.
     latestHls().emit('hlsLevelLoaded', { details: { live: true } });
-    await flush(POLL);
+    await flush(LIVE_VIDEO_TIMING.pollMs);
+    expect(status()?.textContent).toBe('Connecting to Bloomberg…');
+    mediaVideo().currentTime += 1;
+    await flush(LIVE_VIDEO_TIMING.pollMs);
 
     expect(status()).toBeNull();
     expect(channelButton('bloomberg').classList.contains('offline')).toBe(false);
@@ -248,8 +266,7 @@ describe('Live News live verification', () => {
   it('explains why an explicitly chosen channel is offline and offers Retry, the next channel and YouTube', async () => {
     mount(['bloomberg', 'cnn']);
     await playFromPlaceholder();
-    latestHls().emit('hlsLevelLoaded', { details: { live: true } });
-    await flush(POLL);
+    await playHlsLive();
 
     channelButton('cnn').click();
     await flush();
@@ -345,8 +362,7 @@ describe('Live News live verification', () => {
   it('leaves a stream the viewer paused alone at the idle stop', async () => {
     mount(['bloomberg']);
     await playFromPlaceholder();
-    latestHls().emit('hlsLevelLoaded', { details: { live: true } });
-    await flush(POLL);
+    await playHlsLive();
 
     content().querySelector('video.live-news-media')?.dispatchEvent(new Event('pause'));
     await flush(2 * HOUR);
@@ -385,8 +401,7 @@ describe('Live News live verification', () => {
     catalog.news.cnn = [];
     mount(['bloomberg', 'cnn']);
     await playFromPlaceholder();
-    latestHls().emit('hlsLevelLoaded', { details: { live: true } });
-    await flush(POLL);
+    await playHlsLive();
 
     channelButton('cnn').click();
     await flush();
@@ -400,8 +415,7 @@ describe('Live News live verification', () => {
   it('keeps focus on a channel button while its stream connects and ignores repeat clicks', async () => {
     mount(['bloomberg', 'cnn']);
     await playFromPlaceholder();
-    latestHls().emit('hlsLevelLoaded', { details: { live: true } });
-    await flush(POLL);
+    await playHlsLive();
 
     const cnn = channelButton('cnn');
     cnn.focus();
@@ -450,8 +464,7 @@ describe('Live News live verification', () => {
     localStorage.setItem('wm-live-media-idle-stop', '60');
     mount(['bloomberg']);
     await playFromPlaceholder();
-    latestHls().emit('hlsLevelLoaded', { details: { live: true } });
-    await flush(POLL);
+    await playHlsLive();
 
     await flush(HOUR);
     expect(content().querySelector('.live-media-shell--idle')).not.toBeNull();
@@ -465,5 +478,27 @@ describe('Live News live verification', () => {
     expect(hlsState.instances.length + api().players.length).toBe(loads);
     expect(getActiveLiveMedia('live-news')).toBeNull();
     expect(content().querySelector('.live-media-shell--idle')).not.toBeNull();
+  });
+
+  it('never clears the cover for a live playlist that does not play, and falls through to the next entry', async () => {
+    mount(['bloomberg']);
+    await playFromPlaceholder();
+    // hls.js reports a live playlist, but the media clock never moves (a codec the browser cannot decode).
+    latestHls().emit('hlsLevelLoaded', { details: { live: true } });
+
+    for (let elapsed = POLL; elapsed < LIVE_VIDEO_TIMING.verdictDeadlineMs; elapsed += POLL) {
+      await flush(POLL);
+      expect(status()?.textContent).toBe('Connecting to Bloomberg…');
+    }
+    await flush(POLL);
+
+    expect(content().querySelector('video.live-news-media')).toBeNull();
+    const player = api().playerFor('Bloomberg live feed');
+    expect(player.embeddedVideoId).toBe('QB5BNdBFujE');
+    expect(status()?.textContent).toBe('Connecting to Bloomberg…');
+
+    player.goLive();
+    await flush(POLL);
+    expect(status()).toBeNull();
   });
 });
