@@ -116,6 +116,7 @@ export class CrossSourceSignalsPanel extends Panel {
   }
 
   private ageSuffix(ts: number): string {
+    if (!Number.isFinite(ts) || ts <= 0) return 'time unknown';
     const diffMs = Date.now() - ts;
     const mins = Math.floor(diffMs / 60000);
     if (mins < 2) return 'just now';
