@@ -241,7 +241,7 @@ describe('correlation snapshot recovery', () => {
     expect(result.latest().snapshot).toEqual({ cards: [], computedAt: NOW - MINUTE, origin: 'seed' });
     service.publishLocalCorrelationCards('economic', [card('economic', 'Partial local inputs')]);
     expect(result.latest().snapshot?.cards).toEqual([]);
-    expect(mocks.write.mock.calls.at(-1)?.[1].economic.cards).toEqual([]);
+    expect(mocks.write.mock.calls[mocks.write.mock.calls.length - 1]?.[1].economic.cards).toEqual([]);
 
     mocks.fetch.mockResolvedValue(undefined);
     await vi.advanceTimersByTimeAsync(15 * MINUTE);
