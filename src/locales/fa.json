@@ -2701,7 +2701,14 @@
       "signals_one": "{{count}} signal",
       "signals_other": "{{count}} signals",
       "analyzing": "Analyzing...",
-      "viewOnMap": "View on map"
+      "viewOnMap": "View on map",
+      "waiting": "در انتظار به‌روزرسانی بعدی داده‌ها. این پنل به‌طور خودکار به‌روزرسانی می‌شود.",
+      "offline": "در انتظار اتصال. این پنل پس از اتصال دوباره به اینترنت به‌طور خودکار به‌روزرسانی می‌شود.",
+      "updated": "به‌روزرسانی‌شده {{time}}",
+      "saved": "آخرین به‌روزرسانی شناخته‌شده {{time}} · در حال بررسی به‌روزرسانی‌ها",
+      "savedOffline": "آخرین به‌روزرسانی شناخته‌شده {{time}} · آفلاین",
+      "localSignals": "بر اساس سیگنال‌های بارگذاری‌شده در داشبورد",
+      "emptySaved": "در آخرین به‌روزرسانی شناخته‌شده همگرایی وجود نداشت."
     },
     "thermalEscalation": {
       "title": "Thermal Escalation",

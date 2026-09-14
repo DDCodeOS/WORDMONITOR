@@ -2657,7 +2657,14 @@
       "analyzing": "Analiza...",
       "viewOnMap": "Wyświetl na mapie",
       "signals_few": "{{count}} sygnały",
-      "signals_many": "{{count}} sygnałów"
+      "signals_many": "{{count}} sygnałów",
+      "waiting": "Oczekiwanie na kolejną aktualizację danych. Ten panel aktualizuje się automatycznie.",
+      "offline": "Oczekiwanie na połączenie. Ten panel zaktualizuje się automatycznie po przywróceniu połączenia.",
+      "updated": "Zaktualizowano {{time}}",
+      "saved": "Ostatnia znana aktualizacja {{time}} · Sprawdzanie aktualizacji",
+      "savedOffline": "Ostatnia znana aktualizacja {{time}} · Brak połączenia",
+      "localSignals": "Na podstawie sygnałów załadowanych w panelu",
+      "emptySaved": "Brak konwergencji w ostatniej znanej aktualizacji."
     },
     "thermalEscalation": {
       "title": "Eskalacja termiczna",

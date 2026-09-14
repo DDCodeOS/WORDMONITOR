@@ -2643,7 +2643,14 @@
       "signals_other": "{{count}} señales",
       "analyzing": "Analizando...",
       "viewOnMap": "Ver en mapa",
-      "signals_many": "{{count}} señales"
+      "signals_many": "{{count}} señales",
+      "waiting": "Esperando la próxima actualización de datos. Este panel se actualiza automáticamente.",
+      "offline": "Esperando una conexión. Este panel se actualiza automáticamente cuando vuelvas a estar en línea.",
+      "updated": "Actualizado {{time}}",
+      "saved": "Última actualización conocida {{time}} · Buscando actualizaciones",
+      "savedOffline": "Última actualización conocida {{time}} · Sin conexión",
+      "localSignals": "Basado en las señales cargadas en el panel",
+      "emptySaved": "No hubo convergencia en la última actualización conocida."
     },
     "thermalEscalation": {
       "title": "Escalada Térmica",

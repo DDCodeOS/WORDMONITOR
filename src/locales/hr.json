@@ -2719,7 +2719,14 @@
       "signals_other": "{{count}} signala",
       "analyzing": "Analiza...",
       "viewOnMap": "Prikaži na karti",
-      "signals_few": "{{count}} signala"
+      "signals_few": "{{count}} signala",
+      "waiting": "Čekanje sljedećeg ažuriranja podataka. Ovaj se panel automatski ažurira.",
+      "offline": "Čekanje veze. Ovaj se panel automatski ažurira kada ponovno budete povezani.",
+      "updated": "Ažurirano {{time}}",
+      "saved": "Posljednje poznato ažuriranje {{time}} · Provjera ažuriranja",
+      "savedOffline": "Posljednje poznato ažuriranje {{time}} · Izvan mreže",
+      "localSignals": "Na temelju učitanih signala nadzorne ploče",
+      "emptySaved": "Nema konvergencije u posljednjem poznatom ažuriranju."
     },
     "thermalEscalation": {
       "title": "Toplinska eskalacija",

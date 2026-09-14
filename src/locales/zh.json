@@ -2615,7 +2615,14 @@
       "empty": "未检测到活跃收敛",
       "signals_other": "{{count}} 个信号",
       "analyzing": "分析中...",
-      "viewOnMap": "在地图上查看"
+      "viewOnMap": "在地图上查看",
+      "waiting": "正在等待下一次数据更新。此面板会自动更新。",
+      "offline": "正在等待连接。恢复联网后，此面板会自动更新。",
+      "updated": "更新于 {{time}}",
+      "saved": "最近一次已知更新 {{time}} · 正在检查更新",
+      "savedOffline": "最近一次已知更新 {{time}} · 离线",
+      "localSignals": "基于仪表板中已加载的信号",
+      "emptySaved": "最近一次已知更新中未发现汇聚。"
     },
     "thermalEscalation": {
       "title": "热异常升级",

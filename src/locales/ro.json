@@ -2643,7 +2643,14 @@
       "signals_other": "{{count}} semnale",
       "analyzing": "Se analizează...",
       "viewOnMap": "Vizualizare pe hartă",
-      "signals_few": "{{count}} semnale"
+      "signals_few": "{{count}} semnale",
+      "waiting": "Se așteaptă următoarea actualizare a datelor. Acest panou se actualizează automat.",
+      "offline": "Se așteaptă o conexiune. Acest panou se actualizează automat când reveniți online.",
+      "updated": "Actualizat {{time}}",
+      "saved": "Ultima actualizare cunoscută {{time}} · Se caută actualizări",
+      "savedOffline": "Ultima actualizare cunoscută {{time}} · Fără conexiune",
+      "localSignals": "Pe baza semnalelor încărcate în tabloul de bord",
+      "emptySaved": "Nu a existat convergență în ultima actualizare cunoscută."
     },
     "thermalEscalation": {
       "title": "Escaladare termică",

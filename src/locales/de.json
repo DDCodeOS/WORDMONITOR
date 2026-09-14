@@ -2629,7 +2629,14 @@
       "signals_one": "{{count}} Signal",
       "signals_other": "{{count}} Signale",
       "analyzing": "Wird analysiert...",
-      "viewOnMap": "Auf Karte anzeigen"
+      "viewOnMap": "Auf Karte anzeigen",
+      "waiting": "Warten auf die nächste Datenaktualisierung. Dieses Panel wird automatisch aktualisiert.",
+      "offline": "Warten auf eine Verbindung. Dieses Panel wird automatisch aktualisiert, sobald Sie wieder online sind.",
+      "updated": "Aktualisiert {{time}}",
+      "saved": "Letzte bekannte Aktualisierung {{time}} · Suche nach Aktualisierungen",
+      "savedOffline": "Letzte bekannte Aktualisierung {{time}} · Offline",
+      "localSignals": "Basierend auf geladenen Dashboard-Signalen",
+      "emptySaved": "Keine Konvergenz in der letzten bekannten Aktualisierung."
     },
     "thermalEscalation": {
       "title": "Thermische Eskalation",

@@ -2249,7 +2249,14 @@
       "signals_one": "{{count}} signaal",
       "signals_other": "{{count}} signalen",
       "analyzing": "Analyseren...",
-      "viewOnMap": "Bekijken op kaart"
+      "viewOnMap": "Bekijken op kaart",
+      "waiting": "Wachten op de volgende gegevensupdate. Dit paneel wordt automatisch bijgewerkt.",
+      "offline": "Wachten op een verbinding. Dit paneel wordt automatisch bijgewerkt zodra je weer online bent.",
+      "updated": "Bijgewerkt {{time}}",
+      "saved": "Laatst bekende update {{time}} · Controleren op updates",
+      "savedOffline": "Laatst bekende update {{time}} · Offline",
+      "localSignals": "Gebaseerd op geladen dashboardsignalen",
+      "emptySaved": "Geen convergentie in de laatst bekende update."
     },
     "thermalEscalation": {
       "title": "Thermische escalatie",

@@ -2615,7 +2615,14 @@
       "empty": "アクティブな収束は検出されていません",
       "signals_other": "{{count}} シグナル",
       "analyzing": "分析中...",
-      "viewOnMap": "地図で表示"
+      "viewOnMap": "地図で表示",
+      "waiting": "次のデータ更新を待っています。このパネルは自動的に更新されます。",
+      "offline": "接続を待っています。オンラインに戻ると、このパネルは自動的に更新されます。",
+      "updated": "更新日時 {{time}}",
+      "saved": "最後に確認できた更新 {{time}} · 更新を確認中",
+      "savedOffline": "最後に確認できた更新 {{time}} · オフライン",
+      "localSignals": "ダッシュボードに読み込まれたシグナルに基づく",
+      "emptySaved": "最後に確認できた更新では収束はありませんでした。"
     },
     "thermalEscalation": {
       "title": "熱的エスカレーション",
