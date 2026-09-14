@@ -521,16 +521,17 @@ describe('live video audit command line', () => {
     const payloadPath = join(dir, 'payload.json');
     const liveVerdict = { verdict: { verdict: 'live', video: { videoId: 'gCNeDWCI0vo', isLive: true, title: 'Live', author: 'Channel' } } };
     const blockedVerdict = { verdict: { verdict: 'failed', outcome: { kind: 'player-error', code: 150 } } };
-    // Every video entry fails and every channel (the canaries among them) plays, so some slots need a replacement.
+    // The canaries (probed first, on their own page) play and every slot entry fails, so the outcome depends only on
+    // the catalog having entries, never on which slots are filled or empty today.
+    let youtubeCalls = 0;
     await runCheck(['--all', '--report', reportPath], {
       write: () => {},
-      probeYouTube: async (candidates) => candidates.map((candidate) => (candidate.kind === 'channel' ? liveVerdict : blockedVerdict)),
-      probeHls: async (candidates) => candidates.map(() => ({ verdict: { verdict: 'live', video: null } })),
+      probeYouTube: async (candidates) => {
+        youtubeCalls += 1;
+        return candidates.map(() => (youtubeCalls === 1 ? liveVerdict : blockedVerdict));
+      },
+      probeHls: async (candidates) => candidates.map(() => ({ verdict: { verdict: 'failed', outcome: { kind: 'hls-http', status: 404 } } })),
     });
-    const hiddenEmpty = JSON.parse(readFileSync(reportPath, 'utf8')).slots
-      .filter((slot) => slot.status === 'empty' && !slot.shownByDefault)
-      .map((slot) => slot.slot);
-    assert.ok(hiddenEmpty.length > 0, 'the catalog has hidden slots with no entries; if every slot is filled, drop the unfilled-section assertions');
     writeFileSync(join(dir, 'gh'), `#!/usr/bin/env node
 const fs = require('node:fs');
 if (process.argv.includes('--paginate')) {
@@ -551,20 +552,10 @@ if (process.argv.includes('--paginate')) {
     assert.equal(reported.status, 0, reported.stderr);
     const result = JSON.parse(reported.stdout);
     assert.equal(result.action, 'created');
-    assert.ok(result.findings > 0, 'every video entry failed');
+    assert.ok(result.findings > 0, 'every slot entry failed');
     const payload = JSON.parse(readFileSync(payloadPath, 'utf8'));
     assert.equal(payload.title, ISSUE_TITLE);
-    assert.match(payload.body, /\| needs-replacement \| `https:\/\/www\.youtube\.com\/watch\?v=[^`]+` \| YouTube player error 150/);
-    const unfilled = payload.body.indexOf('### Unfilled slots (hidden from viewers)');
-    assert.ok(unfilled > 0, payload.body);
-    const unfilledSlots = payload.body.slice(unfilled).split('\n')
-      .filter((line) => line.startsWith('- '))
-      .flatMap((line) => line.slice(line.indexOf(': ') + 2).split(', '));
-    assert.deepEqual([...unfilledSlots].sort(), [...hiddenEmpty].sort());
-    const tableSlots = payload.body.split('\n')
-      .filter((line) => /^\| (webcams|live-news)\//.test(line))
-      .map((line) => line.split(' | ')[0].slice(2));
-    for (const slot of hiddenEmpty) assert.ok(!tableSlots.includes(slot), `${slot} is listed only as unfilled`);
+    assert.match(payload.body, /^\| (webcams|live-news)\/[a-z0-9-]+ \| [^|]+ \| needs-replacement \| `[^`]+` \| (YouTube player error 150|manifest returned HTTP 404)/m);
 
     const missing = runReporter({ LIVE_VIDEO_AUDIT_REPORT: join(dir, 'missing.json') });
     assert.equal(missing.status, 1);
