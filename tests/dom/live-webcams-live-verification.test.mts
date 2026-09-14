@@ -173,6 +173,7 @@ describe('Live Webcams live verification', () => {
     expect(content().querySelectorAll('.webcam-preview-tile')).toHaveLength(4);
     expect(content().querySelector('.webcam-preview-status')?.textContent).toBe('Ready to play');
     expect(content().querySelector('.webcam-preview-tile .webcam-live-dot')).toBeNull();
+    expect(content().querySelector('.webcam-iframe')).toBeNull();
     expect(api().players).toHaveLength(0);
   });
 
