@@ -61,6 +61,14 @@ describe('sanitizeCrossSourceSignalsPayload (bootstrap hydrate)', () => {
     });
   });
 
+  it('normalizes unknown enum strings like the RPC reader', () => {
+    for (const value of ['invalid', '__proto__', 'constructor', '']) {
+      const result = sanitizeCrossSourceSignalsPayload({ signals: [{ type: value, severity: value }] });
+      assert.equal(result?.signals[0].type, 'CROSS_SOURCE_SIGNAL_TYPE_UNSPECIFIED');
+      assert.equal(result?.signals[0].severity, 'CROSS_SOURCE_SIGNAL_SEVERITY_UNSPECIFIED');
+    }
+  });
+
   it('returns null for non-object payloads so fetch falls through to RPC', () => {
     assert.equal(sanitizeCrossSourceSignalsPayload(null), null);
     assert.equal(sanitizeCrossSourceSignalsPayload(undefined), null);
