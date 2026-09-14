@@ -144,7 +144,8 @@ export class LiveWebcamsPanel extends Panel {
     this.setupIntersectionObserver();
     this.setupIdleDetection();
     subscribeStreamQualityChange(() => this.render());
-    this.unsubscribeStreamSettings = subscribeLiveStreamsSettingsChange((alwaysOn) => {
+    this.unsubscribeStreamSettings = subscribeLiveStreamsSettingsChange(({ alwaysOn }) => {
+      if (alwaysOn === this.alwaysOn) return;
       this.alwaysOn = alwaysOn;
       this.applyIdleMode();
       // Leaving always-on keeps whatever is playing; eco-idle (re-armed by applyIdleMode) pauses it later.

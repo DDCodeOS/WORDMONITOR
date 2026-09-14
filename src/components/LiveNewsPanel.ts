@@ -436,7 +436,8 @@ export class LiveNewsPanel extends Panel {
     this.renderPlaceholder();
     this.setupLazyInit();
     this.setupIdleDetection();
-    this.unsubscribeStreamSettings = subscribeLiveStreamsSettingsChange((alwaysOn) => {
+    this.unsubscribeStreamSettings = subscribeLiveStreamsSettingsChange(({ alwaysOn }) => {
+      if (alwaysOn === this.alwaysOn) return;
       const wasAlwaysOn = this.alwaysOn;
       this.alwaysOn = alwaysOn;
       this.applyIdleMode();
