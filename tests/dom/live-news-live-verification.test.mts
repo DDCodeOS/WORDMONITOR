@@ -73,6 +73,27 @@ const POLL = LIVE_VIDEO_TIMING.pollMs;
 const RECORDING_VERDICT_MS = LIVE_VIDEO_TIMING.durationGrowthWindowMs + 3 * LIVE_VIDEO_TIMING.pollMs;
 const BLOOMBERG_HLS = 'https://streams.example/bloomberg/live.m3u8';
 
+class FakeIntersectionObserver {
+  static latest: FakeIntersectionObserver | null = null;
+  readonly callback: IntersectionObserverCallback;
+
+  constructor(callback: IntersectionObserverCallback) {
+    this.callback = callback;
+    FakeIntersectionObserver.latest = this;
+  }
+
+  intersect(): void {
+    this.callback([{ isIntersecting: true } as IntersectionObserverEntry], this as unknown as IntersectionObserver);
+  }
+
+  observe(): void {}
+  unobserve(): void {}
+  disconnect(): void {}
+  takeRecords(): IntersectionObserverEntry[] {
+    return [];
+  }
+}
+
 interface PanelInternals {
   element: HTMLElement;
   content: HTMLElement;
@@ -343,5 +364,106 @@ describe('Live News live verification', () => {
 
     expect(status()?.textContent).toContain('Can’t confirm this stream is live');
     expect(content().querySelector('iframe[title="CNN live feed"]')).not.toBeNull();
+  });
+
+  it('destroys the previous channel’s player when switching to another channel', async () => {
+    mount(['cnn', 'bloomberg'], { active: 'cnn' });
+    await playFromPlaceholder();
+    const cnn = api().playerFor('CNN live feed');
+    cnn.goLive();
+    await flush(POLL);
+
+    channelButton('bloomberg').click();
+    await flush();
+
+    expect(cnn.destroyed).toBe(true);
+    expect(content().querySelectorAll('iframe, video.live-news-media')).toHaveLength(1);
+    expect(content().querySelector('video.live-news-media')?.getAttribute('title')).toBe('Bloomberg live feed');
+  });
+
+  it('offers the next channel but no Retry for a channel with no stream set up', async () => {
+    catalog.news.cnn = [];
+    mount(['bloomberg', 'cnn']);
+    await playFromPlaceholder();
+    latestHls().emit('hlsLevelLoaded', { details: { live: true } });
+    await flush(POLL);
+
+    channelButton('cnn').click();
+    await flush();
+
+    expect(offlineText()).toBe('No live stream is set up for CNN yet');
+    const labels = Array.from(content().querySelectorAll('button')).map((button) => button.textContent);
+    expect(labels).not.toContain('Retry');
+    expect(labels).toContain('Play next channel');
+  });
+
+  it('keeps focus on a channel button while its stream connects and ignores repeat clicks', async () => {
+    mount(['bloomberg', 'cnn']);
+    await playFromPlaceholder();
+    latestHls().emit('hlsLevelLoaded', { details: { live: true } });
+    await flush(POLL);
+
+    const cnn = channelButton('cnn');
+    cnn.focus();
+    cnn.click();
+    await flush();
+
+    expect(document.activeElement).toBe(cnn);
+    expect(cnn.disabled).toBe(false);
+    expect(cnn.getAttribute('aria-busy')).toBe('true');
+    expect(cnn.getAttribute('aria-disabled')).toBe('true');
+    const players = api().players.length;
+    cnn.click();
+    await flush();
+    expect(api().players.length).toBe(players);
+
+    api().playerFor('CNN live feed').goLive();
+    await flush(POLL);
+    expect(cnn.getAttribute('aria-busy')).toBeNull();
+    expect(cnn.getAttribute('aria-disabled')).toBeNull();
+  });
+
+  it('moves playback to the next channel when the playing channel is removed from saved channels', async () => {
+    mount(['cnn', 'bloomberg'], { active: 'cnn' });
+    await playFromPlaceholder();
+    const cnn = api().playerFor('CNN live feed');
+    cnn.goLive();
+    await flush(POLL);
+
+    localStorage.setItem(STORAGE_KEYS.liveChannels, JSON.stringify({ order: ['bloomberg'], custom: [], displayNameOverrides: {} }));
+    panel?.refreshChannelsFromStorage();
+    await flush();
+
+    expect(cnn.destroyed).toBe(true);
+    expect(internals().element.querySelector('.live-channel-btn[data-channel-id="cnn"]')).toBeNull();
+    expect(channelButton('bloomberg').classList.contains('active')).toBe(true);
+    expect(savedActiveChannel()).toBe('bloomberg');
+    expect(latestHls().url).toBe(BLOOMBERG_HLS);
+    expect(getActiveLiveMedia('live-news')?.streamId).toBe('bloomberg');
+  });
+
+  it('keeps an idle stop when the panel scrolls back into view for an auto-play user', async () => {
+    vi.stubGlobal('IntersectionObserver', FakeIntersectionObserver);
+    vi.stubGlobal('requestIdleCallback', (callback: () => void) => setTimeout(callback, 0));
+    vi.stubGlobal('cancelIdleCallback', (id: ReturnType<typeof setTimeout>) => clearTimeout(id));
+    localStorage.setItem('wm-live-streams-always-on', 'true');
+    localStorage.setItem('wm-live-media-idle-stop', '60');
+    mount(['bloomberg']);
+    await playFromPlaceholder();
+    latestHls().emit('hlsLevelLoaded', { details: { live: true } });
+    await flush(POLL);
+
+    await flush(HOUR);
+    expect(content().querySelector('.live-media-shell--idle')).not.toBeNull();
+    const loads = hlsState.instances.length + api().players.length;
+
+    // Off screen, so showing the panel again waits for it to scroll into view.
+    panel?.resumeLiveMediaForShow();
+    FakeIntersectionObserver.latest?.intersect();
+    await flush(2_000);
+
+    expect(hlsState.instances.length + api().players.length).toBe(loads);
+    expect(getActiveLiveMedia('live-news')).toBeNull();
+    expect(content().querySelector('.live-media-shell--idle')).not.toBeNull();
   });
 });

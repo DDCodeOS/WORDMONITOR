@@ -73,17 +73,19 @@ describe('LiveNews channel loading lifecycle', () => {
     assert.match(createBtn, /setAttribute\('aria-pressed',\s*String\(channel\.id === this\.activeChannel\.id\)\)/);
   });
 
-  it('loading marks the target button aria-busy and disabled', () => {
+  it('loading marks the target button aria-busy and aria-disabled without disabling it', () => {
+    // A disabled button drops keyboard focus to <body> for the whole connection.
     assert.match(clearLoading, /markChannelButtonLoading/);
     assert.match(clearLoading, /setAttribute\('aria-busy',\s*'true'\)/);
-    assert.match(clearLoading, /\.disabled\s*=\s*true/);
+    assert.match(clearLoading, /setAttribute\('aria-disabled',\s*'true'\)/);
+    assert.doesNotMatch(liveNews, /\.disabled\s*=\s*true/);
   });
 
   it('clearChannelLoadingState resets every channel button, not only .loading', () => {
     assert.match(clearLoading, /querySelectorAll\('\.live-channel-btn'\)/);
     assert.doesNotMatch(clearLoading, /querySelectorAll\('\.live-channel-btn\.loading'\)/);
     assert.match(clearLoading, /removeAttribute\('aria-busy'\)/);
-    assert.match(clearLoading, /\.disabled\s*=\s*false/);
+    assert.match(clearLoading, /removeAttribute\('aria-disabled'\)/);
   });
 
   it('switchChannel marks the target busy only while its live session is connecting', () => {
@@ -99,8 +101,11 @@ describe('LiveNews channel loading lifecycle', () => {
     assert.match(onVideoState, /if \(state\.phase !== 'connecting'\) this\.clearChannelLoadingState\(\)/);
     assert.match(stopFromController, /this\.clearChannelLoadingState\(\)/);
     const previewOnly = switchChannel.slice(switchChannel.indexOf('if (!shouldStartMedia)'));
-    assert.ok(previewOnly.indexOf('this.clearChannelLoadingState()') < previewOnly.indexOf('this.renderPlaceholder()'),
-      'a switch that starts no media must clear loading before rendering the preview');
+    const clearPos = previewOnly.indexOf('this.clearChannelLoadingState()');
+    const placeholderPos = previewOnly.indexOf('this.renderPlaceholder()');
+    assert.ok(clearPos >= 0, 'a switch that starts no media must clear loading');
+    assert.ok(placeholderPos >= 0, 'a switch that starts no media must render the preview');
+    assert.ok(clearPos < placeholderPos, 'a switch that starts no media must clear loading before rendering the preview');
   });
 
   it('success path no longer drops only the loading class', () => {

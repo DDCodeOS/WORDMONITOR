@@ -472,7 +472,8 @@ export class LiveNewsPanel extends Panel {
         if (entries.some(e => e.isIntersecting)) {
           this.lazyObserver?.disconnect();
           this.lazyObserver = null;
-          if (!this.alwaysOn) return;
+          // An idle stop ends only through Resume or Play; scrolling back into view is neither.
+          if (!this.alwaysOn || this.idleStoppedAfterMs !== null) return;
           if ('requestIdleCallback' in window) {
             this.idleCallbackId = (window as any).requestIdleCallback(
               () => { this.idleCallbackId = null; this.triggerInit(); },
@@ -715,6 +716,8 @@ export class LiveNewsPanel extends Panel {
         return;
       }
       e.preventDefault();
+      // A connecting channel keeps focus (it is never disabled), so its repeat clicks are ignored here.
+      if (btn.getAttribute('aria-busy') === 'true') return;
       this.switchChannel(channel);
     });
     return btn;
@@ -869,12 +872,12 @@ export class LiveNewsPanel extends Panel {
   private resetChannelButtonLoading(btn: HTMLElement): void {
     btn.classList.remove('loading');
     btn.removeAttribute('aria-busy');
-    (btn as HTMLButtonElement).disabled = false;
+    btn.removeAttribute('aria-disabled');
   }
 
   // Clear every channel button, not only `.loading`. Success used to drop the
-  // spinner class while leaving aria-busy/disabled set, and a later switch
-  // could strip `.loading` from a still-disabled predecessor.
+  // spinner class while leaving aria-busy set, and a later switch could strip
+  // `.loading` from a still-busy predecessor.
   private clearChannelLoadingState(): void {
     this.channelSwitcher?.querySelectorAll('.live-channel-btn').forEach(btn => {
       this.resetChannelButtonLoading(btn as HTMLElement);
@@ -887,10 +890,11 @@ export class LiveNewsPanel extends Panel {
       const btnEl = btn as HTMLElement;
       if (btnEl.dataset.channelId !== channelId) return;
       btnEl.classList.add('loading');
-      // CSS blocks the pointer during load (pointer-events: none); mirror
-      // that for keyboard/AT instead of leaving a silently dead button.
+      // CSS blocks the pointer during load (pointer-events: none). Announce the
+      // same to keyboard/AT without `disabled`, which would drop focus to <body>
+      // for the whole connection; the click handler ignores a busy button.
       btnEl.setAttribute('aria-busy', 'true');
-      (btnEl as HTMLButtonElement).disabled = true;
+      btnEl.setAttribute('aria-disabled', 'true');
     });
   }
 
@@ -1111,11 +1115,11 @@ export class LiveNewsPanel extends Panel {
   public refreshChannelsFromStorage(): void {
     this.channels = loadChannelsFromStorage();
     if (this.channels.length === 0) this.channels = getDefaultLiveChannels();
-    if (!this.channels.some((c) => c.id === this.activeChannel.id)) {
-      this.activeChannel = this.channels[0]!;
-      this.switchChannel(this.activeChannel);
-    }
     this.refreshChannelSwitcher();
+    // The active channel was removed. switchChannel ignores the channel it already holds, so hand it
+    // the replacement instead of assigning it first; it stops the removed channel and saves the new one.
+    const next = this.channels[0];
+    if (next && !this.channels.some((c) => c.id === this.activeChannel.id)) this.switchChannel(next);
   }
 
   public stopLiveMediaForClose(): void {
