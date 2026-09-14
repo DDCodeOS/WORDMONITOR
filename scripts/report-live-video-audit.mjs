@@ -236,11 +236,12 @@ export async function publishAudit(report, {
   probeCanaries = auditAttempts,
 } = {}) {
   assertCompleteReport(report, catalog);
+  // Before the canary retry, which starts a browser: a run that cannot publish fails fast.
+  if (!repository) throw new Error('GITHUB_REPOSITORY is required to publish the live video audit');
   const canaries = await confirmProbeWorks(report.canaries, probeCanaries);
   const rendering = { runUrl, canaries, gridPriority: catalog.gridPriority ?? [] };
   if (summaryPath) appendFileSync(summaryPath, `${renderAuditBody(report, rendering)}\n`);
   const body = issueBody(report, rendering);
-  if (!repository) throw new Error('GITHUB_REPOSITORY is required to publish the live video audit');
 
   const findings = report.slots.filter(isFinding).length;
   const pages = gh(['api', '--paginate', '--slurp', `repos/${repository}/issues?state=open&per_page=100`]);
@@ -252,7 +253,9 @@ export async function publishAudit(report, {
     return { findings, action: 'closed', issue: existing.number };
   }
   const endpoint = `repos/${repository}/issues${existing ? `/${existing.number}` : ''}`;
-  gh(['api', '--method', existing ? 'PATCH' : 'POST', endpoint, '--input', '-'], { title: ISSUE_TITLE, body });
+  // An issue closed between the lookup and this write is reopened, not left closed with a fresh body.
+  const payload = existing ? { title: ISSUE_TITLE, body, state: 'open' } : { title: ISSUE_TITLE, body };
+  gh(['api', '--method', existing ? 'PATCH' : 'POST', endpoint, '--input', '-'], payload);
   return { findings, action: existing ? 'updated' : 'created' };
 }
 

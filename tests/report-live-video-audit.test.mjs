@@ -99,6 +99,7 @@ describe('live video audit issue', () => {
     assert.deepEqual(calls[1].args, ['api', '--method', 'POST', 'repos/owner/repo/issues', '--input', '-']);
     const { title, body } = calls[1].payload;
     assert.equal(title, ISSUE_TITLE);
+    assert.equal(calls[1].payload.state, undefined, 'a new issue sends no state');
     assert.match(body, /^\| Slot \| Where it shows \| Status \| Entry \| Why \| Shown instead \|$/m);
     assert.match(body, /^\| webcams\/jerusalem \| Webcam grid cell 1 \| needs-replacement \| `https:\/\/www\.youtube\.com\/watch\?v=zp6LNSoq000` \| YouTube player error 150: [^|]+ \| webcams\/tel-aviv \|$/m);
     assert.match(body, /actions\/runs\/7/);
@@ -123,6 +124,7 @@ describe('live video audit issue', () => {
     assert.equal(calls.length, 2);
     assert.deepEqual(calls[1].args, ['api', '--method', 'PATCH', 'repos/owner/repo/issues/6', '--input', '-']);
     assert.equal(calls[1].payload.title, ISSUE_TITLE);
+    assert.equal(calls[1].payload.state, 'open', 'an issue closed between the lookup and the update is reopened');
     assert.match(calls[1].payload.body, /webcams\/kyiv/);
   });
 
@@ -493,6 +495,17 @@ describe('live video audit issue', () => {
     assert.equal(rowCount(body) + overflow, count, 'every row is in the issue or counted by an overflow line');
     assert.match(body, /^- Live News optional: .*… and \d+ more \(see the run summary\)$/m);
     assert.doesNotMatch(summary, /see the run summary/);
+  });
+
+  it('checks the repository before retrying the canaries', async () => {
+    const report = reportFor(baseCatalog);
+    report.canaries = [dead(CANARY_1), dead(CANARY_2)];
+    let retried = false;
+    await assert.rejects(
+      publish(report, { repository: '', gh: unexpectedGh, probeCanaries: async (entries) => { retried = true; return entries.map(live); } }),
+      /GITHUB_REPOSITORY/,
+    );
+    assert.equal(retried, false, 'no browser starts for a run that cannot publish');
   });
 
   it('requires the repository before looking up the issue', async () => {
