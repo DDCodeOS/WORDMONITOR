@@ -7,51 +7,59 @@
   "totalTolerancePct": 0.25,
   "totalToleranceBytes": 16384,
   "total": {
-    "raw": 292990
+    "raw": 439739
   },
   "chunks": {
-    "analytics": {
-      "raw": 132393,
-      "files": 1
-    },
     "clerk": {
-      "raw": 18618,
+      "raw": 18229,
       "files": 1
     },
     "debugbear-rum": {
-      "raw": 2675,
+      "raw": 28211,
       "files": 1
     },
     "dom-utils": {
-      "raw": 3140,
+      "raw": 2747,
+      "files": 1
+    },
+    "entitlements": {
+      "raw": 2507,
       "files": 1
     },
     "font-settings": {
-      "raw": 862,
+      "raw": 465,
       "files": 1
     },
     "geo-convergence": {
-      "raw": 10076,
+      "raw": 9680,
       "files": 1
     },
     "geo-distance": {
-      "raw": 28869,
+      "raw": 28468,
       "files": 1
     },
     "globe-marker-probe": {
-      "raw": 829,
+      "raw": 427,
       "files": 1
     },
     "i18n": {
-      "raw": 52848,
+      "raw": 52460,
       "files": 1
     },
     "main": {
-      "raw": 40809,
+      "raw": 125775,
+      "files": 1
+    },
+    "panels": {
+      "raw": 37234,
+      "files": 1
+    },
+    "theme-colors": {
+      "raw": 132059,
       "files": 1
     },
     "theme-manager": {
-      "raw": 1871,
+      "raw": 1477,
       "files": 1
     }
   }

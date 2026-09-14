@@ -159,6 +159,23 @@ function stylesheetHrefs(html) {
   return hrefs;
 }
 
+function deferredAppStylesheetHrefs(html) {
+  const entryHref = html.match(/<script\b[^>]*\bsrc="([^"\s]+\/main-[^"\s]+\.js)"/)?.[1];
+  assert.ok(entryHref, 'Built dashboard must have its main module entry.');
+  const entry = builtSrc(`dist/${entryHref.replace(/^\//, '')}`);
+  // Vite awaits these CSS preloads before evaluating the dynamic App import.
+  const dependencyTable = entry.match(/m\.f=\[([^\]]*)\]/)?.[1];
+  const appDependencyIds = entry.match(
+    /import\(["']\.\/App-[^"']+\.js["']\)[\s\S]*?__vite__mapDeps\(\[([\d,]+)\]\)/,
+  )?.[1];
+  assert.ok(dependencyTable && appDependencyIds, 'Built App import must retain its Vite preload dependencies.');
+  const dependencies = JSON.parse(`[${dependencyTable}]`);
+  return appDependencyIds.split(',')
+    .map((index) => dependencies[Number(index)])
+    .filter((path) => path?.endsWith('.css'))
+    .map((path) => `/${path}`);
+}
+
 function stripNoscript(html) {
   return html.replace(/<noscript\b[\s\S]*?<\/noscript>/gi, '');
 }
@@ -322,7 +339,7 @@ describe('dashboard critical CSS graph', () => {
 
     it('does not link or merge the settings-only stylesheet into built dashboard.html', () => {
     const dashboardHtml = builtSrc('dist/dashboard.html');
-    const hrefs = stylesheetHrefs(dashboardHtml);
+    const hrefs = [...stylesheetHrefs(dashboardHtml), ...deferredAppStylesheetHrefs(dashboardHtml)];
     const settingsStylesheets = hrefs.filter((href) =>
       /\/assets\/settings(?:-(?:persistence|window))?-[A-Za-z0-9_-]+\.css$/.test(href)
     );
@@ -394,7 +411,10 @@ describe('dashboard critical CSS graph', () => {
         deferredHrefs.push(attrs.get('href'));
       }
     }
-    assert.ok(deferredHrefs.length > 0, 'Built dashboard.html should still request app CSS on a deferred stylesheet path.');
+    assert.ok(
+      deferredHrefs.length + deferredAppStylesheetHrefs(dashboardHtml).length > 0,
+      'Built dashboard must load app CSS through deferred HTML links or the dynamic App preload.',
+    );
 
     const noscriptLinkTags = [...dashboardHtml.matchAll(/<noscript>\s*(<link\b[^>]*>)\s*<\/noscript>/gi)].map((m) => m[1]);
     for (const href of deferredHrefs) {

@@ -3,6 +3,7 @@ import './bootstrap/zod-csp';
 import { SITE_VARIANT } from '@/config/variant';
 import { installLcpAttributionDebug } from '@/bootstrap/lcp-attribution';
 import { markLcpDebug } from '@/utils/lcp-debug';
+import { registerWebMcpTools, type WebMcpAppBindings } from '@/services/webmcp';
 import { safeStorageGet, safeStorageRemove, safeStorageSet } from '@/utils/safe-storage';
 import { enqueueSentryCall, installPreInitErrorQueue, scheduleSentryInit } from '@/bootstrap/sentry-defer';
 import { registerClsReporting } from '@/bootstrap/cls-report';
@@ -623,20 +624,28 @@ if (urlParams.get('settings') === '1') {
   );
 } else {
   installUtmInterceptor();
-  markLcpDebug('wm:boot:app-construct');
+  let resolveBindings!: (bindings: WebMcpAppBindings) => void;
+  let rejectBindings!: (error: unknown) => void;
+  const bindings = new Promise<WebMcpAppBindings>((resolve, reject) => {
+    resolveBindings = resolve;
+    rejectBindings = reject;
+  });
+  const webMcpController = registerWebMcpTools(bindings);
   // Import and constructor failures must reach the global startup error monitors.
   void import('./App').then(({ App }) => {
+    markLcpDebug('wm:boot:app-construct');
     const app = new App('app');
+    resolveBindings(app.getWebMcpBindings());
     app
-      .init()
+      .init(webMcpController)
       .then(() => {
         clearChunkReloadGuard(chunkReloadStorageKey);
       })
       .catch((error: unknown) => {
         console.error(error);
         try {
-          // init() registers WebMCP before its first await. A failed boot must
-          // therefore run normal teardown so the browser cannot retain tools
+          // init() owns the WebMCP controller before its first await. A failed
+          // boot must run normal teardown so the browser cannot retain tools
           // bound to an App that will never become ready.
           app.destroy();
         } catch (cleanupError) {
@@ -645,6 +654,10 @@ if (urlParams.get('settings') === '1') {
           console.error('[App] Failed to clean up after initialization failure:', cleanupError);
         }
       });
+  }).catch((error: unknown) => {
+    rejectBindings(error);
+    webMcpController?.abort();
+    throw error;
   });
 }
 

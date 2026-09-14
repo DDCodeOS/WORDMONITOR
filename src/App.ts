@@ -172,6 +172,7 @@ import {
   raceWebMcpAbort,
   registerWebMcpTools,
   throwIfWebMcpAborted,
+  type WebMcpAppBindings,
   type WebMcpExecutionOptions,
 } from '@/services/webmcp';
 import {
@@ -1967,19 +1968,8 @@ export class App {
     }
   }
 
-  public async init(): Promise<void> {
-    const initStart = performance.now();
-    markLcpDebug('wm:boot:app-init-start');
-
-    // WebMCP — register synchronously before any init awaits so agent
-    // scanners (isitagentready.com, in-browser agents) find the tools on
-    // their first probe. No-op in browsers without document.modelContext.
-    // Bindings await `this.uiReady` (resolves after Phase-4 UI init) so a tool
-    // invoked during startup waits for managers that can lazily create their
-    // targets. A bounded startup timeout keeps a genuinely broken state from
-    // hanging the caller. Store the returned controller
-    // so destroy() can unregister every tool on teardown.
-    this.webMcpController = registerWebMcpTools({
+  public getWebMcpBindings(): WebMcpAppBindings {
+    return {
       openCountryBriefByCode: (code, country, execution) => (
         this.openWebMcpCountryBrief(code, country, execution)
       ),
@@ -2357,7 +2347,18 @@ export class App {
         }
         return openWebMcpSignIn(execution?.signal);
       },
-    });
+    };
+  }
+
+  public async init(webMcpController?: AbortController | null): Promise<void> {
+    const initStart = performance.now();
+    markLcpDebug('wm:boot:app-init-start');
+
+    // The dashboard entry registers before loading App. Direct App callers
+    // still register here; both paths retain the same readiness and teardown.
+    this.webMcpController = webMcpController === undefined
+      ? registerWebMcpTools(this.getWebMcpBindings())
+      : webMcpController;
 
     window.addEventListener(I18N_RESOURCES_LOADED_EVENT, this.handleI18nResourcesLoaded);
 

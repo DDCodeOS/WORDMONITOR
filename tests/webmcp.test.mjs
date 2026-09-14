@@ -2867,8 +2867,13 @@ describe('webmcp App.ts binding invariants', () => {
 
   const initMethod = appMember('init');
   const registerCall = callByExpression(initMethod, appFile, 'registerWebMcpTools');
-  const bindings = registerCall.arguments[0];
-  assert.ok(ts.isObjectLiteralExpression(bindings), 'registerWebMcpTools must receive bindings inline');
+  const bindingsMethod = appMember('getWebMcpBindings');
+  const bindings = findNode(
+    bindingsMethod,
+    (node) => ts.isReturnStatement(node) && node.parent === bindingsMethod.body,
+    'App.getWebMcpBindings return',
+  ).expression;
+  assert.ok(ts.isObjectLiteralExpression(bindings), 'App.getWebMcpBindings must return the binding object');
 
   function objectPropertyInitializer(object, sourceFile, name) {
     assert.ok(ts.isObjectLiteralExpression(object), `${name} owner must be an object literal`);
@@ -2884,7 +2889,7 @@ describe('webmcp App.ts binding invariants', () => {
     assert.deepEqual(call.arguments.map((argument) => argument.getText(sourceFile)), expected);
   }
 
-  it('is imported statically and called before the first init await', () => {
+  it('registers the same bindings before the first init await for direct App callers', () => {
     const serviceImport = findNode(
       appFile,
       (node) => (
@@ -2897,6 +2902,7 @@ describe('webmcp App.ts binding invariants', () => {
     const importedNames = serviceImport.importClause?.namedBindings?.elements
       .map(({ name }) => name.text) ?? [];
     assert.ok(importedNames.includes('registerWebMcpTools'));
+    assertCallArguments(registerCall, appFile, ['this.getWebMcpBindings()']);
     assert.equal(
       findNodes(appFile, (node) => (
         ts.isCallExpression(node)
