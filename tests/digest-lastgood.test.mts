@@ -228,7 +228,7 @@ describe('durable last-good wiring (#7084)', () => {
     ].join('\n');
     const result = await build({
       stdin: {
-        contents: "export * from './server/worldmonitor/news/v1/list-feed-digest.ts';",
+        contents: "export * from './server/worldmonitor/news/v1/list-feed-digest.ts'; export { createNewsServiceRoutes } from './src/generated/server/worldmonitor/news/v1/service_server.ts';",
         loader: 'ts',
         resolveDir: root,
         sourcefile: 'digest-lastgood-test-entry.ts',
@@ -311,7 +311,10 @@ describe('durable last-good wiring (#7084)', () => {
     for (const lang of ['english', 'en-US', 'EN', 'en\n', ' en', 'a', 'a'.repeat(10_000), '../en', 'en:other', 1, null, {}, false]) {
       reset();
       stub.fetchMeta = { data: body(['https://a/1'], COVERAGE), source: 'cache', leader: false };
-      await assert.rejects(mod.listFeedDigest(ctx(), { variant: 'full', lang }), { statusCode: 400 });
+      await assert.rejects(mod.listFeedDigest(ctx(), { variant: 'full', lang }), {
+        name: 'ValidationError',
+        violations: [{ field: 'lang', description: 'must be a lowercase two-letter language code' }],
+      });
       assert.deepEqual(stub.fetchKeys, []);
       assert.deepEqual(stub.readCalls, []);
       assert.deepEqual(stub.pipelineCalls, []);
@@ -319,6 +322,19 @@ describe('durable last-good wiring (#7084)', () => {
       assert.deepEqual(stub.writes, []);
       assert.equal(mod.__testing__.fallbackDigestCache.size, 0);
     }
+  });
+
+  it('returns the declared HTTP validation envelope for malformed language', async () => {
+    reset();
+    const routes = mod.createNewsServiceRoutes({ listFeedDigest: mod.listFeedDigest });
+    const route = routes.find((r: { path: string; method: string }) => r.path === '/api/news/v1/list-feed-digest' && r.method === 'GET');
+    assert.ok(route);
+    const response = await route.handler(new Request('https://x.test/api/news/v1/list-feed-digest?lang=english'), {});
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { violations: [{ field: 'lang', description: 'must be a lowercase two-letter language code' }] });
+    assert.deepEqual(stub.fetchKeys, []);
+    assert.deepEqual(stub.pipelineCalls, []);
+    assert.deepEqual(stub.writes, []);
   });
 
   it('preserves default English and two-letter language cache scopes', async () => {
