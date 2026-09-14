@@ -48,7 +48,7 @@ function attempt(entry, verdict, { why, unverifiableFromRunner = false, evidence
     kind: entry.endsWith('.m3u8') ? 'hls' : entry.includes('/channel/') ? 'channel' : 'video',
     verdict,
     why: why ?? (verdict === 'live'
-      ? 'YouTube reports a live stream (isLive=true)'
+      ? 'YouTube reports a live stream (isLive=true) and it is playing'
       : 'YouTube player error 150: the owner does not allow embedding, or the video is unavailable here'),
     unverifiableFromRunner,
     evidence: { videoId: null, title: null, author: null, isLive: null, errorCode: null, httpStatus: null, durationSeconds: null, verdictAtMs: null, ...evidence },
@@ -201,6 +201,22 @@ describe('live video audit issue', () => {
     assert.deepEqual(await publish(report, { gh }), { findings: 0, action: 'none' });
   });
 
+  it('retries canaries the batched page could not verify, and reports normally once one plays', async () => {
+    const report = reportFor(baseCatalog);
+    report.canaries = [
+      attempt(CANARY_1, 'unverifiable', { why: 'the player frame loaded but never became ready', unverifiableFromRunner: true }),
+      attempt(CANARY_2, 'unverifiable', { why: 'the player no longer reports whether a video is live (isLive missing)', unverifiableFromRunner: true }),
+    ];
+    const retries = [];
+    const { calls, gh } = fakeGh([{ number: 6, title: ISSUE_TITLE }]);
+
+    const result = await publish(report, { gh, probeCanaries: async (entries) => { retries.push(entries); return entries.map(live); } });
+
+    assert.deepEqual(retries, [[CANARY_1, CANARY_2]]);
+    assert.deepEqual(result, { findings: 0, action: 'closed', issue: 6 });
+    assert.equal(calls.length, 3);
+  });
+
   it('throws on an incomplete or malformed report before probing or calling GitHub', async () => {
     const complete = () => reportFor(baseCatalog);
     const variants = {
@@ -258,6 +274,23 @@ describe('live video audit issue', () => {
     const onlyGeo = reportFor(baseCatalog, { 'live-news/bbc-news': geoBlocked });
     assert.deepEqual(await publish(onlyGeo, { gh: closeGh }), { findings: 0, action: 'closed', issue: 9 });
     assert.match(closeCalls[1].payload.body, /1 slot\(s\) could not be verified from the runner/);
+  });
+
+  it('lists a YouTube player the runner could not verify under "Could not verify from the runner", never as a finding', async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'live-video-audit-unverified-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const summaryPath = join(dir, 'summary.md');
+    const silent = attempt(watch('QB5BNdBFujE'), 'unverifiable', { why: 'the player frame loaded but never became ready', unverifiableFromRunner: true });
+    const report = reportFor(baseCatalog, { 'live-news/bloomberg': { status: 'unverifiable-from-runner', attempts: [silent] } });
+    const { gh } = fakeGh([{ number: 6, title: ISSUE_TITLE }]);
+
+    assert.deepEqual(await publish(report, { gh, summaryPath }), { findings: 0, action: 'closed', issue: 6 });
+    const body = readFileSync(summaryPath, 'utf8');
+    const section = body.indexOf('### Could not verify from the runner');
+    assert.ok(section > 0, body);
+    assert.match(body.slice(section), /^An HLS 403[^\n]*a YouTube player that never became ready[^\n]*$/m);
+    assert.match(body.slice(section), /\| live-news\/bloomberg \| Live News default \(full, tech\) \| `https:\/\/www\.youtube\.com\/watch\?v=QB5BNdBFujE` \| the player frame loaded but never became ready \|/);
+    assert.equal(body.indexOf('live-news/bloomberg'), body.indexOf('live-news/bloomberg', section), 'listed only in the unverifiable section');
   });
 
   it('counts an empty grid hotspot as "no entries configured", first, with the slot shown in its cell', async () => {

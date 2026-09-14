@@ -389,8 +389,9 @@ async function probeRows(rows, { probeYouTube, probeHls }) {
   }
 }
 
-// A manifest that answers 403/451 or times out, or a player API that never loaded, can depend on
-// where the check runs (region, network), so the audit cannot call the entry dead from there.
+// A manifest that answers 403/451 or times out, and any player the probe could not verify (API not
+// loaded, never ready, no live signal), can depend on where the check runs: its region, its network,
+// or a busy batched headless page. The audit cannot call the entry dead from there.
 const RUNNER_BLOCKED_HLS_STATUSES = new Set([403, 451]);
 // fetch reports a connection or read timeout as a failure code, not as the probe's own deadline.
 const NETWORK_TIMEOUT_CODES = new Set(['UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'ETIMEDOUT']);
@@ -398,8 +399,8 @@ const NETWORK_TIMEOUT_CODES = new Set(['UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADE
 function unverifiableFromRunner(row) {
   if (!row.parsed.ok) return false;
   const { verdict } = row;
-  // A frame that loads but never becomes ready is dead for viewers too; the chain skips it.
-  if (verdict.verdict === 'unverifiable') return verdict.reason !== 'player-api-silent';
+  // Channel embeds in a batched page have come back never-ready while the same channels played as canaries.
+  if (verdict.verdict === 'unverifiable') return true;
   if (verdict.verdict !== 'failed' || row.parsed.candidate.kind !== 'hls') return false;
   const { outcome } = verdict;
   return outcome.kind === 'timeout'

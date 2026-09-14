@@ -456,7 +456,7 @@ describe('audit report (--all --report)', () => {
       ['webcams/sydney', 'Webcam (Asia)', false, 'ok', null],
       ['live-news/bloomberg', 'Live News default (full, tech)', true, 'ok', null],
       ['live-news/bbc-news', 'Live News optional', false, 'unverifiable-from-runner', null],
-      ['live-news/yahoo', 'Live News default (tech)', true, 'needs-replacement', null],
+      ['live-news/yahoo', 'Live News default (tech)', true, 'unverifiable-from-runner', null],
       ['live-news/rtve', 'Live News optional', false, 'empty', null],
     ]);
   });
@@ -500,7 +500,7 @@ describe('audit report (--all --report)', () => {
 
     const [silent] = bySlot.get('live-news/yahoo').attempts;
     assert.equal(silent.verdict, 'unverifiable');
-    assert.equal(silent.unverifiableFromRunner, false, 'a player that never became ready is dead for viewers too');
+    assert.equal(silent.unverifiableFromRunner, true, 'a player that never became ready can be the busy headless page, not the stream');
 
     assert.deepEqual(bySlot.get('live-news/rtve').attempts, []);
     assert.deepEqual(report.canaries.map((canary) => [canary.entry, canary.kind, canary.verdict, canary.evidence.author]), [
@@ -526,6 +526,36 @@ describe('audit report (--all --report)', () => {
       assert.equal(slot.attempts[0].unverifiableFromRunner, unverifiable, detail);
       assert.equal(slot.status, unverifiable ? 'unverifiable-from-runner' : 'needs-replacement', detail);
     }
+  });
+
+  it('counts a stream that never started as dead, and every unverifiable player verdict as unverifiable from the runner', async () => {
+    const videoOnly = { webcams: {}, gridPriority: [], news: { bloomberg: [watch('QB5BNdBFujE')] }, canaries: [CANARY] };
+    const cases = [
+      [{ verdict: 'failed', outcome: { kind: 'not-started' } }, false, 'needs-replacement', /scheduled or not started/],
+      [{ verdict: 'unverifiable', reason: 'live-signal-missing' }, true, 'unverifiable-from-runner', /isLive missing/],
+      [{ verdict: 'unverifiable', reason: 'player-api-silent' }, true, 'unverifiable-from-runner', /never became ready/],
+      [{ verdict: 'unverifiable', reason: 'player-api-blocked' }, true, 'unverifiable-from-runner', /IFrame API did not load/],
+    ];
+    for (const [verdict, unverifiable, status, why] of cases) {
+      const label = verdict.outcome?.kind ?? verdict.reason;
+      const probeYouTube = async (candidates) => candidates.map((candidate) => (candidate.kind === 'channel'
+        ? live('gCNeDWCI0vo')
+        : { verdict, durationSeconds: null, verdictAtMs: 15_000 }));
+      const { writes: [{ report }] } = await audit(['--all', '--report', 'audit.json'], { catalog: videoOnly, probeYouTube });
+      const [slot] = report.slots;
+      assert.equal(slot.attempts[0].unverifiableFromRunner, unverifiable, label);
+      assert.equal(slot.status, status, label);
+      assert.match(slot.attempts[0].why, why, label);
+    }
+  });
+
+  it('records a live HLS playlist as live with playback not checked', async () => {
+    const hlsOnly = { webcams: {}, gridPriority: [], news: { bloomberg: [BLOOMBERG_HLS] }, canaries: [CANARY] };
+    const probeHls = async (candidates) => candidates.map(() => ({ verdict: { verdict: 'live', video: null } }));
+    const { writes: [{ report }] } = await audit(['--all', '--report', 'audit.json'], { catalog: hlsOnly, probeHls });
+    const [slot] = report.slots;
+    assert.equal(slot.status, 'ok');
+    assert.equal(slot.attempts[0].why, 'HLS playlist is live (playback not checked outside a browser)');
   });
 
   it('fails before probing when a slot has no place on the dashboard', async () => {
