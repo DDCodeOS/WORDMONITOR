@@ -1,0 +1,239 @@
+import { ensureHydrated, getHydratedData, waitForBootstrapSlowTier } from './bootstrap';
+import { getPersistentCache, setPersistentCache } from './persistent-cache';
+import type { ConvergenceCard, CorrelationDomain } from './correlation-engine';
+
+export interface CorrelationSnapshot {
+  cards: ConvergenceCard[];
+  computedAt: number;
+  origin: 'seed' | 'local';
+}
+
+export type CorrelationSnapshotState =
+  | { status: 'loading' | 'waiting'; snapshot: null }
+  | { status: 'current' | 'updating'; snapshot: CorrelationSnapshot };
+
+const DOMAINS = ['military', 'escalation', 'economic', 'disaster'] as const;
+const CACHE_KEY = 'correlation-snapshots:v1';
+const MINUTE = 60_000;
+const REFRESH_MS = 5 * MINUTE;
+const FRESH_MS = 15 * MINUTE;
+// Historical display only; this does not extend the producer's freshness budget.
+const MAX_AGE_MS = 60 * MINUTE;
+
+type Listener = (state: CorrelationSnapshotState) => void;
+const snapshots = new Map<CorrelationDomain, CorrelationSnapshot>();
+const listeners = new Map<CorrelationDomain, Set<Listener>>();
+const failedDomains = new Set<CorrelationDomain>();
+let timer: ReturnType<typeof setTimeout> | undefined;
+let generation = 0;
+let active = false;
+let pending = false;
+let attempted = false;
+let failureCount = 0;
+let nextFetchAt = 0;
+let saveQueued = false;
+
+function record(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function finite(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function validCards(value: unknown, domain: CorrelationDomain): value is ConvergenceCard[] {
+  return Array.isArray(value) && value.every(card => (
+    record(card) && typeof card.id === 'string' && card.domain === domain
+    && typeof card.title === 'string' && finite(card.score)
+    && card.score >= 0 && card.score <= 100 && finite(card.timestamp)
+    && ['escalating', 'stable', 'de-escalating'].includes(String(card.trend))
+    && Array.isArray(card.countries) && card.countries.every(country => typeof country === 'string')
+    && (card.assessment === undefined || typeof card.assessment === 'string')
+    && (card.location === undefined || (record(card.location)
+      && finite(card.location.lat) && Math.abs(card.location.lat) <= 90
+      && finite(card.location.lon) && Math.abs(card.location.lon) <= 180
+      && typeof card.location.label === 'string'))
+    && Array.isArray(card.signals) && card.signals.every(signal => (
+      record(signal) && typeof signal.type === 'string' && typeof signal.label === 'string'
+      && typeof signal.source === 'string' && finite(signal.severity) && finite(signal.timestamp)
+    ))
+  ));
+}
+
+function validTime(value: unknown): value is number {
+  return finite(value) && value > 0 && value <= Date.now() + MINUTE
+    && Date.now() - value < MAX_AGE_MS;
+}
+
+function stateFor(domain: CorrelationDomain): CorrelationSnapshotState {
+  const snapshot = snapshots.get(domain);
+  if (!snapshot || !validTime(snapshot.computedAt)) {
+    return { status: attempted ? 'waiting' : 'loading', snapshot: null };
+  }
+  const updating = pending || navigator.onLine === false
+    || Date.now() - snapshot.computedAt >= FRESH_MS
+    || (snapshot.origin === 'seed' && failedDomains.has(domain));
+  return { status: updating ? 'updating' : 'current', snapshot };
+}
+
+function notify(): void {
+  for (const [domain, callbacks] of listeners) {
+    const state = stateFor(domain);
+    for (const callback of callbacks) callback(state);
+  }
+}
+
+function accept(domain: CorrelationDomain, snapshot: CorrelationSnapshot): boolean {
+  const previous = snapshots.get(domain);
+  if (previous && previous.computedAt >= snapshot.computedAt) return false;
+  snapshots.set(domain, snapshot);
+  return true;
+}
+
+function persist(): void {
+  if (saveQueued) return;
+  saveQueued = true;
+  queueMicrotask(() => {
+    saveQueued = false;
+    const saved = Object.fromEntries([...snapshots].map(([domain, snapshot]) => [domain, {
+      ...snapshot,
+      // Local adapters may attach large source objects; the panel never renders them.
+      cards: snapshot.cards.map(card => ({
+        ...card,
+        assessment: snapshot.origin === 'seed' ? card.assessment : undefined,
+        signals: card.signals.map(({ rawData: _rawData, ...signal }) => signal),
+      })),
+    }]));
+    void setPersistentCache(CACHE_KEY, saved).catch(error => {
+      console.warn('[CorrelationSnapshot] Cache write failed', error);
+    });
+  });
+}
+
+async function restore(epoch: number): Promise<void> {
+  try {
+    const saved = await getPersistentCache<unknown>(CACHE_KEY);
+    if (!active || epoch !== generation || !record(saved?.data)) return;
+    for (const domain of DOMAINS) {
+      const value = saved.data[domain];
+      if (record(value) && validTime(value.computedAt) && validCards(value.cards, domain)
+        && (value.origin === 'seed' || (value.origin === 'local' && value.cards.length > 0))) {
+        accept(domain, { cards: value.cards, computedAt: value.computedAt, origin: value.origin });
+      }
+    }
+    notify();
+  } catch (error) {
+    console.warn('[CorrelationSnapshot] Cache read failed', error);
+  }
+}
+
+async function refresh(): Promise<void> {
+  const epoch = generation;
+  pending = true;
+  notify();
+  try {
+    // Drain legacy tier hydration during a rolling deploy without making its
+    // completion a permanent prerequisite for this on-demand key.
+    await waitForBootstrapSlowTier(3_500);
+    if (!active || epoch !== generation) return;
+    const payload = getHydratedData('correlationCards') ?? await ensureHydrated('correlationCards');
+    if (!active || epoch !== generation) return;
+    let changed = false;
+    failedDomains.clear();
+    for (const domain of DOMAINS) {
+      if (record(payload) && validTime(payload.computedAt) && validCards(payload[domain], domain)) {
+        changed = accept(domain, {
+          cards: payload[domain], computedAt: payload.computedAt, origin: 'seed',
+        }) || changed;
+      } else {
+        failedDomains.add(domain);
+      }
+    }
+    if (changed) persist();
+    if (failedDomains.size) {
+      console.warn('[CorrelationSnapshot] Missing, expired or invalid domains', [...failedDomains]);
+    }
+  } catch (error) {
+    if (!active || epoch !== generation) return;
+    for (const domain of DOMAINS) failedDomains.add(domain);
+    console.warn('[CorrelationSnapshot] Refresh failed', error);
+  } finally {
+    if (active && epoch === generation) {
+      pending = false;
+      attempted = true;
+      failureCount = failedDomains.size ? failureCount + 1 : 0;
+      nextFetchAt = Date.now() + (failureCount
+        ? Math.min(15_000 * 2 ** Math.min(failureCount - 1, 4), 180_000)
+        : REFRESH_MS);
+      notify();
+      schedule();
+    }
+  }
+}
+
+function tick(): void {
+  if (!active) return;
+  if (!pending && Date.now() >= nextFetchAt) {
+    if (navigator.onLine === false) {
+      attempted = true;
+      nextFetchAt = Date.now() + MINUTE;
+    } else {
+      void refresh();
+    }
+  }
+  notify();
+  schedule();
+}
+
+function schedule(): void {
+  clearTimeout(timer);
+  if (!active) return;
+  timer = setTimeout(tick, pending ? MINUTE : Math.max(1, Math.min(MINUTE, nextFetchAt - Date.now())));
+}
+
+function reconnect(): void {
+  nextFetchAt = 0;
+  tick();
+}
+
+export function subscribeCorrelationSnapshot(domain: CorrelationDomain, listener: Listener): () => void {
+  let subscribed = true;
+  const callbacks = listeners.get(domain) ?? new Set<Listener>();
+  callbacks.add(listener);
+  listeners.set(domain, callbacks);
+  listener(stateFor(domain));
+  if (!active) {
+    active = true;
+    generation++;
+    window.addEventListener('online', reconnect);
+    window.addEventListener('offline', tick);
+    void restore(generation);
+    nextFetchAt = 0;
+    tick();
+  }
+  return () => {
+    if (!subscribed) return;
+    subscribed = false;
+    callbacks.delete(listener);
+    if (!callbacks.size) listeners.delete(domain);
+    if (listeners.size || !active) return;
+    active = false;
+    generation++;
+    pending = false;
+    clearTimeout(timer);
+    window.removeEventListener('online', reconnect);
+    window.removeEventListener('offline', tick);
+  };
+}
+
+export function publishLocalCorrelationCards(domain: CorrelationDomain, cards: ConvergenceCard[]): void {
+  if (!validCards(cards, domain)) {
+    console.warn('[CorrelationSnapshot] Invalid local cards', domain);
+    return;
+  }
+  // Adapters also return [] when their inputs have not loaded. Only the
+  // validated seed can authoritatively clear previously observed activity.
+  if (cards.length === 0) return;
+  if (accept(domain, { cards, computedAt: Date.now(), origin: 'local' })) persist();
+  notify();
+}

@@ -17,27 +17,18 @@ test('FAST-demoted consumers use demand-gated public hydration without miss-to-R
   const loader = read('src/app/data-loader.ts');
   const forecasts = method(loader, '  async loadForecasts()', '  async loadSimulationOutcome(');
   const correlation = read('src/components/CorrelationPanel.ts');
-  const correlationLoader = method(
-    correlation,
-    'function loadCorrelationBootstrap()',
-    '// Score-badge BACKGROUND colors.',
-  );
+  const correlationLoader = read('src/services/correlation-snapshots.ts');
 
   assert.match(forecasts, /await ensureHydrated\('forecasts'\)/);
   assert.doesNotMatch(forecasts, /fetchForecastFeed|getForecasts/);
   assert.match(forecasts, /showError[\s\S]*loadForecasts/);
 
-  assert.match(correlation, /ensureHydrated\('correlationCards'\)/);
-  assert.match(correlation, /observeNearViewport\(\(\) => this\.loadBootstrapCards\(\), 400\)/);
-  assert.match(correlation, /showError[\s\S]*loadBootstrapCards/);
+  assert.match(correlationLoader, /ensureHydrated\('correlationCards'\)/);
+  assert.match(correlation, /observeNearViewport\(\(\) => \{[\s\S]*subscribeCorrelationSnapshot[\s\S]*\}, 400\)/);
   assert.match(
     correlationLoader,
-    /waitForBootstrapSlowTier\(\)[\s\S]*getHydratedData\('correlationCards'\)[\s\S]*ensureHydrated\('correlationCards'\)/,
+    /waitForBootstrapSlowTier\(3_500\)[\s\S]*getHydratedData\('correlationCards'\)[\s\S]*ensureHydrated\('correlationCards'\)/,
     'rolling deploys must re-read the old SLOW response before trying the new per-key URL',
   );
-  assert.match(
-    correlationLoader,
-    /correlationBootstrap === null\) correlationBootstrapPromise = null/,
-    'empty reads must remain retryable',
-  );
+  assert.doesNotMatch(correlationLoader, /ServiceClient|\/api\/.*\/v1\//);
 });
