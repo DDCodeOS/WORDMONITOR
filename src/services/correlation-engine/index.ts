@@ -7,7 +7,6 @@ export type {
   TrendDirection,
 } from './types';
 export { CorrelationEngine } from './engine';
-export { CORRELATION_DOMAINS } from './types';
 export { militaryAdapter } from './adapters/military';
 export { escalationAdapter } from './adapters/escalation';
 export { economicAdapter } from './adapters/economic';

@@ -2,6 +2,7 @@
 import type { AppContext } from '@/app/app-context';
 import type {
   DomainAdapter,
+  CorrelationDomain,
   SignalEvidence,
   ConvergenceCard,
   ClusterState,
@@ -32,7 +33,10 @@ export class CorrelationEngine {
   private llmCache: Map<string, LlmCacheEntry> = new Map();
   private intelligenceClient: InstanceType<typeof IntelligenceServiceClient>;
   private running = false;
-  private llmInFlight = new Map<string, Promise<string | undefined>>();
+  private llmInFlight = new Set<string>();
+  private assessmentCards = new Map<CorrelationDomain, ConvergenceCard[]>();
+  private attemptedAssessments = new WeakSet<ConvergenceCard>();
+  private assessmentGeneration = 0;
   private consecutiveSlowRuns = 0;
   private peakSlowRunMs = 0;
   private warnedForCurrentSlowStreak = false;
@@ -409,31 +413,58 @@ export class CorrelationEngine {
   // ── LLM Assessment ─────────────────────────────────────────
 
   /** Assess only the evidence selected for display, whether seeded or computed locally. */
-  assessCards(cards: ConvergenceCard[]): void {
+  assessCards(domain: CorrelationDomain, cards: ConvergenceCard[]): void {
+    this.assessmentCards.set(domain, cards);
+    this.drainAssessments();
+  }
+
+  clearAssessments(): void {
+    this.assessmentGeneration++;
+    this.llmCache.clear();
+    for (const cards of this.assessmentCards.values()) {
+      for (const card of cards) delete card.assessment;
+    }
+    const domains = [...this.assessmentCards.keys()];
+    this.assessmentCards.clear();
+    this.attemptedAssessments = new WeakSet();
+    document.dispatchEvent(new CustomEvent('wm:correlation-updated', {
+      detail: { domains, assessmentUpdate: true },
+    }));
+  }
+
+  private drainAssessments(): void {
     if (!hasPremiumAccess()) return;
-    for (const card of cards) {
+    const changed = new Set<CorrelationDomain>();
+    for (const card of [...this.assessmentCards.values()].flat()) {
       if (card.score < LLM_SCORE_THRESHOLD) continue;
 
       const cacheKey = this.llmCacheKey(card);
       const cached = this.llmCache.get(cacheKey);
       if (cached && (Date.now() - cached.timestamp) < LLM_CACHE_TTL_MS) {
-        card.assessment = cached.assessment;
+        if (card.assessment !== cached.assessment) {
+          card.assessment = cached.assessment;
+          changed.add(card.domain);
+        }
         continue;
       }
 
-      let request = this.llmInFlight.get(cacheKey);
-      if (!request) {
-        if (this.llmInFlight.size >= LLM_MAX_CONCURRENT) continue;
-        request = this.fetchAssessment(card, cacheKey).finally(() => { this.llmInFlight.delete(cacheKey); });
-        this.llmInFlight.set(cacheKey, request);
+      if (this.llmInFlight.has(cacheKey)) {
+        continue;
       }
-      void request.then(assessment => {
-        if (!assessment) return;
-        card.assessment = assessment;
-        document.dispatchEvent(new CustomEvent('wm:correlation-updated', {
-          detail: { domains: [card.domain], assessmentUpdate: true },
-        }));
+      if (this.attemptedAssessments.has(card) || this.llmInFlight.size >= LLM_MAX_CONCURRENT) continue;
+      this.attemptedAssessments.add(card);
+      this.llmInFlight.add(cacheKey);
+      void this.fetchAssessment(card, cacheKey).finally(() => {
+        this.llmInFlight.delete(cacheKey);
+        // Re-scan only the currently selected cards; replaced/closed panels
+        // must not leave obsolete paid work waiting behind the concurrency cap.
+        this.drainAssessments();
       });
+    }
+    if (changed.size) {
+      document.dispatchEvent(new CustomEvent('wm:correlation-updated', {
+        detail: { domains: [...changed], assessmentUpdate: true },
+      }));
     }
   }
 
@@ -449,6 +480,7 @@ export class CorrelationEngine {
     card: ConvergenceCard,
     cacheKey: string,
   ): Promise<string | undefined> {
+    const generation = this.assessmentGeneration;
     try {
       const signalSummary = card.signals
         .map(s => `- [${s.type}] ${s.label} (severity: ${s.severity})`)
@@ -474,7 +506,7 @@ export class CorrelationEngine {
 
       const resp = await this.intelligenceClient.deductSituation({ query, geoContext, framework: '' });
 
-      if (resp.analysis) {
+      if (resp.analysis && generation === this.assessmentGeneration && hasPremiumAccess()) {
         this.llmCache.set(cacheKey, { assessment: resp.analysis, timestamp: Date.now() });
         return resp.analysis;
       }

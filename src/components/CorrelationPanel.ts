@@ -9,6 +9,7 @@ import {
   type CorrelationSnapshotState,
 } from '@/services/correlation-snapshots';
 import { describeFreshness } from '@/services/persistent-cache';
+import { hasPremiumAccess } from '@/services/panel-gating';
 
 // Score-badge BACKGROUND colors. Badge text color is chosen per-background via
 // readableTextColor() so it clears WCAG AA on each: white on the dark `low`
@@ -64,6 +65,7 @@ export class CorrelationPanel extends Panel {
 
   override destroy(): void {
     this.correlationDestroyed = true;
+    this.assessmentHandler?.([]);
     this.stopSnapshots?.();
     document.removeEventListener('wm:correlation-updated', this.boundUpdateHandler);
     super.destroy();
@@ -82,9 +84,9 @@ export class CorrelationPanel extends Panel {
 
   private requestAssessments(): void {
     const cards = this.snapshotState.snapshot?.cards;
-    if (!this.assessmentHandler || !cards || cards === this.assessedCards) return;
+    if (!this.assessmentHandler || cards === this.assessedCards) return;
     this.assessedCards = cards;
-    this.assessmentHandler(cards);
+    this.assessmentHandler(cards ?? []);
   }
 
   protected navigateToMap(lat: number, lon: number): void {
@@ -231,11 +233,11 @@ export class CorrelationPanel extends Panel {
       h('div', { style: 'padding:6px 0;' }, ...signalList),
     ];
 
-    if (card.assessment) {
+    if (card.assessment && hasPremiumAccess()) {
       children.push(h('div', {
         style: 'padding:6px 8px;margin:4px 0;border-radius:4px;background:rgba(100,150,255,0.08);border-left:2px solid rgba(100,150,255,0.3);font-size:calc(10px * var(--wm-panel-effective-scale, 1));line-height:1.4;',
       }, card.assessment));
-    } else if (card.score >= 60 && this.snapshotState.snapshot?.origin === 'local') {
+    } else if (card.score >= 60 && this.assessmentHandler && hasPremiumAccess()) {
       children.push(h('div', {
         style: 'padding:4px;font-size:calc(9px * var(--wm-panel-effective-scale, 1));opacity:0.4;font-style:italic;',
       }, t('components.correlation.analyzing')));

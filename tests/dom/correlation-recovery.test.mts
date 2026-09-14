@@ -304,6 +304,15 @@ describe('correlation snapshot recovery', () => {
     expect(mocks.fetch).toHaveBeenCalledTimes(2);
   });
 
+  it('moves a healthy five-minute deadline forward when an offline event arrives', async () => {
+    watch();
+    await settle();
+    vi.spyOn(navigator, 'onLine', 'get').mockReturnValue(false);
+    window.dispatchEvent(new Event('offline'));
+    await vi.advanceTimersByTimeAsync(MINUTE + 25);
+    expect(mocks.fetch).toHaveBeenCalledTimes(2);
+  });
+
   it('accepts healthy generations with seven minutes of clock skew without resetting source time', async () => {
     mocks.fetch.mockImplementation(() => payload([], Date.now() + 7 * MINUTE));
     const result = watch();
@@ -514,7 +523,7 @@ describe('CorrelationPanel presentation', () => {
     });
     await engine.run({} as never);
     expect(mocks.deduct).not.toHaveBeenCalled();
-    result.setAssessmentHandler(cards => engine.assessCards(cards));
+    result.setAssessmentHandler(cards => engine.assessCards('economic', cards));
     result.updateCards(engine.getCards('economic'));
     await settle();
     expect(mocks.deduct).toHaveBeenCalledTimes(1);
@@ -533,37 +542,123 @@ describe('CorrelationPanel presentation', () => {
     expect(mocks.deduct).toHaveBeenCalledTimes(1);
   });
 
+  it('connects a deferred panel mounted after the engine already exists', async () => {
+    const { CorrelationEngine } = await import('@/services/correlation-engine/engine');
+    const engine = new CorrelationEngine();
+    mocks.fetch.mockResolvedValue(payload([{ ...card(), score: 75 }]));
+    const result = await panel();
+    expect(mocks.deduct).not.toHaveBeenCalled();
+    const { PanelLayoutManager } = await import('@/app/panel-layout');
+    // Exercise the real mount handoff without starting the unrelated billing/map constructor.
+    const mount = Reflect.get(PanelLayoutManager.prototype, 'afterPanelMounted');
+    mount.call({
+      ctx: { correlationEngine: engine, panelSettings: {} },
+      observePanelForHydration: vi.fn(),
+    }, 'economic-correlation', result);
+    await settle();
+    result.getElement().querySelector<HTMLElement>('.correlation-card-header')!.click();
+    expect(result.getElement().textContent).toContain('Premium narrative for displayed evidence');
+    expect(mocks.deduct).toHaveBeenCalledTimes(1);
+  });
+
   it('shares an in-flight assessment only across identical evidence and respects premium access', async () => {
     const { CorrelationEngine } = await import('@/services/correlation-engine/engine');
     const engine = new CorrelationEngine();
     const first = { ...card(), score: 75, countries: ['US', 'CA'] };
     const next = structuredClone(first);
     mocks.premium.mockReturnValue(false);
-    engine.assessCards([first]);
+    engine.assessCards('economic', [first]);
     expect(mocks.deduct).not.toHaveBeenCalled();
     mocks.premium.mockReturnValue(true);
     const response = deferred<{ analysis: string }>();
     mocks.deduct.mockReturnValueOnce(response.promise);
-    engine.assessCards([first]);
-    engine.assessCards([next]);
+    engine.assessCards('economic', [first]);
+    engine.assessCards('economic', [next]);
     expect(mocks.deduct).toHaveBeenCalledTimes(1);
     response.resolve({ analysis: 'Shared evidence narrative' });
     await settle();
-    expect(first.assessment).toBe('Shared evidence narrative');
+    expect(first.assessment).toBeUndefined();
     expect(next.assessment).toBe('Shared evidence narrative');
     expect(first.countries).toEqual(['US', 'CA']);
     const cached = structuredClone(first);
     delete cached.assessment;
-    engine.assessCards([cached]);
+    engine.assessCards('economic', [cached]);
     expect(cached.assessment).toBe('Shared evidence narrative');
     expect(mocks.deduct).toHaveBeenCalledTimes(1);
     const changed = structuredClone(first);
     changed.signals[0]!.label = 'New evidence in same cluster';
     delete changed.assessment;
-    engine.assessCards([changed]);
+    engine.assessCards('economic', [changed]);
     await settle();
     expect(mocks.deduct).toHaveBeenCalledTimes(2);
     expect(changed.assessment).toBe('Premium narrative for displayed evidence');
+  });
+
+  it('drains all selected cards through the concurrency cap without looping on a failed assessment', async () => {
+    const { CorrelationEngine } = await import('@/services/correlation-engine/engine');
+    const engine = new CorrelationEngine();
+    const cards = Array.from({ length: 5 }, (_, index) => ({ ...card(), score: 70 + index }));
+    const responses: Array<ReturnType<typeof deferred<{ analysis: string }>>> = [];
+    mocks.deduct.mockImplementation(() => {
+      const response = deferred<{ analysis: string }>();
+      responses.push(response);
+      return response.promise;
+    });
+    engine.assessCards('economic', cards);
+    expect(mocks.deduct).toHaveBeenCalledTimes(3);
+    responses[0]!.resolve({ analysis: '' });
+    await settle();
+    expect(mocks.deduct).toHaveBeenCalledTimes(4);
+    responses[1]!.resolve({ analysis: 'Second' });
+    await settle();
+    expect(mocks.deduct).toHaveBeenCalledTimes(5);
+    for (const response of responses.slice(2)) response.resolve({ analysis: 'Completed' });
+    await settle();
+    expect(cards[0]!.assessment).toBeUndefined();
+    expect(cards.slice(1).every(card => !!card.assessment)).toBe(true);
+    expect(mocks.deduct).toHaveBeenCalledTimes(5);
+  });
+
+  it('drops queued work when a panel stops displaying its cards', async () => {
+    const { CorrelationEngine } = await import('@/services/correlation-engine/engine');
+    const engine = new CorrelationEngine();
+    const response = deferred<{ analysis: string }>();
+    mocks.deduct.mockReturnValue(response.promise);
+    engine.assessCards('economic', Array.from({ length: 4 }, (_, index) => ({ ...card(), score: 70 + index })));
+    expect(mocks.deduct).toHaveBeenCalledTimes(3);
+    engine.assessCards('economic', []);
+    response.resolve({ analysis: 'Old work' });
+    await settle();
+    expect(mocks.deduct).toHaveBeenCalledTimes(3);
+  });
+
+  it('clears visible premium assessments on access loss and rejects an old in-flight result', async () => {
+    const seed = { ...card(), score: 75 };
+    mocks.fetch.mockResolvedValue(payload([seed]));
+    const result = await panel();
+    const { CorrelationEngine } = await import('@/services/correlation-engine/engine');
+    const engine = new CorrelationEngine();
+    result.setAssessmentHandler(cards => engine.assessCards('economic', cards));
+    await settle();
+    result.getElement().querySelector<HTMLElement>('.correlation-card-header')!.click();
+    expect(result.getElement().textContent).toContain('Premium narrative for displayed evidence');
+    mocks.premium.mockReturnValue(false);
+    engine.clearAssessments();
+    await settle();
+    expect(seed.assessment).toBeUndefined();
+    expect(result.getElement().textContent).not.toContain('Premium narrative for displayed evidence');
+
+    const old = deferred<{ analysis: string }>();
+    mocks.deduct.mockReturnValueOnce(old.promise);
+    mocks.premium.mockReturnValue(true);
+    result.setAssessmentHandler(cards => engine.assessCards('economic', cards));
+    engine.clearAssessments();
+    result.setAssessmentHandler(cards => engine.assessCards('economic', cards));
+    old.resolve({ analysis: 'Previous entitlement generation' });
+    await settle();
+    expect(result.getElement().textContent).not.toContain('Previous entitlement generation');
+    expect(result.getElement().textContent).toContain('Premium narrative for displayed evidence');
+    expect(mocks.deduct).toHaveBeenCalledTimes(3);
   });
 
   it('renders confirmed empty as content, with a known count', async () => {

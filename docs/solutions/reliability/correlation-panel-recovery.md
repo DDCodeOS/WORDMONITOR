@@ -34,9 +34,15 @@ Connectivity is an offline hint overridden by a successful endpoint probe.
 The component owns presentation, map navigation, supplements, and expansion.
 Saved cards exclude raw source objects and session-specific premium LLM
 assessments. App installs an assessment handler on the panel; the panel passes
-the selected evidence to the engine after seed/local ordering. The engine does
+the selected evidence to the engine after seed/local ordering, including panels
+mounted after engine initialization. The engine does
 not assess discarded local computations. Its cache and in-flight sharing match
 the prompt evidence, so a shared cluster ID cannot attach an unrelated narrative.
+The three-request concurrency limit drains the currently selected cards after
+each completion; replaced/closed panels drop queued work. Failed assessments
+wait for new selected data rather than immediately retrying. Premium access loss
+clears live assessments and their cache, invalidates old request generations,
+and repaints the panel. Rendering also checks current premium access.
 Status-only updates preserve the card DOM, focus, and expansion. Assessments
 and deferred supplements still request content redraws.
 No caller coordinates separate read, restore, validate, and save operations.
@@ -50,6 +56,9 @@ local calculations. Panel-owned recovery repeated clocks and timers. A generic
 The existing circuit breaker timestamps acquisition and does not publish its
 background refresh to component subscribers; wrapping it would still leave this
 domain's ordering and local producer outside the owner.
+
+Shared domain definitions live in the types layer. Importing values from the
+engine directory would pull its manually grouped lazy chunk into initial load.
 
 The selected shape preserves the existing App call site, public bootstrap helper,
 legacy slow-tier drain, near-viewport activation, persistent-cache storage, and

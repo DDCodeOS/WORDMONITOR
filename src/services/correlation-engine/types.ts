@@ -2,9 +2,9 @@
 
 // boundary-ignore: AppContext is an aggregate type that lives in app/ by design
 import type { AppContext } from '@/app/app-context';
+import type { CorrelationDomain } from '@/types/correlation';
 
-export const CORRELATION_DOMAINS = ['military', 'escalation', 'economic', 'disaster'] as const;
-export type CorrelationDomain = typeof CORRELATION_DOMAINS[number];
+export type { CorrelationDomain } from '@/types/correlation';
 export type TrendDirection = 'escalating' | 'stable' | 'de-escalating';
 
 export interface SignalEvidence {

@@ -1,7 +1,7 @@
 import { ensureHydrated, getHydratedData, waitForBootstrapSlowTier } from './bootstrap';
 import { getPersistentCache, setPersistentCache } from './persistent-cache';
 import type { ConvergenceCard, CorrelationDomain } from './correlation-engine';
-import { CORRELATION_DOMAINS } from './correlation-engine/types';
+import { CORRELATION_DOMAINS } from '@/types/correlation';
 import { enqueueSentryCall } from '@/bootstrap/sentry-defer';
 
 export interface CorrelationSnapshot {
@@ -238,6 +238,7 @@ function reconnect(): void {
 function disconnect(): void {
   reachedServer = false;
   offlineProbeAt = Date.now() + MINUTE;
+  nextFetchAt = offlineProbeAt;
   tick();
 }
 
