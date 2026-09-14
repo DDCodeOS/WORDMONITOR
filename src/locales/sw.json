@@ -925,7 +925,7 @@
     "webcams": {
       "paused": "Kamera za wavuti zimesitishwa",
       "play": "Cheza",
-      "previewStatus": "Onyesho la kukagua moja kwa moja",
+      "previewStatus": "Tayari kucheza",
       "regions": {
         "all": "YOTE",
         "mideast": "KATI",
@@ -933,7 +933,11 @@
         "americas": "MAREKANI",
         "asia": "ASIA",
         "space": "NAFASI"
-      }
+      },
+      "connecting": "Inaunganisha…",
+      "unverified": "Haiwezi kuthibitisha kuwa mtaji huu ni moja kwa moja",
+      "offline": "{{city}} hayako mtandaoni sasa",
+      "noFeeds": "Hakuna kamera za mtandaoni moja kwa moja katika eneo hili sasa"
     },
     "pinnedWebcams": {
       "pinFromMap": "Bandika kamera ya wavuti kutoka kwenye ramani"
