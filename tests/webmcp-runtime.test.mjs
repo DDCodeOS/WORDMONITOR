@@ -8,6 +8,7 @@ import {
   CANCELLATION_REQUIRED_WEBMCP_TOOLS,
   WEBMCP_TOOL_CANCELLATION_POLICY,
   buildWebMcpTools,
+  createWebMcpBindingsGate,
   registerWebMcpTools,
 } from '../src/services/webmcp.ts';
 import { waitForWebMcpUiReady } from '../src/app/webmcp-dashboard.ts';
@@ -24,8 +25,12 @@ const settlePromises = async () => {
 
 function deferred() {
   let resolve;
-  const promise = new Promise((onResolve) => { resolve = onResolve; });
-  return { promise, resolve };
+  let reject;
+  const promise = new Promise((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  return { promise, resolve, reject };
 }
 
 function createBindings(overrides = {}) {
@@ -333,6 +338,32 @@ describe('WebMCP registry behavioral contract', () => {
     assert.equal(opened, 1);
   });
 
+  it('detaches each canceled or timed-out waiter and clears its timer while the load stalls', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const scheduled = t.mock.method(globalThis, 'setTimeout');
+    const cleared = t.mock.method(globalThis, 'clearTimeout');
+    const gate = createWebMcpBindingsGate(deferred().promise);
+    for (let i = 0; i < 20; i += 1) {
+      const caller = new AbortController();
+      const detached = assert.rejects(
+        gate.wait(caller.signal),
+        i % 2 ? /did not load/ : { name: 'AbortError' },
+      );
+      assert.equal(gate.pendingWaiters, 1);
+      if (i % 2) t.mock.timers.tick(30_000);
+      else caller.abort();
+      await detached;
+      assert.equal(gate.pendingWaiters, 0, 'A detached call must not stay subscribed to the stalled load.');
+    }
+    const timers = scheduled.mock.calls.map((call) => call.result);
+    assert.equal(timers.length, 20);
+    assert.deepEqual(
+      cleared.mock.calls.map((call) => call.arguments[0]),
+      timers,
+      'Every per-call timer must be cleared when its call detaches.',
+    );
+  });
+
   it('publishes the complete inventory while App bindings are still loading', async () => {
     const pending = deferred();
     const provider = new FakeWebMcpModelContext({ supportsTargetExecutionSignal: true });
@@ -362,7 +393,13 @@ describe('WebMCP registry behavioral contract', () => {
       const caller = new AbortController();
       let opened = false;
       const invocation = executeRegistered(provider, 'openSearch', '{}', { signal: caller.signal });
-      const rejected = assert.rejects(invocation, (error) => error.name === 'AbortError');
+      // Caller cancellation stays AbortError. Registration teardown means the
+      // App will not serve the call, which is reported as app_destroyed.
+      const rejected = assert.rejects(invocation, (error) => (
+        cancelRegistration
+          ? error.name === 'WebMcpToolError' && /Reason: app_destroyed\.$/.test(error.message)
+          : error.name === 'AbortError'
+      ));
       await settlePromises();
       (cancelRegistration ? controller : caller).abort();
       await rejected;
@@ -382,9 +419,34 @@ describe('WebMCP registry behavioral contract', () => {
     await settlePromises();
     await assert.rejects(executeRegistered(provider, 'openSearch'), {
       name: 'WebMcpToolError',
-      message: 'World Monitor could not open search.',
+      message: 'Dashboard unavailable: Dashboard application did not load. Reason: app_destroyed.',
     });
     controller.abort();
+  });
+
+  it('reports an App load failure torn down with its registration as app_destroyed, not cancellation', async () => {
+    const pending = deferred();
+    const provider = new FakeWebMcpModelContext({ supportsTargetExecutionSignal: true });
+    const harness = trackedRuntime(provider);
+    const controller = registerWebMcpTools(pending.promise, harness.runtime);
+    const invocation = executeRegistered(provider, 'openSearch');
+    const rejected = assert.rejects(invocation, (error) => {
+      assert.equal(error.name, 'WebMcpToolError');
+      assert.match(error.message, /Reason: app_destroyed\.$/);
+      assert.doesNotMatch(error.message, /private startup detail/);
+      return true;
+    });
+    await settlePromises();
+    // src/main.ts rejects the load and tears down registration in the same tick.
+    pending.reject(new Error('private startup detail'));
+    controller.abort();
+    await rejected;
+    assert.deepEqual(
+      harness.events
+        .filter(({ event }) => event === 'webmcp-tool-invoked')
+        .map(({ data }) => data.reason),
+      ['unavailable'],
+    );
   });
 
   it('times out a stalled App without preventing a later invocation', async (t) => {

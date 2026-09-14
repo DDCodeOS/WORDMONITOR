@@ -170,7 +170,6 @@ import {
   DashboardBindingError,
   isWebMcpAbortError,
   raceWebMcpAbort,
-  registerWebMcpTools,
   throwIfWebMcpAborted,
   type WebMcpAppBindings,
   type WebMcpExecutionOptions,
@@ -2350,15 +2349,13 @@ export class App {
     };
   }
 
-  public async init(webMcpController?: AbortController | null): Promise<void> {
+  public async init(webMcpController: AbortController | null): Promise<void> {
     const initStart = performance.now();
     markLcpDebug('wm:boot:app-init-start');
 
-    // The dashboard entry registers before loading App. Direct App callers
-    // still register here; both paths retain the same readiness and teardown.
-    this.webMcpController = webMcpController === undefined
-      ? registerWebMcpTools(this.getWebMcpBindings())
-      : webMcpController;
+    // src/main.ts registers WebMCP before loading App. Own its controller before
+    // the first await so a failed init unregisters those tools through destroy().
+    this.webMcpController = webMcpController;
 
     window.addEventListener(I18N_RESOURCES_LOADED_EVENT, this.handleI18nResourcesLoaded);
 

@@ -1779,46 +1779,77 @@ function boundPanelTabResult(result: PanelTabSelectionResult): Record<string, un
   };
 }
 
+const WEBMCP_APP_LOAD_TIMEOUT_MS = 30_000;
+
+export interface WebMcpBindingsGate {
+  wait(signal?: AbortSignal): Promise<WebMcpAppBindings>;
+  // Calls still waiting for an unsettled App load.
+  readonly pendingWaiters: number;
+}
+
+// Dashboard tools register before App loads, so every call waits here first.
+// The wait is bounded, and a canceled or timed-out call detaches its waiter and
+// timer so a stalled load retains nothing per abandoned call.
+export function createWebMcpBindingsGate(
+  bindings: WebMcpAppBindings | PromiseLike<WebMcpAppBindings>,
+): WebMcpBindingsGate {
+  type BindingsResult = { value: WebMcpAppBindings } | { error: unknown };
+  let settled: BindingsResult | undefined;
+  const waiters = new Set<(result: BindingsResult) => void>();
+  const settle = (result: BindingsResult): void => {
+    settled = result;
+    for (const resolve of waiters) resolve(result);
+    waiters.clear();
+  };
+  // Observe the shared load once. Per-call waiters can detach even if it stalls.
+  void Promise.resolve(bindings).then(
+    (value) => settle({ value }),
+    (error: unknown) => settle({ error }),
+  );
+  const unwrap = (result: BindingsResult): WebMcpAppBindings => {
+    if ('value' in result) return result.value;
+    // A failed load never serves the call, even when registration teardown
+    // aborted the load first. Report it like a destroyed App rather than as the
+    // caller's cancellation, and keep startup details out of the tool error.
+    throw new DashboardBindingError('app_destroyed', 'Dashboard application did not load.');
+  };
+  return {
+    get pendingWaiters() {
+      return waiters.size;
+    },
+    async wait(signal) {
+      if (settled) return unwrap(settled);
+      let waiter!: (result: BindingsResult) => void;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return unwrap(await raceWebMcpAbort(new Promise<BindingsResult>((resolve, reject) => {
+          waiter = resolve;
+          waiters.add(resolve);
+          timer = setTimeout(
+            () => reject(new Error('Dashboard application did not load.')),
+            WEBMCP_APP_LOAD_TIMEOUT_MS,
+          );
+        }), signal));
+      } finally {
+        waiters.delete(waiter);
+        clearTimeout(timer);
+      }
+    },
+  };
+}
+
 export function buildWebMcpTools(
   bindings: WebMcpAppBindings | Promise<WebMcpAppBindings>,
   trackEvent: WebMcpAnalytics = trackPrivacyRestricted,
 ): DashboardWebMcpTool[] {
-  type BindingsResult = { value: WebMcpAppBindings } | { error: unknown };
-  let bindingsResult: BindingsResult | undefined;
-  const bindingWaiters = new Set<(result: BindingsResult) => void>();
-  const settleBindings = (result: BindingsResult): void => {
-    bindingsResult = result;
-    for (const resolve of bindingWaiters) resolve(result);
-    bindingWaiters.clear();
-  };
-  // Observe the shared load once. Per-call waiters can detach even if it stalls.
-  void Promise.resolve(bindings).then(
-    (value) => settleBindings({ value }),
-    (error: unknown) => settleBindings({ error }),
-  );
+  const bindingsGate = createWebMcpBindingsGate(bindings);
   let app: WebMcpAppBindings;
   const withBindings = (...[name, fn, track, hooks = {}]: Parameters<typeof withInvocationLogging>) => (
     withInvocationLogging(name, fn, track, {
       ...hooks,
       // Every binding-dependent hook and callback runs after this bounded wait.
       preflight: async (args, extra) => {
-        let result = bindingsResult;
-        if (!result) {
-          let resolveWaiter!: (result: BindingsResult) => void;
-          let timer: ReturnType<typeof setTimeout> | undefined;
-          try {
-            result = await raceWebMcpAbort(new Promise<BindingsResult>((resolve, reject) => {
-              resolveWaiter = resolve;
-              bindingWaiters.add(resolve);
-              timer = setTimeout(() => reject(new Error('Dashboard application did not load.')), 30_000);
-            }), extra?.signal);
-          } finally {
-            bindingWaiters.delete(resolveWaiter);
-            clearTimeout(timer);
-          }
-        }
-        if ('error' in result) throw result.error;
-        app = result.value;
+        app = await bindingsGate.wait(extra?.signal);
         return hooks.preflight?.(args, extra);
       },
     })
