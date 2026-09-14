@@ -99,11 +99,11 @@ describe('live video sidecar transport', () => {
     receive(liveData, { source: window, origin: SIDECAR_ORIGIN });
     receive(liveData, { source: frameWindow, origin: 'https://www.youtube.com' });
     await poll();
-    expect(states.at(-1)?.phase).toBe('connecting');
+    expect(states[states.length - 1]?.phase).toBe('connecting');
 
     receive(liveData, { source: frameWindow, origin: SIDECAR_ORIGIN });
     await poll();
-    expect(states.at(-1)).toEqual({
+    expect(states[states.length - 1]).toEqual({
       phase: 'live',
       via: 'channel',
       title: 'Live now',
