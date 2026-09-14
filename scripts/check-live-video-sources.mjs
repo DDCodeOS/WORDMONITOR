@@ -13,7 +13,7 @@ const PROBE_ORIGIN = 'https://www.worldmonitor.app';
 const PROBE_URL = `${PROBE_ORIGIN}/__live_video_probe__`;
 const BATCH_SIZE = 8;
 const MAX_POLLS = Math.ceil((2 * LIVE_VIDEO_TIMING.verdictDeadlineMs) / LIVE_VIDEO_TIMING.pollMs);
-/** A player that never became ready counts as dead only after this many checks alone stall too. */
+/** A YouTube stall (never ready, no verdict, never started) counts as dead only after this many checks alone stall too. */
 export const ALONE_RECHECKS = 2;
 /** Total time the alone checks may take (about 10 at their 45 s worst case), so the audit workflow reaches its reporter inside the job timeout. */
 export const ALONE_RECHECK_BUDGET_MS = 8 * 60_000;
