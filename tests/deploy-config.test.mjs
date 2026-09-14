@@ -5464,4 +5464,20 @@ describe('cold-load metric evidence reaches the CI artifact (#7837)', () => {
       'the settled sample is recorded, never asserted (#7837)',
     );
   });
+
+  // The CI artifact is a reader contract, not a side effect of the gate: swapping
+  // or dropping these fields still leaves the E2E assertion green while the
+  // uploaded JSON misstates which 12,000/15,000 budget applies.
+  it('serializes first-paint budgets as asserted and settled budgets as recorded', () => {
+    assert.match(
+      mapBudgetE2eSource,
+      /recorded:\s*\{\s*readiness:\s*'dom-quiescence',\s*measurement:\s*'post-gc',\s*budgets:\s*DASHBOARD_METRIC_BUDGETS,/,
+      'recorded.budgets must stay the settled 15,000-node DASHBOARD_METRIC_BUDGETS contract',
+    );
+    assert.match(
+      mapBudgetE2eSource,
+      /\},\s*budgets:\s*FIRST_PAINT_METRIC_BUDGETS,\s*samples,/,
+      'the artifact top-level budgets field must stay the asserted 12,000-node FIRST_PAINT_METRIC_BUDGETS contract',
+    );
+  });
 });
