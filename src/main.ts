@@ -10,7 +10,6 @@ import { registerInpReporting } from '@/bootstrap/inp-report';
 import { registerLcpReporting } from '@/bootstrap/lcp-report';
 import { initVercelAnalytics } from '@/bootstrap/secondary-startup';
 import { loadVariantThemeStylesheet } from '@/bootstrap/variant-theme';
-import { App } from './App';
 import { installUtmInterceptor } from './utils/utm';
 import { captureContentAttributionFromUrl } from '../shared/content-attribution';
 
@@ -625,25 +624,29 @@ if (urlParams.get('settings') === '1') {
 } else {
   installUtmInterceptor();
   markLcpDebug('wm:boot:app-construct');
-  const app = new App('app');
-  app
-    .init()
-    .then(() => {
-      clearChunkReloadGuard(chunkReloadStorageKey);
-    })
-    .catch((error: unknown) => {
-      console.error(error);
-      try {
-        // init() registers WebMCP before its first await. A failed boot must
-        // therefore run normal teardown so the browser cannot retain tools
-        // bound to an App that will never become ready.
-        app.destroy();
-      } catch (cleanupError) {
-        // Cleanup is best-effort on a partially initialised App; never replace
-        // the original boot failure with an unhandled teardown rejection.
-        console.error('[App] Failed to clean up after initialization failure:', cleanupError);
-      }
-    });
+  void import('./App').then(({ App }) => {
+    const app = new App('app');
+    app
+      .init()
+      .then(() => {
+        clearChunkReloadGuard(chunkReloadStorageKey);
+      })
+      .catch((error: unknown) => {
+        console.error(error);
+        try {
+          // init() registers WebMCP before its first await. A failed boot must
+          // therefore run normal teardown so the browser cannot retain tools
+          // bound to an App that will never become ready.
+          app.destroy();
+        } catch (cleanupError) {
+          // Cleanup is best-effort on a partially initialised App; never replace
+          // the original boot failure with an unhandled teardown rejection.
+          console.error('[App] Failed to clean up after initialization failure:', cleanupError);
+        }
+      });
+  }).catch((error: unknown) => {
+    console.error(error);
+  });
 }
 
 // Debug helpers for geo-convergence testing (remove in production)

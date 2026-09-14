@@ -219,9 +219,18 @@ describe('dashboard critical CSS graph', () => {
   });
 
   it('keeps standalone settings CSS out of the dashboard static import graph', () => {
-    const dashboardGraph = collectStaticGraph('src/main.ts');
+    const dashboardGraph = new Set([
+      ...collectStaticGraph('src/main.ts'),
+      ...collectStaticGraph('src/App.ts'),
+    ]);
     const unifiedSettingsGraph = collectStaticGraph('src/components/UnifiedSettings.ts');
     const settingsGraph = collectStaticGraph('src/settings-main.ts');
+
+    assert.equal(
+      dynamicModuleSpecifiers('src/main.ts').includes('./App'),
+      true,
+      'The dashboard entry must keep the full application on its deferred import path.',
+    );
 
     assert.equal(
       dashboardGraph.has('src/components/UnifiedSettings.ts'),
