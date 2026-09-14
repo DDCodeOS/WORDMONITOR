@@ -61,6 +61,7 @@ The only bypass is the "Auto-play live streams on dashboard" setting. It is stor
 The idle stop is not new. Idle detection arrived on 2026-01-18 (2ef99d2565), well before the click-to-play intent gate from #4341 (issue #4334, 2026-06-22). Issue #914 ("Live news panel cams stop working every 10-15 minutes", closed 2026-03-04) was an earlier user report of live video stopping after minutes.
 
 Observed on production 2026-09-14, driven with real input:
+
 - The last `locator.click` landed at t=64s.
 - The idle log fired at t=364s, exactly +300s.
 - The Live News HLS `<video>` and all 4 webcam iframes were removed.
@@ -70,6 +71,7 @@ Observed on production 2026-09-14, driven with real input:
 A secondary factor makes the first minutes feel static. Feeds refresh every 20 minutes and markets every 12 (`src/config/variants/base.ts:13-14`). The untouched run recorded almost no API requests between about 20s and 570s (observed on production 2026-09-14).
 
 Fix (branch `feat/live-media-idle-notice`, unmerged as of 2026-09-14):
+
 - One owner, `src/services/live-media-idle.ts`, replaces the two panel timers. It listens once, suspends while the tab is hidden, and fires once per idle episode.
 - A "Stop live video when idle" preference (`wm-live-media-idle-stop`: 15/30/60/120/240 minutes or never, default 60) lives in `src/services/live-stream-settings.ts`. It is cloud-synced and absence-tolerant during rolling deploys. A user who had saved always-on reads as never, and always-on now means autoplay only.
 - An idle stop renders an in-panel notice naming inactivity, with Resume and "Keep playing when idle". Input no longer restarts video. Fullscreen panels and a native video the viewer paused are not stopped.
@@ -91,6 +93,7 @@ The request passes through three fallback layers. In the failure mode observed i
 3. **Edge to its own scrape.** On any non-2xx, `handleYouTubeLiveRequest` replies HTTP 200 `{videoId:null, channelExists:false}` without logging (`scripts/ais-relay.cjs:11587-11589`). The edge handler treats any `relayRes.ok` as success and caches the null for 600s (`api/youtube/live.js:61-69`). Its own scrape, which uses `redirect: 'follow'` (`api/youtube/live.js:104-139`), runs only when the relay is unset, unreachable, or answers non-2xx (`api/youtube/live.js:57-74`). The server RPC has the same shape. `parseRelayPayload` always returns an object (`server/worldmonitor/aviation/v1/get-youtube-live-stream-info.ts:47-57`), so `fetchLiveStreamInfo` returns the relay's null before its own scrape (`:161-162`).
 
 UNVERIFIED: why the relay's proxied fetch fails for handles such as @SkyNews, which return 200 both from a residential IP and through a direct TLS tunnel. Candidates:
+
 - proxy authentication
 - egress blocking
 - a YouTube bot wall served to the proxy's exit IPs
@@ -100,6 +103,7 @@ The relay logs no upstream status, so Railway logs cannot answer this today. The
 The relay detection path was added in efc1945bb8 (2026-02-28) and last changed in #2702 (2026-04-05).
 
 Recommended (not implemented as of 2026-09-14):
+
 - Decide the mechanism before repairing it. Issue #5503 flagged this page scrape plus residential proxy as a YouTube Terms of Service violation and was closed as not planned (2026-07-23). Every repair below strengthens that path. The alternative is the official YouTube Data API for live-video lookup.
 - In `ytFetch`, fall back to direct on a non-2xx proxy result, not only on a throw.
 - Follow redirects on the proxied YouTube fetch, or pass `location` through and re-request.
@@ -126,11 +130,13 @@ About 7 webcam feeds were live (observed 2026-09-14). The current tree defines 2
 Dead IDs render YouTube's own error inside the tile, not the app's blocked overlay (observed on production 2026-09-14). On web, `handleEmbedMessage` reads only `onReady`, `initialDelivery`, and `infoDelivery` with `playerState === 1` (`src/components/LiveWebcamsPanel.ts:619-629`). No branch handles YouTube `onError`. `markIframeBlocked` is reached only through the 15s ready timeout (`:130`, `:390`) or the desktop sidecar's `yt-error` (`:645-646`).
 
 Live News full-variant defaults (`src/components/LiveNewsPanel.ts:69-79`), observed on production 2026-09-14:
+
 - **Played.** bloomberg, sky, euronews, dw, france24, alarabiya, and aljazeera have `DIRECT_HLS_MAP` entries (`src/components/LiveNewsPanel.ts:244`).
 - **cnbc.** It has HLS only on desktop: `PROXIED_HLS_MAP` (`:300-302`) is gated by `isDesktopRuntime()` (`:620`). On web it goes to detection, gets null, and plays fallback `9NyxcX3rhQs` (`:74`), titled "LIVE: CNBC Marathon - Documentaries and deep dives 24/7".
 - **cnn.** Its HLS stream (`:252`) hit `[LiveNews] HLS fatal error for cnn` (`:1398`). The handler sets a cooldown and re-initializes the player (`:1403-1408`; `HLS_COOLDOWN_MS` is 5 minutes, `:411`). Detection then returns null, and the panel plays fallback `w_Ma8oQLmSM` (`:75`), a deleted ABC News Live video. That is the error 150 message.
 
 The current tree has 47 unique Live News fallback IDs. The session audited 46 and found many ended or gone:
+
 - france24 `u9foWyMSETk` returned oEmbed 404.
 - nhk-world `f0lYfG_vY_U` returned 404.
 - several returned LOGIN_REQUIRED.
@@ -139,6 +145,7 @@ The current tree has 47 unique Live News fallback IDs. The session audited 46 an
 The existing structural tests only check presence. `tests/live-news-hls.test.mjs:63-71` checks that each `DIRECT_HLS_MAP` channel has a fallback ID, an `hlsUrl`, or a handle. `:96-101` checks that full-variant channels have a `fallbackVideoId`. No test, script, or workflow checks whether an ID is still live.
 
 Recommended (not implemented as of 2026-09-14):
+
 - Once Defect 2 is fixed, resolve webcam IDs from `channelHandle` the way Live News does.
 - Map YouTube `onError` from the native iframe to `markIframeBlocked` or to the next feed.
 - Add a scheduled audit of every `fallbackVideoId` (recipe below) that opens an issue or PR when an ID dies.
@@ -160,6 +167,7 @@ curl -s -A "$UA" -H 'Cookie: CONSENT=YES+cb; SOCS=CAI' "https://www.youtube.com/
 ```
 
 How to read the output:
+
 - **Live:** oEmbed 200, `"status":"OK"`, `"isLiveNow":true`, and no `endTimestamp`.
 - **Ended:** an `endTimestamp` is present. The ID may still play, but as a recording.
 - **Dead:** `UNPLAYABLE`, `LOGIN_REQUIRED`, or an oEmbed 404. The tile will fail.
@@ -175,6 +183,7 @@ curl -s -D - -A "$UA" -H 'Origin: https://www.worldmonitor.app' \
 ```
 
 Read `cache-control` to fingerprint the path:
+
 - **`max-age=600`:** the relay answered (`api/youtube/live.js:63`, `:69`).
 - **`max-age=300`:** the edge's own scrape answered (`api/youtube/live.js:138`).
 
