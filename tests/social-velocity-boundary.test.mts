@@ -6,6 +6,7 @@ import { getSocialVelocity } from '../server/worldmonitor/intelligence/v1/get-so
 import { createRedisFetch } from './helpers/fake-upstash-redis.mts';
 import { TOOL_REGISTRY } from '../api/mcp/registry/index.ts';
 import { sanitizeBootstrapValue } from '../api/_bootstrap-public-payload.js';
+import { assembleBootstrapTierPayload } from '../scripts/publish-bootstrap-tiers.mjs';
 
 const originalFetch = globalThis.fetch;
 const originalEnv = { ...process.env };
@@ -86,4 +87,37 @@ test('real seeder publishes only Reddit permalinks and the reader accepts its ou
   assert.equal(produced.posts.length, 2);
   assert.ok(produced.posts.every(p => p.url === post.url));
   assert.deepEqual(await read(produced), JSON.parse(JSON.stringify(produced)));
+});
+
+test('KV publisher normalizes the actual assembled fast-tier social payload', async () => {
+  assert.equal(
+    readFileSync(new URL('../scripts/_social-velocity.mjs', import.meta.url), 'utf8'),
+    readFileSync(new URL('../api/_social-velocity.js', import.meta.url), 'utf8'),
+  );
+  for (const value of [
+    'bad', [], { posts: 'bad', fetchedAt: 123 }, { posts: [], fetchedAt: 123 },
+    { posts: [null, { ...post, extra: 'private' }, ...badUrls.map(url => ({ ...post, url }))], fetchedAt: 123 },
+  ]) {
+    const payload = await assembleBootstrapTierPayload({ socialVelocity: key }, {
+      env: { UPSTASH_REDIS_REST_URL: 'https://redis.example', UPSTASH_REDIS_REST_TOKEN: 'synthetic' },
+      fetchFn: async () => Response.json([{ result: JSON.stringify({ _seed: { fetchedAt: 123 }, data: value }) }]),
+    });
+    assert.deepEqual(payload, { data: { socialVelocity: await read(value) }, missing: [] });
+  }
+});
+
+test('publisher imports work with only the Docker scripts and shared directories', async () => {
+  const { mkdtemp, cp } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { pathToFileURL } = await import('node:url');
+  const root = await mkdtemp(join(tmpdir(), 'social-publisher-'));
+  await cp(new URL('../scripts', import.meta.url), join(root, 'scripts'), { recursive: true, filter: path => !path.includes('node_modules') });
+  await cp(new URL('../shared', import.meta.url), join(root, 'shared'), { recursive: true });
+  const { assembleBootstrapTierPayload: assemble } = await import(pathToFileURL(join(root, 'scripts/publish-bootstrap-tiers.mjs')).href);
+  const payload = await assemble({ socialVelocity: key }, {
+    env: { UPSTASH_REDIS_REST_URL: 'https://redis.example', UPSTASH_REDIS_REST_TOKEN: 'synthetic' },
+    fetchFn: async () => Response.json([{ result: JSON.stringify({ posts: [{ ...post, url: badUrls[0] }], fetchedAt: 123 }) }]),
+  });
+  assert.deepEqual(payload, { data: { socialVelocity: { posts: [], fetchedAt: 0 } }, missing: [] });
 });
