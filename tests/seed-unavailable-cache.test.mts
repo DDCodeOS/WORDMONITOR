@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, before, beforeEach, it } from 'node:test';
 import { createDomainGateway, serverOptions } from '../server/gateway';
+import { createRedisFetch } from './helpers/fake-upstash-redis.mts';
 import { issueSessionToken } from '../api/_session.js';
 import { createMarketServiceRoutes } from '../src/generated/server/worldmonitor/market/v1/service_server';
 import { createClimateServiceRoutes } from '../src/generated/server/worldmonitor/climate/v1/service_server';
@@ -36,10 +37,11 @@ beforeEach(() => {
   process.env.VERCEL_ENV = 'production';
   process.env.UPSTASH_REDIS_REST_URL = 'https://cache-redis.invalid';
   process.env.UPSTASH_REDIS_REST_TOKEN = 'synthetic';
-  globalThis.fetch = async (input) => {
+  const { fetchImpl } = createRedisFetch({});
+  globalThis.fetch = async (input, init) => {
     const url = new URL(String(input));
     assert.equal(url.origin, 'https://cache-redis.invalid');
-    assert.ok(url.pathname.startsWith('/get/'));
+    if (!url.pathname.startsWith('/get/')) return fetchImpl(input, init);
     if (mode === 'http-error') return new Response('', { status: 503 });
     if (mode === 'timeout') throw new DOMException('Fixture timeout', 'TimeoutError');
     const key = decodeURIComponent(url.pathname.slice(5));
@@ -86,7 +88,7 @@ for (const entry of cases) {
       cache.set(entry.key, entry.payload);
       const recovered = await request(entry.path);
       assert.equal(recovered.status, 200);
-      assert.equal(recovered.headers.get('Cache-Control'), 'private, max-age=300');
+      assert.match(recovered.headers.get('Cache-Control') ?? '', /^private, max-age=300(?:,|$)/);
       const recoveredBody = await recovered.json();
       if (entry.field === 'crudeWeeks') assert.equal(recoveredBody.crudeWeeks[0].stocksMb, 440);
       else if (entry.field === 'tensionPairs') assert.equal(recoveredBody.pizzint.defconLevel, 5);
@@ -97,7 +99,7 @@ for (const entry of cases) {
 it('preserves a genuine PizzINT miss as a cacheable empty response', async () => {
   const response = await request('intelligence/v1/get-pizzint-status');
   assert.equal(response.status, 200);
-  assert.equal(response.headers.get('Cache-Control'), 'private, max-age=300');
+  assert.match(response.headers.get('Cache-Control') ?? '', /^private, max-age=300(?:,|$)/);
   assert.deepEqual(await response.json(), { tensionPairs: [] });
 });
 it('preserves PizzINT includeGdelt filtering on a valid seed', async () => {
@@ -106,4 +108,25 @@ it('preserves PizzINT includeGdelt filtering on a valid seed', async () => {
   cache.set('intelligence:pizzint:seed:v1', payload);
   assert.deepEqual((await (await request('intelligence/v1/get-pizzint-status?include_gdelt=true')).json()).tensionPairs, payload.tensionPairs);
   assert.deepEqual((await (await request('intelligence/v1/get-pizzint-status?include_gdelt=false')).json()).tensionPairs, []);
+});
+for (const entry of cases.filter(entry => !entry.path.includes('pizzint'))) {
+  it(`${entry.path} does not cache a missing Redis configuration`, async () => {
+    delete process.env.UPSTASH_REDIS_REST_TOKEN;
+    assertNoStore(await request(entry.path));
+  });
+}
+for (const entry of cases.filter(entry => entry.path.startsWith('market/') || entry.path.startsWith('climate/'))) {
+  it(`${entry.path} rejects a seed without its collection`, async () => {
+    mode = 'hit';
+    cache.set(entry.key, {});
+    assertNoStore(await request(entry.path));
+  });
+}
+it('preserves a valid empty crypto sector collection', async () => {
+  mode = 'hit';
+  cache.set('market:crypto-sectors:v1', { sectors: [] });
+  const response = await request('market/v1/list-crypto-sectors');
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('Cache-Control') ?? '', /^private, max-age=300(?:,|$)/);
+  assert.deepEqual(await response.json(), { sectors: [] });
 });

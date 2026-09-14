@@ -5,6 +5,7 @@ import type {
 } from '../../../../src/generated/server/worldmonitor/economic/v1/service_server';
 
 import { getCachedJson } from '../../../_shared/redis';
+import { markNoStoreFallbackResponse } from '../../../_shared/response-headers';
 
 const CRUDE_KEY = 'economic:crude-inventories:v1';
 const SPR_KEY = 'economic:spr:v1';
@@ -64,7 +65,7 @@ interface RefineryRaw {
 }
 
 export async function getOilInventories(
-  _ctx: ServerContext,
+  ctx: ServerContext,
   _req: GetOilInventoriesRequest,
 ): Promise<GetOilInventoriesResponse> {
   try {
@@ -76,6 +77,10 @@ export async function getOilInventories(
       getCachedJson(IEA_KEY, true) as Promise<IeaRaw | null>,
       getCachedJson(REFINERY_KEY, true) as Promise<RefineryRaw | null>,
     ]);
+
+    if (!crudeRaw && !sprRaw && !natGasRaw && !euGasRaw && !ieaRaw && !refineryRaw) {
+      return markNoStoreFallbackResponse(ctx.request, { crudeWeeks: [], natGasWeeks: [], updatedAt: '' });
+    }
 
     const crudeWeeks = crudeRaw?.weeks?.map((w) => ({
       period: w.period,
@@ -147,6 +152,6 @@ export async function getOilInventories(
     } as GetOilInventoriesResponse;
   } catch (err) {
     console.error('[getOilInventories] Redis read failed:', err);
-    return { crudeWeeks: [], natGasWeeks: [], updatedAt: '' } as GetOilInventoriesResponse;
+    return markNoStoreFallbackResponse(ctx.request, { crudeWeeks: [], natGasWeeks: [], updatedAt: '' });
   }
 }
