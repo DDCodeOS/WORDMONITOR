@@ -7,16 +7,33 @@ describe('PipelineStatusPanel live paint gate — partial availability', () => {
     assert.equal(
       shouldErrorOnPipelineLiveResponse({
         pipelines: [{ id: 'gas1' } as never],
+        upstreamUnavailable: true,
       }),
       false,
     );
   });
 
-  test('errors when the live response has no pipelines', () => {
-    assert.equal(shouldErrorOnPipelineLiveResponse({ pipelines: [] }), true);
+  test('errors only when the live response is empty and unavailable', () => {
+    assert.equal(
+      shouldErrorOnPipelineLiveResponse({ pipelines: [], upstreamUnavailable: true }),
+      true,
+    );
   });
 
-  test('errors when pipelines is missing', () => {
-    assert.equal(shouldErrorOnPipelineLiveResponse({ pipelines: undefined as never }), true);
+  test('does not error on a healthy empty registry', () => {
+    assert.equal(
+      shouldErrorOnPipelineLiveResponse({ pipelines: [], upstreamUnavailable: false }),
+      false,
+    );
+  });
+
+  test('errors when pipelines is missing and upstream is unavailable', () => {
+    assert.equal(
+      shouldErrorOnPipelineLiveResponse({
+        pipelines: undefined as never,
+        upstreamUnavailable: true,
+      }),
+      true,
+    );
   });
 });

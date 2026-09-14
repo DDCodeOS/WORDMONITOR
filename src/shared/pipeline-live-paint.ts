@@ -3,10 +3,11 @@ import type { ListPipelinesResponse } from '@/generated/client/worldmonitor/supp
 /**
  * Live RPC paint gate for listPipelines. Partial registry misses set
  * upstreamUnavailable while retaining rows — keep the map when any rows
- * arrived; only blank into showError when the response has nothing to show.
+ * arrived. showError is only for empty + unavailable. A healthy empty
+ * registry still paints so valid empty data is not treated as an outage.
  */
 export function shouldErrorOnPipelineLiveResponse(
-  live: Pick<ListPipelinesResponse, 'pipelines'>,
+  live: Pick<ListPipelinesResponse, 'pipelines' | 'upstreamUnavailable'>,
 ): boolean {
-  return !(live.pipelines?.length > 0);
+  return Boolean(live.upstreamUnavailable && !(live.pipelines?.length > 0));
 }
