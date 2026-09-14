@@ -118,6 +118,25 @@ describe('reverse-geocode shared cache contract', () => {
     });
   }
 
+  it('returns a fixed edge error for Nominatim HTTP failures', async () => {
+    configurePreviewRedis();
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/get/')) return json({ result: null });
+      if (url.endsWith('/pipeline')) return allowLimiter(init);
+      if (url === 'https://redis.example.test/') return json({ result: 'OK' });
+      assert.match(url, /^https:\/\/nominatim\.openstreetmap\.org\/reverse\?/);
+      return new Response('synthetic provider failure', { status: 503 });
+    }) as typeof fetch;
+
+    const response = await edgeReverseGeocode(new Request(
+      'https://worldmonitor.app/api/reverse-geocode?lat=49&lon=-97',
+      { headers: { Origin: 'https://worldmonitor.app', 'x-real-ip': '198.51.100.40' } },
+    ));
+    assert.equal(response.status, 502);
+    assert.deepEqual(await response.json(), { error: 'Nominatim request failed' });
+  });
+
   it('reads the edge route deployment-scoped key in preview and normalizes its value', async () => {
     configurePreviewRedis();
     const urls: string[] = [];
