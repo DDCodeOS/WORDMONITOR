@@ -50,3 +50,24 @@ test('a failed added feed preserves successful sibling snapshots', async () => {
   assert.deepEqual(produced['research:hackernews:v1:job:30'].items.map((item: { id: number }) => item.id), [idFor('job')]);
   assert.deepEqual(produced['research:hackernews:v1:top:30'].items.map((item: { id: number }) => item.id), [idFor('top')]);
 });
+
+test('each feed remains capped at 30 item reads and isolates item failures', async () => {
+  let itemReads = 0;
+  let active = 0;
+  let maxActive = 0;
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith('stories.json')) return Response.json(Array.from({ length: 45 }, (_, index) => index + 1));
+    itemReads++; active++; maxActive = Math.max(maxActive, active);
+    await Promise.resolve(); active--;
+    const id = Number(String(url).match(/item\/(\d+)/)![1]);
+    if (id === 1) throw new Error('fixture item failure');
+    return Response.json({ id, type: 'story', title: `Item ${id}` });
+  };
+  const produced = await fetchHackerNews();
+  assert.equal(itemReads, 180);
+  assert.equal(maxActive, 10);
+  for (const feed of feeds) {
+    assert.equal(produced[`research:hackernews:v1:${feed}:30`].items.length, 29);
+    assert.equal(produced[`research:hackernews:v1:${feed}:30`].items[0].id, 2);
+  }
+});
