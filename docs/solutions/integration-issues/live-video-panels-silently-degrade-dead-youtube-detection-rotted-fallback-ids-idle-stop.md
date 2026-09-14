@@ -24,7 +24,7 @@ tags: [youtube, live-video, relay-fetch, railway-relay, fallback-video-ids, idle
 
 ## Problem
 
-The dashboard's "TV screen" (Live News and Live Webcams) looks healthy for a few minutes, then fails in three independent ways. None of them raises an error or an alarm. A cancelling paying user reported it on 2026-09-14: "your dashboard only last for about 4 minutes. you have the wrong video links in the tv screen". Each part of that report maps to a verified defect. No code fix has shipped. This doc records the diagnosis, the audit method, and the recommended fixes.
+The dashboard's "TV screen" (Live News and Live Webcams) looks healthy for a few minutes, then fails in three independent ways. None of them raises an error or an alarm. A cancelling paying user reported it on 2026-09-14: "your dashboard only last for about 4 minutes. you have the wrong video links in the tv screen". Each part of that report maps to a verified defect. A fix for Defect 1 is on branch `feat/live-media-idle-notice` (unmerged as of 2026-09-14); Defects 2 and 3 have no fix yet. This doc records the diagnosis, the audit method, and the fixes.
 
 ## Symptoms
 
@@ -46,7 +46,7 @@ These approaches gave wrong or misleading readings during diagnosis.
 
 ## Solution
 
-Status: diagnosis verified against production and against the code at 618757b97b. All fixes below are recommendations, not implemented as of 2026-09-14.
+Status: diagnosis verified against production and against the code at 618757b97b. The Defect 1 fix is implemented on branch `feat/live-media-idle-notice` (unmerged as of 2026-09-14). The Defect 2 and 3 fixes below remain recommendations.
 
 ### Defect 1: the 5-minute idle stop ("only lasts about 4 minutes")
 
@@ -69,10 +69,12 @@ Observed on production 2026-09-14, driven with real input:
 
 A secondary factor makes the first minutes feel static. Feeds refresh every 20 minutes and markets every 12 (`src/config/variants/base.ts:13-14`). The untouched run recorded almost no API requests between about 20s and 570s (observed on production 2026-09-14).
 
-Recommended (not implemented as of 2026-09-14):
-- Say why playback stopped in both paused placeholders.
-- Say in the Auto-play setting copy that it also keeps streams running while idle.
-- Consider an explicit "wall display" mode, or skip the stop on large displays, for users who run the dashboard unattended.
+Fix (branch `feat/live-media-idle-notice`, unmerged as of 2026-09-14):
+- One owner, `src/services/live-media-idle.ts`, replaces the two panel timers. It listens once, suspends while the tab is hidden, and fires once per idle episode.
+- A "Stop live video when idle" preference (`wm-live-media-idle-stop`: 15/30/60/120/240 minutes or never, default 60) lives in `src/services/live-stream-settings.ts`. It is cloud-synced and absence-tolerant during rolling deploys. A user who had saved always-on reads as never, and always-on now means autoplay only.
+- An idle stop renders an in-panel notice naming inactivity, with Resume and "Keep playing when idle". Input no longer restarts video. Fullscreen panels and a native video the viewer paused are not stopped.
+- The app-shell animation pause keeps its own 5-minute timer.
+- Verified with vitest DOM tests on fake timers and a real-browser drive using Playwright `page.clock`. After 6 minutes idle playback continues. After 66 minutes the notice shows and a mouse move does not resume. Resume restores Live News and the webcam wall, and Never keeps playing through 5 hours.
 
 ### Defect 2: YouTube live detection returns null for every channel
 

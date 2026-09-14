@@ -924,13 +924,13 @@ A Fallback Stream decays with no code change. The provider ends the broadcast, r
 
 ### Idle Pause
 
-The dashboard's resource-saving stop after a stretch with no pointer, keyboard, scroll, or touch input. Live news and webcam playback end, live news returns to its Play prompt, webcams show a paused message, and page animation freezes. The next input resumes whatever playback the pause interrupted.
+The resource-saving stop of live video after a viewer-chosen stretch with no pointer, keyboard, scroll, wheel, click, or touch input, which the viewer can also set to never. Every live panel that was playing ends at once and shows a notice naming inactivity as the cause, with a way to resume and a way to stop pausing. Input alone never restarts video; only the notice or a Play action does.
 
-The pause keys on input, not on whether anyone is watching. A dashboard left running on an unattended display therefore goes dark a fixed interval after the last touch, which reads to that viewer as the product failing rather than saving power. See also: Always-On Playback.
+The pause keys on input, not on whether anyone is watching, so input inside an embedded player does not count. A panel in fullscreen and a video the viewer paused are left alone. A separate, shorter, fixed stretch freezes page animation and is not governed by this preference. See also: Always-On Playback.
 
 ### Always-On Playback
 
-A viewer preference that starts live news and webcams as soon as their panels are visible instead of waiting for Play. It also exempts those panels from the Idle Pause, which makes it the only way to keep video running on an unattended display; page animation still freezes. See also: Idle Pause.
+A viewer preference that starts live news and webcams as soon as their panels are visible instead of waiting for Play. It governs autoplay only; how long video keeps playing without input is the Idle Pause preference. A viewer who saved it before the Idle Pause preference existed is treated as never pausing until they choose a duration, which preserves what the preference used to imply. See also: Idle Pause.
 
 ## Flagged ambiguities
 
