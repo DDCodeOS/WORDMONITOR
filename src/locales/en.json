@@ -924,7 +924,6 @@
   "components": {
     "webcams": {
       "paused": "Webcams paused",
-      "pausedIdle": "Webcams paused — move mouse to resume",
       "play": "Play",
       "previewStatus": "Live preview",
       "regions": {
@@ -1602,6 +1601,9 @@
       "analysisFrameworksSaveToLibrary": "Save to Library",
       "streamAlwaysOnLabel": "Auto-play live streams on dashboard",
       "streamAlwaysOnDesc": "Starts Live News and Live Webcams automatically when visible. Leave off to load video only after you click Play.",
+      "streamIdleStopLabel": "Stop live video when idle",
+      "streamIdleStopDesc": "Stops Live News and Live Webcams after this long without activity and shows a notice in the panel.",
+      "streamIdleStopNever": "Never",
       "frameworkNote": "Applies to client-generated analysis only",
       "loadingServerInsights": "Loading server insights...",
       "usingCachedBrief": "Using cached brief...",

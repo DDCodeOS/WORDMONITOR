@@ -852,7 +852,6 @@
   "components": {
     "webcams": {
       "paused": "ウェブカメラ一時停止中",
-      "pausedIdle": "ウェブカメラ一時停止中 — マウスを動かして再開",
       "regions": {
         "all": "すべて",
         "mideast": "中東",
@@ -1486,7 +1485,10 @@
       "provenanceTitle": "カバレッジプロヴェナンス: このブリーフが選択された取り込まれたストーリーと個別ソースの数",
       "compiledFrom": "{{stories}}件のストーリーから{{sources}}個のソースをコンパイル",
       "briefFreshness": "{{minutes}}m前に生成 · 最新ソース{{hours}}h前",
-      "briefStoryDetails": "Story details ({{count}})"
+      "briefStoryDetails": "Story details ({{count}})",
+      "streamIdleStopLabel": "アイドル時にライブ動画を停止",
+      "streamIdleStopDesc": "この時間アクティビティがない場合、ライブニュースとライブウェブカメラを停止し、パネルに通知を表示します。",
+      "streamIdleStopNever": "なし"
     },
     "settings": {
       "exportSettings": "設定をエクスポート",
@@ -2791,6 +2793,14 @@
       "captured": "取得しました。ダウンロード前に観測日と制約を確認してください。",
       "failed": "シナリオを取得できませんでした。アクセス権を確認して再試行してください。エクスポートできる結果はありません。",
       "locked": "意思決定ブリーフはProで利用できます。"
+    },
+    "liveMedia": {
+      "idleStatus": "アクティビティがないため一時停止中",
+      "idleBody": "マウス、キーボード、またはタッチアクティビティが {{duration}} ない状態が続いたため、ライブ動画が停止しました。",
+      "idleResume": "再開",
+      "idleKeepPlaying": "アイドル時にライブ動画を再生し続ける",
+      "idleSettingsHint": "この設定はいつでも設定 › メディアで変更できます。",
+      "idleKeepPlayingToast": "ライブ動画はアイドル時にも再生され続けます。設定 › メディアで変更してください。"
     }
   },
   "popups": {

@@ -875,7 +875,6 @@
         "space": "SPAZIO"
       },
       "paused": "Webcam in pausa",
-      "pausedIdle": "Webcam in pausa — muovi il mouse per riprendere",
       "play": "Riproduci",
       "previewStatus": "Anteprima live"
     },
@@ -1842,7 +1841,10 @@
       "provenanceTitle": "Provenienza della copertura: quante storie acquisite e quante fonti distinte sono state utilizzate per selezionare questo briefing",
       "compiledFrom": "Compilato da {{stories}} storie provenienti da {{sources}} fonti",
       "briefFreshness": "Generato {{minutes}}m fa · fonte più recente {{hours}}h fa",
-      "briefStoryDetails": "Story details ({{count}})"
+      "briefStoryDetails": "Story details ({{count}})",
+      "streamIdleStopLabel": "Arresta il video in diretta quando inattivo",
+      "streamIdleStopDesc": "Interrompe Live News e Live Webcams dopo questo periodo di inattività e mostra un avviso nel pannello.",
+      "streamIdleStopNever": "Mai"
     },
     "etfFlows": {
       "unavailable": "Dati ETF temporaneamente non disponibili",
@@ -2829,6 +2831,14 @@
       "captured": "Acquisizione completata. Controlla le date delle osservazioni e i vincoli prima del download.",
       "failed": "Impossibile acquisire gli scenari. Controlla il tuo accesso e riprova. Nessun risultato da esportare.",
       "locked": "La scheda decisionale è disponibile con Pro."
+    },
+    "liveMedia": {
+      "idleStatus": "Pausa per inattività",
+      "idleBody": "Video in diretta interrotto dopo {{duration}} senza attività del mouse, tastiera o tocco.",
+      "idleResume": "Riprendi",
+      "idleKeepPlaying": "Mantieni la riproduzione quando inattivo",
+      "idleSettingsHint": "Cambia questa impostazione in qualsiasi momento in Impostazioni › Media.",
+      "idleKeepPlayingToast": "Il video in diretta continuerà a riprodursi quando inattivo. Modifica in Impostazioni › Media."
     }
   },
   "popups": {

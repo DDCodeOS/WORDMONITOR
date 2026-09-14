@@ -852,7 +852,6 @@
   "components": {
     "webcams": {
       "paused": "摄像头已暂停",
-      "pausedIdle": "摄像头已暂停 — 移动鼠标以恢复",
       "regions": {
         "all": "全部",
         "mideast": "中东",
@@ -1486,7 +1485,10 @@
       "compiledFrom": "编译自 {{stories}} 条故事和 {{sources}} 个来源",
       "provenanceTitle": "覆盖来源：此摘要选自多少条摄取的故事和不同的来源",
       "briefFreshness": "生成于 {{minutes}}m 前 · 最新来源 {{hours}}h 前",
-      "briefStoryDetails": "Story details ({{count}})"
+      "briefStoryDetails": "Story details ({{count}})",
+      "streamIdleStopLabel": "空闲时停止实时视频",
+      "streamIdleStopNever": "从不",
+      "streamIdleStopDesc": "在此时间内无活动后停止实时新闻和实时网络摄像头，并在面板中显示通知。"
     },
     "settings": {
       "exportSettings": "导出设置",
@@ -2791,6 +2793,14 @@
       "captured": "已获取。下载前请核查观测日期和限制条件。",
       "failed": "无法获取情景。请检查访问权限并重试。没有可导出的结果。",
       "locked": "决策简报面向 Pro 用户提供。"
+    },
+    "liveMedia": {
+      "idleStatus": "因不活动已暂停",
+      "idleBody": "在没有鼠标、键盘或触摸活动 {{duration}} 后，实时视频已停止。",
+      "idleResume": "继续",
+      "idleKeepPlaying": "空闲时继续播放",
+      "idleSettingsHint": "可随时在设置 › 媒体中更改。",
+      "idleKeepPlayingToast": "实时视频在空闲时将继续播放。在设置 › 媒体中更改。"
     }
   },
   "popups": {

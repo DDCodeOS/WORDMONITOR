@@ -492,7 +492,6 @@
         "space": "RYMDEN"
       },
       "paused": "Webbkameror pausade",
-      "pausedIdle": "Webbkameror pausade — flytta musen för att återuppta",
       "play": "Spela",
       "previewStatus": "Liveförhandsvisning"
     },
@@ -1316,7 +1315,10 @@
       "provenanceTitle": "Täckningshärkomst: hur många inmatade historier och unika källor denna kortfattade sammanfattning valdes från",
       "compiledFrom": "Kompilerat från {{stories}} berättelser från {{sources}} källor",
       "briefFreshness": "Genererad {{minutes}}m sedan · senaste källa {{hours}}h gammal",
-      "briefStoryDetails": "Story details ({{count}})"
+      "briefStoryDetails": "Story details ({{count}})",
+      "streamIdleStopLabel": "Stoppa livevideo när inaktiv",
+      "streamIdleStopDesc": "Stoppar Live News och Live Webcams efter denna tid utan aktivitet och visar ett meddelande i panelen.",
+      "streamIdleStopNever": "Aldrig"
     },
     "techHubs": {
       "infoTooltip": "<strong>Teknisk hubbaktivitet</strong><br>Visar tekniska nav med mest nyhetsaktivitet.<br><br><em>Aktivitetsnivåer:</em><br>• <span style=\"color: {{highColor}}\">Hög</span> — Nyheter från 50+ PH_• 50+ stil: {{elevatedColor}}\">Höjd</span> — Poäng 20-49<br>• <span style=\"color: {{lowColor}}\">Låg</span> — Poäng under 20<br><br>Klicka på ett nav för att zooma till dess plats."
@@ -2430,6 +2432,14 @@
       "captured": "Hämtat. Kontrollera observationsdatum och begränsningar före nedladdning.",
       "failed": "Det gick inte att hämta scenarierna. Kontrollera din åtkomst och försök igen. Inget resultat kan exporteras.",
       "locked": "Beslutsunderlaget är tillgängligt med Pro."
+    },
+    "liveMedia": {
+      "idleStatus": "Pausad på grund av inaktivitet",
+      "idleBody": "Livevideo stoppades efter {{duration}} utanmus-, tangent- eller pekaktivitet.",
+      "idleResume": "Återuppta",
+      "idleKeepPlaying": "Fortsätt spela när inaktiv",
+      "idleSettingsHint": "Ändra detta när som helst i Inställningar › Media.",
+      "idleKeepPlayingToast": "Livevideo fortsätter spela när inaktiv. Ändra i Inställningar › Media."
     }
   },
   "popups": {

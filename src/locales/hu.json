@@ -924,7 +924,6 @@
   "components": {
     "webcams": {
       "paused": "Webkamerák szüneteltetve",
-      "pausedIdle": "Webkamerák szüneteltetve — mozgassa az egeret a folytatáshoz",
       "regions": {
         "all": "ÖSSZES",
         "mideast": "KÖZEL-KELET",
@@ -1631,7 +1630,10 @@
       "provenanceTitle": "Lefedettség eredete: hány feldolgozott történetből és különálló forrásból választotta ki ezt az összefoglalót",
       "compiledFrom": "{{stories}} történetből és {{sources}} forrásból összeállítva",
       "briefFreshness": "Generálva {{minutes}}m idővel ezelőtt · legfrissebb forrás {{hours}}ó régi",
-      "briefStoryDetails": "Story details ({{count}})"
+      "briefStoryDetails": "Story details ({{count}})",
+      "streamIdleStopLabel": "Élő videó leállítása üresjárat során",
+      "streamIdleStopDesc": "Az Élő Hírek és Élő Webkamerák leállnak ennyi idő után inaktivitás esetén, és egy értesítés jelenik meg a panelen.",
+      "streamIdleStopNever": "Soha"
     },
     "settings": {
       "exportSettings": "Beállítások exportálása",
@@ -2879,6 +2881,14 @@
       "captured": "Betöltve. Letöltés előtt ellenőrizze a megfigyelési dátumokat és a korlátokat.",
       "failed": "Nem sikerült betölteni a forgatókönyveket. Ellenőrizze hozzáférését, és próbálja újra. Nincs exportálható eredmény.",
       "locked": "A döntési összefoglaló Pro csomaggal érhető el."
+    },
+    "liveMedia": {
+      "idleStatus": "Szüneteltetve az inaktivitás miatt",
+      "idleBody": "Az élő videó leállítva {{duration}} után egér-, billentyűzet- vagy érintésaktivitás hiányában.",
+      "idleResume": "Folytatás",
+      "idleKeepPlaying": "Élő videó lejátszása üresjárat során",
+      "idleSettingsHint": "Ezt bármikor módosíthatja a Beállítások › Médium menüben.",
+      "idleKeepPlayingToast": "Az élő videó üresjárat során is lejátszódik. Módosítása a Beállítások › Médium menüben."
     }
   },
   "popups": {

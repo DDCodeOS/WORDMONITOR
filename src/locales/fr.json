@@ -875,7 +875,6 @@
         "space": "ESPACE"
       },
       "paused": "Webcams en pause",
-      "pausedIdle": "Webcams en pause — bougez la souris pour reprendre",
       "play": "Lire",
       "previewStatus": "Aperçu en direct"
     },
@@ -1445,7 +1444,10 @@
       "provenanceTitle": "Provenance de la couverture : nombre d'articles ingérés et de sources distinctes à partir desquels ce résumé a été sélectionné",
       "compiledFrom": "Compilé à partir de {{stories}} articles provenant de {{sources}} sources",
       "briefFreshness": "Généré il y a {{minutes}}m · source la plus récente datant de {{hours}}h",
-      "briefStoryDetails": "Story details ({{count}})"
+      "briefStoryDetails": "Story details ({{count}})",
+      "streamIdleStopLabel": "Arrêter la vidéo en direct en cas d'inactivité",
+      "streamIdleStopDesc": "Arrête Live News et Live Webcams après cette durée sans activité et affiche une notification dans le panneau.",
+      "streamIdleStopNever": "Jamais"
     },
     "settings": {
       "exportSettings": "Exporter les paramètres",
@@ -2829,6 +2831,14 @@
       "captured": "Capture terminée. Vérifiez les dates des observations et les contraintes avant le téléchargement.",
       "failed": "Impossible de capturer les scénarios. Vérifiez votre accès et réessayez. Aucun résultat à exporter.",
       "locked": "La note de décision est disponible avec Pro."
+    },
+    "liveMedia": {
+      "idleStatus": "En pause pour inactivité",
+      "idleBody": "Vidéo en direct arrêtée après {{duration}} sans activité souris, clavier ou tactile.",
+      "idleResume": "Reprendre",
+      "idleKeepPlaying": "Continuer la lecture en cas d'inactivité",
+      "idleSettingsHint": "Modifiez ce paramètre à tout moment dans Paramètres › Média.",
+      "idleKeepPlayingToast": "La vidéo en direct continuera de se lire en cas d'inactivité. Modifiez dans Paramètres › Média."
     }
   },
   "popups": {
