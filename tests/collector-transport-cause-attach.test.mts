@@ -3,23 +3,6 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-/**
- * Sentry WORLDMONITOR-12E.
- *
- * Vite lowers `readonly cause` on `CollectorTransportError` to
- * `__publicField(this, "cause")` for the `es2020` build target. That helper
- * assigns `this.cause = undefined` when the instance has no own `cause`, and
- * the assignment throws `TypeError: Cannot add property cause, object is not
- * extensible` if `Error` itself returned a non-extensible object. The throw
- * happens inside `new CollectorTransportError(...)` in the collector catch,
- * so the intended `Umami collector beacon transport rejected…` rejection
- * never exists and Sentry titles the leak as this TypeError.
- *
- * This file drives the real class after replacing `Error` with a constructor
- * that `preventExtensions`s the instance, which is the production-shaped
- * failure. A frozen *cause value* is not the trigger.
- */
-
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const TRANSPORT_HREF = new URL('../src/services/analytics-collector-transport.ts', import.meta.url).href;
 
@@ -46,13 +29,13 @@ const {
 function constructUnderNonExtensibleError(): { status: number | null; stdout: string; stderr: string } {
   const code = `
     const NativeError = Error;
-    class NonExtensibleError extends NativeError {
-      constructor(message, options) {
-        super(message, options);
-        Object.preventExtensions(this);
-      }
-    }
-    globalThis.Error = NonExtensibleError;
+    globalThis.Error = new Proxy(NativeError, {
+      construct(target, args, newTarget) {
+        const instance = Reflect.construct(target, args, newTarget);
+        Object.preventExtensions(instance);
+        return instance;
+      },
+    });
 
     const store = new Map();
     Object.defineProperty(globalThis, 'window', {
