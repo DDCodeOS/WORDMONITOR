@@ -4,11 +4,14 @@ import { runInNewContext } from 'node:vm';
 import { afterEach, test } from 'node:test';
 import { getSocialVelocity } from '../server/worldmonitor/intelligence/v1/get-social-velocity.ts';
 import { createRedisFetch } from './helpers/fake-upstash-redis.mts';
+import { TOOL_REGISTRY } from '../api/mcp/registry/index.ts';
+import { sanitizeBootstrapValue } from '../api/_bootstrap-public-payload.js';
 
 const originalFetch = globalThis.fetch;
 const originalEnv = { ...process.env };
 const key = 'intelligence:social:reddit:v1';
 const post = { id: 'abc123', title: 'A report', subreddit: 'worldnews', url: 'https://reddit.com/r/worldnews/comments/abc123/a_report/', score: 10, upvoteRatio: 0.9, numComments: 2, velocityScore: 3.5, createdAt: 1700000000000 };
+const badUrls = ['https://reddit.com@attacker.example/r/x', 'https://reddit.com.attacker.example/r/x', 'javascript:alert(1)', 'https://reddit.com:8443/r/x', 'https://attacker.example', 'https://reddit.com/redirect'];
 async function read(value: unknown) {
   process.env.UPSTASH_REDIS_REST_URL = 'https://redis.example';
   process.env.UPSTASH_REDIS_REST_TOKEN = 'synthetic';
@@ -25,14 +28,13 @@ afterEach(() => {
 });
 
 test('rejects malformed cache envelopes and preserves a valid empty observation', async () => {
-  for (const value of [null, [], 'bad', { posts: 'bad', fetchedAt: 123 }, { extra: true }]) {
+  for (const value of [null, [], 'bad', { posts: 'bad', fetchedAt: 123 }, { posts: [null], fetchedAt: 123 }, { extra: true }]) {
     assert.deepEqual(await read(value), { posts: [], fetchedAt: 0 });
   }
   assert.deepEqual(await read({ posts: [], fetchedAt: 123 }), { posts: [], fetchedAt: 123 });
 });
 
 test('projects post fields and excludes malformed or foreign-origin links', async () => {
-  const badUrls = ['https://reddit.com@attacker.example/r/x', 'https://reddit.com.attacker.example/r/x', 'javascript:alert(1)', 'https://reddit.com:8443/r/x', 'https://attacker.example', 'https://reddit.com/redirect'];
   const result = await read({ posts: [null, false, { ...post, extra: 'secret' }, ...badUrls.map(url => ({ ...post, url }))], fetchedAt: 123, extra: 'secret' });
   assert.deepEqual(result, { posts: [post], fetchedAt: 123 });
   for (const hostname of ['www.reddit.com', 'old.reddit.com']) {
@@ -46,6 +48,23 @@ test('bounds posts and normalizes malformed scalar fields to the public shape', 
   assert.equal(result.posts.length, 30);
   assert.deepEqual(result.posts[0], { ...post, id: '', title: '', subreddit: '', score: 0, upvoteRatio: 1, numComments: 0, velocityScore: 0, createdAt: 0 });
   assert.equal(result.fetchedAt, 0);
+});
+
+test('bootstrap and MCP sanitize the same cached posts while preserving missing data', async () => {
+  const bad = { posts: [null, false, { ...post, extra: 'secret' }, ...badUrls.map(url => ({ ...post, url }))], fetchedAt: 123 };
+  const expected = { posts: [post], fetchedAt: 123 };
+  assert.deepEqual(sanitizeBootstrapValue('socialVelocity', bad), expected);
+  assert.equal(sanitizeBootstrapValue('socialVelocity', null), null);
+  const tool = TOOL_REGISTRY.find(t => t.name === 'get_social_velocity');
+  assert.ok(tool?._postFilter);
+  assert.deepEqual(tool._postFilter({ reddit: bad }, {}), { reddit: expected });
+  assert.deepEqual(tool._postFilter({ reddit: null }, {}), { reddit: null });
+  assert.deepEqual(tool._postFilter({ reddit: bad }, { subreddit: 'geopolitics' }), { reddit: { posts: [], fetchedAt: 123 } });
+  for (const value of [[], 'bad', { posts: 'bad', fetchedAt: 123 }, { posts: [null], fetchedAt: 123 }, { posts: [], fetchedAt: 123 }]) {
+    const normalized = await read(value);
+    assert.deepEqual(sanitizeBootstrapValue('socialVelocity', value), normalized);
+    assert.deepEqual(tool._postFilter({ reddit: value }, {}), { reddit: normalized });
+  }
 });
 
 test('real seeder publishes only Reddit permalinks and the reader accepts its output', async () => {
@@ -66,5 +85,5 @@ test('real seeder publishes only Reddit permalinks and the reader accepts its ou
   const produced = payload as { posts: typeof post[]; fetchedAt: number };
   assert.equal(produced.posts.length, 2);
   assert.ok(produced.posts.every(p => p.url === post.url));
-  assert.deepEqual(await read(produced), produced);
+  assert.deepEqual(await read(produced), JSON.parse(JSON.stringify(produced)));
 });

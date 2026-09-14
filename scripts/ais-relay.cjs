@@ -7515,6 +7515,12 @@ async function seedSocialVelocity() {
       await new Promise(r => setTimeout(r, 500));
       const posts = await fetchRedditHot(sub, fetchFailures);
       for (const p of posts) {
+        if (!p || typeof p.permalink !== 'string' || !p.permalink.startsWith('/r/')) continue;
+        let postUrl;
+        try {
+          postUrl = new URL(p.permalink, 'https://reddit.com');
+          if (postUrl.origin !== 'https://reddit.com' || !postUrl.pathname.startsWith('/r/') || postUrl.href.length > 2048) continue;
+        } catch { continue; }
         // Deduplicate cross-subreddit reposts of the same article URL.
         const articleUrl = p.url || '';
         let articleHostname = '';
@@ -7529,7 +7535,7 @@ async function seedSocialVelocity() {
           id: String(p.id || ''),
           title: String(p.title || '').slice(0, 300),
           subreddit: sub,
-          url: `https://reddit.com${p.permalink || ''}`,
+          url: postUrl.href,
           score: p.score || 0,
           upvoteRatio: p.upvote_ratio || 0,
           numComments: p.num_comments || 0,
