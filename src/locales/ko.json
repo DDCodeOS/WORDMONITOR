@@ -2613,7 +2613,14 @@
       "empty": "검출된 활성 수렴이 없습니다.",
       "signals_other": "{{count}}개 신호",
       "analyzing": "분석 중입니다...",
-      "viewOnMap": "지도에서 보기"
+      "viewOnMap": "지도에서 보기",
+      "waiting": "다음 데이터 업데이트를 기다리는 중입니다. 이 패널은 자동으로 업데이트됩니다.",
+      "offline": "연결을 기다리는 중입니다. 다시 온라인 상태가 되면 이 패널이 자동으로 업데이트됩니다.",
+      "updated": "업데이트됨 {{time}}",
+      "saved": "마지막으로 확인된 업데이트 {{time}} · 업데이트 확인 중",
+      "savedOffline": "마지막으로 확인된 업데이트 {{time}} · 오프라인",
+      "localSignals": "대시보드에 로드된 신호를 기반으로 함",
+      "emptySaved": "마지막으로 확인된 업데이트에는 수렴이 없었습니다."
     },
     "thermalEscalation": {
       "title": "열 급증",

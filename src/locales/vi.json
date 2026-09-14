@@ -2613,7 +2613,14 @@
       "empty": "Không phát hiện sự hội tụ hoạt động",
       "signals_other": "{{count}} tín hiệu",
       "analyzing": "Đang phân tích...",
-      "viewOnMap": "Xem trên bản đồ"
+      "viewOnMap": "Xem trên bản đồ",
+      "waiting": "Đang chờ lần cập nhật dữ liệu tiếp theo. Bảng này tự động cập nhật.",
+      "offline": "Đang chờ kết nối. Bảng này tự động cập nhật khi bạn trực tuyến trở lại.",
+      "updated": "Đã cập nhật {{time}}",
+      "saved": "Lần cập nhật gần nhất đã biết {{time}} · Đang kiểm tra cập nhật",
+      "savedOffline": "Lần cập nhật gần nhất đã biết {{time}} · Ngoại tuyến",
+      "localSignals": "Dựa trên các tín hiệu đã tải trong bảng điều khiển",
+      "emptySaved": "Không có sự hội tụ trong lần cập nhật gần nhất đã biết."
     },
     "thermalEscalation": {
       "title": "Tăng cường nhiệt độ",

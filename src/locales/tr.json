@@ -2627,7 +2627,14 @@
       "signals_one": "{{count}} sinyal",
       "signals_other": "{{count}} sinyal",
       "analyzing": "Analiz ediliyor...",
-      "viewOnMap": "Haritada görüntüle"
+      "viewOnMap": "Haritada görüntüle",
+      "waiting": "Bir sonraki veri güncellemesi bekleniyor. Bu panel otomatik olarak güncellenir.",
+      "offline": "Bağlantı bekleniyor. Yeniden çevrimiçi olduğunuzda bu panel otomatik olarak güncellenir.",
+      "updated": "Güncellendi {{time}}",
+      "saved": "Bilinen son güncelleme {{time}} · Güncellemeler kontrol ediliyor",
+      "savedOffline": "Bilinen son güncelleme {{time}} · Çevrimdışı",
+      "localSignals": "Panoya yüklenen sinyallere dayanır",
+      "emptySaved": "Bilinen son güncellemede yakınsama yoktu."
     },
     "thermalEscalation": {
       "title": "Termal Yükseltme",

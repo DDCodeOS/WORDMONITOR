@@ -87,6 +87,10 @@ responses. It proves retained interactive cards, reload during failure, first-lo
 failure/recovery, known empty, and desktop/mobile overflow. It does not prove
 upstream acquisition, deployed middleware, or production acceptance.
 
+All shipped language catalogs include the recovery labels. Locale checks cover
+key completeness, English provenance, interpolation tokens, and the generated
+Traditional Chinese catalog.
+
 This change covers the four shared correlation panels. Other panels need their
 own validated empty/failure contracts before adopting the same presentation
 policy. Account gates and unrelated data-source behavior are unchanged.

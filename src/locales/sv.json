@@ -2247,7 +2247,14 @@
       "signals_one": "{{count}} signal",
       "signals_other": "{{count}} signaler",
       "analyzing": "Analyserar...",
-      "viewOnMap": "Visa på karta"
+      "viewOnMap": "Visa på karta",
+      "waiting": "Väntar på nästa datauppdatering. Den här panelen uppdateras automatiskt.",
+      "offline": "Väntar på en anslutning. Den här panelen uppdateras automatiskt när du är online igen.",
+      "updated": "Uppdaterad {{time}}",
+      "saved": "Senast kända uppdatering {{time}} · Söker efter uppdateringar",
+      "savedOffline": "Senast kända uppdatering {{time}} · Frånkopplad",
+      "localSignals": "Baserat på inlästa signaler i instrumentpanelen",
+      "emptySaved": "Ingen konvergens i den senast kända uppdateringen."
     },
     "thermalEscalation": {
       "title": "Värmeskalering",

@@ -2609,7 +2609,14 @@
       "signals_one": "{{count}} mawimbi",
       "signals_other": "Ishara {{count}}",
       "analyzing": "Inachanganua...",
-      "viewOnMap": "Tazama kwenye ramani"
+      "viewOnMap": "Tazama kwenye ramani",
+      "waiting": "Inasubiri sasisho linalofuata la data. Paneli hii husasishwa kiotomatiki.",
+      "offline": "Inasubiri muunganisho. Paneli hii husasishwa kiotomatiki unapounganishwa tena mtandaoni.",
+      "updated": "Imesasishwa {{time}}",
+      "saved": "Sasisho la mwisho linalojulikana {{time}} · Inatafuta masasisho",
+      "savedOffline": "Sasisho la mwisho linalojulikana {{time}} · Nje ya mtandao",
+      "localSignals": "Kulingana na ishara zilizopakiwa kwenye dashibodi",
+      "emptySaved": "Hakukuwa na muunganiko katika sasisho la mwisho linalojulikana."
     },
     "thermalEscalation": {
       "title": "Kuongezeka kwa joto",

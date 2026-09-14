@@ -2259,7 +2259,14 @@
       "signals_other": "{{count}} sinais",
       "analyzing": "Analisando...",
       "viewOnMap": "Visualizar no mapa",
-      "signals_many": "{{count}} sinais"
+      "signals_many": "{{count}} sinais",
+      "waiting": "A aguardar a próxima atualização dos dados. Este painel atualiza-se automaticamente.",
+      "offline": "A aguardar uma ligação. Este painel atualiza-se automaticamente quando voltar a estar online.",
+      "updated": "Atualizado {{time}}",
+      "saved": "Última atualização conhecida {{time}} · A procurar atualizações",
+      "savedOffline": "Última atualização conhecida {{time}} · Sem ligação",
+      "localSignals": "Com base nos sinais carregados no painel",
+      "emptySaved": "Sem convergência na última atualização conhecida."
     },
     "thermalEscalation": {
       "title": "Escalação Térmica",
