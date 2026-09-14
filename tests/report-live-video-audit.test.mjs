@@ -7,7 +7,7 @@ import { describe, it } from 'node:test';
 import YAML from 'yaml';
 
 import { runCheck } from '../scripts/check-live-video-sources.mjs';
-import { ISSUE_TITLE, publishAudit } from '../scripts/report-live-video-audit.mjs';
+import { ISSUE_TITLE, MAX_ISSUE_BODY_CHARS, publishAudit } from '../scripts/report-live-video-audit.mjs';
 
 const watch = (id) => `https://www.youtube.com/watch?v=${id}`;
 const CANARY_1 = 'https://www.youtube.com/channel/UCNye-wNBqNL5ZzHSJj3l8Bg';
@@ -451,6 +451,48 @@ describe('live video audit issue', () => {
     assert.equal(rowsFor('live-news/bbc-news').length, 1);
     for (const row of rowsFor('live-news/bbc-news')) assert.equal(cellCount(row), 4, row);
     assert.match(body, /`@koala73 @github\/staff 'tick' \[x\]\(https:\/\/evil\.example\)/, 'the title stays readable inside its code span');
+  });
+
+  it("keeps the issue body under GitHub's size limit and puts every row in the step summary", async (t) => {
+    const count = 400;
+    const news = {};
+    const slots = [];
+    for (let i = 0; i < count; i++) {
+      const entry = `https://streams.example/${'p'.repeat(150)}/${i}.m3u8`;
+      const unverifiable = i % 2 === 0;
+      news[`channel-${i}`] = [entry];
+      slots.push({
+        slot: `live-news/channel-${i}`,
+        surface: 'Live News optional',
+        shownByDefault: false,
+        status: unverifiable ? 'unverifiable-from-runner' : 'needs-replacement',
+        attempts: [attempt(entry, 'failed', { why: 'stream failed', unverifiableFromRunner: unverifiable, evidence: { detail: 'D'.repeat(200) } })],
+        shownInstead: null,
+      });
+    }
+    for (let i = 0; i < 300; i++) {
+      news[`unfilled-${i}`] = [];
+      slots.push({ slot: `live-news/unfilled-${i}`, surface: 'Live News optional', shownByDefault: false, status: 'empty', attempts: [], shownInstead: null });
+    }
+    const catalog = { webcams: {}, gridPriority: [], news, canaries: [CANARY_1, CANARY_2] };
+    const report = { checkedAt: '2026-09-15T05:17:00.000Z', canaries: catalog.canaries.map(live), slots };
+    const dir = mkdtempSync(join(tmpdir(), 'live-video-audit-size-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const summaryPath = join(dir, 'summary.md');
+    const { calls, gh } = fakeGh([]);
+
+    assert.deepEqual(await publish(report, { gh, catalog, summaryPath }), { findings: count / 2, action: 'created' });
+    const { body } = calls[1].payload;
+    const summary = readFileSync(summaryPath, 'utf8');
+    assert.ok(summary.length > 65_536, `the synthetic report must really be oversized (${summary.length} characters)`);
+    assert.ok(body.length <= MAX_ISSUE_BODY_CHARS, `the issue body is ${body.length} characters`);
+    const rowCount = (markdown) => markdown.split('\n').filter((line) => line.startsWith('| live-news/channel-')).length;
+    const overflow = [...body.matchAll(/^… and (\d+) more \(see the run summary\)$/gm)].reduce((sum, [, more]) => sum + Number(more), 0);
+    assert.equal(rowCount(summary), count, 'the step summary lists every row');
+    assert.ok(overflow > 0, 'the issue says rows were left out');
+    assert.equal(rowCount(body) + overflow, count, 'every row is in the issue or counted by an overflow line');
+    assert.match(body, /^- Live News optional: .*… and \d+ more \(see the run summary\)$/m);
+    assert.doesNotMatch(summary, /see the run summary/);
   });
 
   it('requires the repository before looking up the issue', async () => {

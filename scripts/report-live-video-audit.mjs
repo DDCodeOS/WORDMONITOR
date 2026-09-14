@@ -8,6 +8,10 @@ import { isMainModule } from './lib/main-module.mjs';
 import { auditAttempts, catalogSlots, DEFAULT_CATALOG, slotStatus } from './check-live-video-sources.mjs';
 
 export const ISSUE_TITLE = 'Live video sources: slots needing a replacement';
+/** GitHub rejects an issue body over 65,536 characters; this leaves room for multi-unit characters. */
+export const MAX_ISSUE_BODY_CHARS = 60_000;
+/** Rows per issue section before the rest are only counted; halved until the body fits. */
+const ISSUE_ROWS_PER_SECTION = 50;
 
 const STATUSES = new Set(['ok', 'degraded', 'needs-replacement', 'empty', 'unverifiable-from-runner']);
 
@@ -138,15 +142,18 @@ function inAttentionOrder(slots, gridPriority) {
     .map(({ slot }) => slot);
 }
 
-function table(header, rows) {
+/** A table of at most `maxRows` rows; the rest are counted below it and listed in full in the run summary. */
+function table(header, rows, maxRows) {
+  const more = Math.max(0, rows.length - maxRows);
   return [
     `| ${header.join(' | ')} |`,
     `| ${header.map(() => '---').join(' | ')} |`,
-    ...rows.map((row) => `| ${row.join(' | ')} |`),
+    ...rows.slice(0, maxRows).map((row) => `| ${row.join(' | ')} |`),
+    ...(more > 0 ? ['', `… and ${more} more (see the run summary)`] : []),
   ];
 }
 
-export function renderAuditBody(report, { runUrl = '', canaries, gridPriority = [] }) {
+export function renderAuditBody(report, { runUrl = '', canaries, gridPriority = [], maxRows = Number.POSITIVE_INFINITY }) {
   const findings = report.slots.filter(isFinding);
   const shown = inAttentionOrder(findings.filter((slot) => slot.shownByDefault), gridPriority);
   const hidden = inAttentionOrder(findings.filter((slot) => !slot.shownByDefault), gridPriority);
@@ -163,14 +170,14 @@ export function renderAuditBody(report, { runUrl = '', canaries, gridPriority = 
     '',
     'Status `needs-replacement` means no entry is live, `degraded` means an earlier entry failed and a later one plays, and `empty` means a slot viewers see by default has no entries.',
   ];
-  if (shown.length > 0) lines.push('', '### Shown by default', '', ...table(FINDINGS_HEADER, shown.flatMap(findingRows)));
-  if (hidden.length > 0) lines.push('', '### Not shown by default', '', ...table(FINDINGS_HEADER, hidden.flatMap(findingRows)));
+  if (shown.length > 0) lines.push('', '### Shown by default', '', ...table(FINDINGS_HEADER, shown.flatMap(findingRows), maxRows));
+  if (hidden.length > 0) lines.push('', '### Not shown by default', '', ...table(FINDINGS_HEADER, hidden.flatMap(findingRows), maxRows));
   if (unverifiable.length > 0) {
     const rows = unverifiable.flatMap((slot) => slot.attempts.map((attempt, index) => [text(slot.slot), text(slot.surface), entryCell(attempt, index), because(attempt)]));
     lines.push(
       '', '### Could not verify from the runner', '',
       'An HLS 403, 451, 429 or 5xx, an HLS timeout, connection error or incomplete certificate chain, a YouTube player that never became ready, gave no verdict or never started while no canary played, a player that stopped reporting whether a video is live, or a YouTube player API that did not load can depend on the runner (its network, its region, or YouTube itself). These slots may still play for viewers, so they are not counted above. A YouTube player that stalls while a canary plays is checked alone up to twice within the audit time budget, and is counted above only if both checks stall.',
-      '', ...table(['Slot', 'Where it shows', 'Entry', 'Why'], rows),
+      '', ...table(['Slot', 'Where it shows', 'Entry', 'Why'], rows, maxRows),
     );
   }
   const unfilled = report.slots.filter(isUnfilled);
@@ -180,7 +187,11 @@ export function renderAuditBody(report, { runUrl = '', canaries, gridPriority = 
     lines.push(
       '', '### Unfilled slots (hidden from viewers)', '',
       `${unfilled.length} slot(s) have no entries, so the dashboard hides them. They are not counted above; fill one the same way as a broken slot.`,
-      '', ...[...bySurface].map(([surface, slots]) => `- ${surface}: ${slots.join(', ')}`),
+      '', ...[...bySurface].map(([surface, slots]) => {
+        const listed = slots.slice(0, maxRows);
+        const more = slots.length - listed.length;
+        return `- ${surface}: ${[...listed, ...(more > 0 ? [`… and ${more} more (see the run summary)`] : [])].join(', ')}`;
+      }),
     );
   }
   lines.push(
@@ -192,6 +203,17 @@ export function renderAuditBody(report, { runUrl = '', canaries, gridPriority = 
     'Each daily run rewrites this issue, and closes it once no slot needs attention.',
   );
   return lines.join('\n');
+}
+
+/**
+ * The body GitHub will accept: at most ISSUE_ROWS_PER_SECTION rows per section, halved until it fits under
+ * MAX_ISSUE_BODY_CHARS. With no rows left the body is headings and counts, so it always fits.
+ */
+function issueBody(report, rendering) {
+  for (let maxRows = ISSUE_ROWS_PER_SECTION; ; maxRows = Math.floor(maxRows / 2)) {
+    const body = renderAuditBody(report, { ...rendering, maxRows });
+    if (body.length <= MAX_ISSUE_BODY_CHARS || maxRows === 0) return body;
+  }
 }
 
 function recoveredComment(report, runUrl) {
@@ -215,8 +237,9 @@ export async function publishAudit(report, {
 } = {}) {
   assertCompleteReport(report, catalog);
   const canaries = await confirmProbeWorks(report.canaries, probeCanaries);
-  const body = renderAuditBody(report, { runUrl, canaries, gridPriority: catalog.gridPriority ?? [] });
-  if (summaryPath) appendFileSync(summaryPath, `${body}\n`);
+  const rendering = { runUrl, canaries, gridPriority: catalog.gridPriority ?? [] };
+  if (summaryPath) appendFileSync(summaryPath, `${renderAuditBody(report, rendering)}\n`);
+  const body = issueBody(report, rendering);
   if (!repository) throw new Error('GITHUB_REPOSITORY is required to publish the live video audit');
 
   const findings = report.slots.filter(isFinding).length;
