@@ -68,6 +68,8 @@ Add an ESLint rule or grep pre-commit hook to flag new `innerHTML` usage.
 | **Affected** | `vite.config.ts` (line ~148-151) |
 | **Depends on** | — |
 
+**Status**: Resolved. The dev plugin was deleted when channel live detection was retired; Live News plays verified streams from `src/config/live-video-sources.ts`.
+
 **Description**
 The `youtubeLivePlugin()` Vite middleware hardcodes `{ videoId: null, channel }` with a TODO comment: *"will implement proper detection later"*.
 This means the LiveNewsPanel falls back to static channel-level video IDs during local development, never resolving the actual live stream.
