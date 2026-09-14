@@ -73,7 +73,7 @@ describe('Yahoo request path', () => {
     // drift without the other.
     assert.match(
       seedSource,
-      /for \(const \[currency, countryCode\] of Object\.entries\(CURRENCY_COUNTRY\)\) \{[\s\S]*?await new Promise\(\(r\) => setTimeout\(r, PER_CURRENCY_DELAY_MS\)\);[\s\S]*?\n  \}/,
+      /for \(const \[currency, countryCode\] of Object\.entries\(CURRENCY_COUNTRY\)\) \{[\s\S]*?await new Promise\(\(r\) => setTimeout\(r, PER_CURRENCY_DELAY_MS\)\);[\s\S]*?\n {2}\}/,
       'the currency loop must await PER_CURRENCY_DELAY_MS between requests',
     );
     assert.doesNotMatch(seedSource, /setTimeout\(r, \d+\)/, 'no literal delay may bypass the constant');
