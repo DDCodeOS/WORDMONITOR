@@ -703,9 +703,18 @@ export function marketingBeforeSend<T extends PolicyEvent>(event: T): T | null {
   // on the same argument. They were first left reporting in case our bundle
   // ever minted one, but no first-party code here talks to a wallet provider,
   // and 8 of the issue's 9 events were a wallet extension's `{code: 4001,
-  // message}` — the rule had matched only the minority -32603 event. `tests/pro-sentry-filter-policy.test.mts` pins the bundle as
-  // wallet-free so the codes stay proof of origin. Any other number, a
-  // non-integer, a string, or an absent code keeps reporting.
+  // message}` — the rule had matched only the minority -32603 event.
+  // `tests/pro-sentry-filter-policy.test.mts` pins the bundle as wallet-free so
+  // the codes stay proof of origin. Any other number, a non-integer, a string,
+  // or an absent code keeps reporting.
+  //
+  // One dependency no test can pin: `@clerk/clerk-js` bundles wallet SDKs, and
+  // its Web3 sign-in helpers rethrow provider errors. They are unreachable
+  // while this bundle never calls them (scanned) and Web3 sign-in stays
+  // disabled on the Clerk instance (disabled as of 2026-09-14). Enabling it
+  // there makes a wallet code possible from our own sign-in path, so BOTH
+  // halves of this rule — the reserved range and these codes — must be
+  // re-derived first.
   //
   // The payload's own `message` is deliberately NOT consulted, so
   // `{code: -32603, message: 'checkout failed'}` is dropped too (raised in

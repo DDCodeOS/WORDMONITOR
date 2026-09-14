@@ -972,11 +972,17 @@ describe('marketing beforeSend — wallet JSON-RPC rejection (WORLDMONITOR-107)'
       'a JSON-RPC client on the marketing surface invalidates the WORLDMONITOR-107 rule');
   });
 
-  // Wallet-provider access, or a literal EIP-1193 code. Bare `ethereum` is not
-  // enough: the teaser strip quotes the coin by that id. The lookarounds skip
-  // decimals such as a coordinate ending in `.4100`.
+  // Wallet-provider access, a Clerk Web3 sign-in call, or a literal EIP-1193
+  // code. Bare `ethereum` is not enough: the teaser strip quotes the coin by
+  // that id. The lookarounds skip decimals such as a coordinate ending in
+  // `.4100`.
+  //
+  // The Clerk half matters because `@clerk/clerk-js` bundles wallet SDKs and
+  // its Web3 helpers rethrow provider errors. That path is reachable only when
+  // our code calls those helpers (scanned here) or Web3 sign-in is enabled on
+  // the Clerk instance, which no repo test can see.
   const WALLET_PROVIDER_CODE =
-    /\bwindow\.ethereum\b|\bethereum\.(?:request|enable|send|on)\b|\beth_[a-z]\w*|eip-?1193|(?<![\d.])(?:4001|4100|4200|4900|4901)(?![\d.])/i;
+    /\bwindow\.ethereum\b|\bethereum\.(?:request|enable|send|on)\b|\beth_[a-z]\w*|eip-?1193|\bauthenticateWith(?:Metamask|CoinbaseWallet|OKXWallet|Base|Solana|Web3)\b|\bweb3_?wallet\b|(?<![\d.])(?:4001|4100|4200|4900|4901)(?![\d.])/i;
 
   it('pins the marketing bundle as wallet-free, which is what licenses the EIP-1193 codes', () => {
     // The EIP-1193 codes prove third-party origin only while no first-party code
@@ -996,6 +1002,9 @@ describe('marketing beforeSend — wallet JSON-RPC rejection (WORLDMONITOR-107)'
       'reject({ code: 4001, message: "User rejected" })',
       'if (err.code === 4900) retry()',
       '// EIP-1193 provider',
+      'await clerk.authenticateWithMetamask({ redirectUrl })',
+      'await signIn.authenticateWithCoinbaseWallet()',
+      "strategy: 'web3_wallet'",
     ]) {
       assert.ok(WALLET_PROVIDER_CODE.test(code), `must flag: ${code}`);
     }
