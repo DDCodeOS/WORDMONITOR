@@ -6,6 +6,7 @@ import type {
 
 import { getCachedJson } from '../../../_shared/redis';
 import { markNoStoreFallbackResponse } from '../../../_shared/response-headers';
+// @ts-expect-error -- JS module, no declaration file
 import { captureSilentError } from '../../../../api/_sentry-edge.js';
 
 const CRUDE_KEY = 'economic:crude-inventories:v1';
