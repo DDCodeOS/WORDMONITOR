@@ -69,8 +69,9 @@ export const LIVE_NEWS_SOURCES = {
     'https://linear901-oo-hls0-prd-gtm.delivery.skycdp.com/17501/sde-fast-skynews/master.m3u8',
     'https://www.youtube.com/watch?v=xDWQ3LkccY8',
   ],
-  // Euronews' own YouTube live comes first: the HLS entry is a third-party test endpoint whose
-  // playlist reads live but played no frames in Chrome (2026-09-14).
+  // Euronews' own YouTube live comes first. The HLS entry is a third-party test endpoint whose
+  // playlist reads live but played no frames in Chrome (2026-09-14); it is kept deliberately as the
+  // second option.
   euronews: [
     'https://www.youtube.com/watch?v=pykpO5kQJ98',
     'https://dash4.antik.sk/live/test_euronews/playlist.m3u8',
@@ -79,11 +80,6 @@ export const LIVE_NEWS_SOURCES = {
     'https://dwamdstream103.akamaized.net/hls/live/2015526/dwstream103/master.m3u8',
     'https://www.youtube.com/watch?v=LuKwFajn37U',
     'https://www.youtube.com/channel/UCknLrEdhRCp1aegoMqRaCZg',
-  ],
-  // CNBC's only YouTube live stream is a documentary marathon.
-  cnbc: [
-    'https://www.youtube.com/watch?v=9NyxcX3rhQs',
-    'https://www.youtube.com/channel/UCvJJ_dzjViJCoLf5uKUTwoA',
   ],
   cnn: ['https://www.youtube.com/watch?v=GotlA1KKWoo'],
   france24: [

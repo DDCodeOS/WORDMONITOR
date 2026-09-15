@@ -94,6 +94,11 @@ describe('live video catalog', () => {
     assert.deepEqual([...builtinNewsIds].sort(), Object.keys(LIVE_NEWS_SOURCES).sort());
   });
 
+  it('does not list CNBC, whose only YouTube live stream is a documentary marathon', () => {
+    assert.equal('cnbc' in LIVE_NEWS_SOURCES, false, 'cnbc must not have a Live News catalog slot');
+    assert.doesNotMatch(readFileSync(new URL('../src/config/live-video-sources.ts', import.meta.url), 'utf8'), /\bcnbc\b/i);
+  });
+
   it('gives every default Live News channel at least one entry', () => {
     for (const id of defaultNewsIds) {
       assert.ok((LIVE_NEWS_SOURCES as Record<string, readonly string[]>)[id]?.length, `default channel live-news/${id} has no entries`);
