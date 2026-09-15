@@ -1,5 +1,5 @@
 /** Browser telemetry keeps routes and error evidence, but not URL credentials or user identifiers. */
-const PRIVATE_FIELD = /^(?:authorization|proxy-authorization|cookie|set-cookie|password|passwd|secret|token|access_token|refresh_token|query_string|url\.query|url\.fragment|api[_-]?key|email|ip_address|username)$/i;
+const PRIVATE_FIELD = /^(?:authorization|proxy-authorization|cookie|set-cookie|password|passwd|secret|token|access_token|refresh_token|query_string|(?:url|http)\.(?:query|fragment)|api[_-]?key|email|ip_address|username)$/i;
 const ABSOLUTE_URL = /(?:https?|wss?):\/\/[^\s<>"']+/gi;
 
 function sanitizeUrl(value: string): string {

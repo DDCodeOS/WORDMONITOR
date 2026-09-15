@@ -65,6 +65,8 @@ if (mode) {
   });
   sdk.startSpan({ name: 'GET https://example.test/api?token=SYNTH_LIVE_SPAN', forceTransaction: true }, (span: { setAttribute(key: string, value: string): void }) => {
     span.setAttribute('url.full', 'https://example.test/api?token=SYNTH_LIVE_SPAN_DATA');
+    span.setAttribute('http.query', '?token=SYNTH_HTTP_QUERY');
+    span.setAttribute('http.fragment', '#SYNTH_HTTP_FRAGMENT');
   });
   sdk.setUser(null);
   sdk.startSession();
@@ -90,7 +92,10 @@ if (mode) {
       assert.equal(error.request.url, 'https://worldmonitor.app/pro');
       assert.equal(error.request.headers.Referer, 'https://example.test/from');
       assert.equal(error.sdk.settings.infer_ip, 'never');
-      assert.ok(items.some((item: [{ type: string }]) => item[0].type === 'transaction'), 'transaction reaches transport');
+      const liveSpan = items.find((item: [{ type: string }, { transaction?: string }]) => item[0].type === 'transaction' && item[1].transaction === 'GET https://example.test/api')?.[1];
+      assert.ok(liveSpan, 'SDK-created span reaches transport');
+      assert.equal(liveSpan.contexts.trace.data['http.query'], '[Filtered]');
+      assert.equal(liveSpan.contexts.trace.data['http.fragment'], '[Filtered]');
       const sessions = items.filter((item: [{ type: string }]) => item[0].type === 'session');
       assert.ok(sessions.length, 'session reaches transport');
       for (const [, session] of sessions) assert.equal(session.attrs.ip_address, undefined);
