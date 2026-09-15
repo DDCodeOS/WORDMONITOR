@@ -70,10 +70,12 @@ function reportFor(catalog, problems = {}, shownInstead = {}) {
   return { checkedAt: '2026-09-15T05:17:00.000Z', canaries: catalog.canaries.map(live), slots };
 }
 
-function fakeGh(openIssues = []) {
+/** A fake gh: the open-issue listing returns `openIssues`, a closed-issue search returns `closedIssues`, writes return an issue. */
+function fakeGh(openIssues = [], closedIssues = []) {
   const calls = [];
   const gh = (args, payload) => {
     calls.push({ args, payload });
+    if (args.includes('search/issues')) return [{ total_count: closedIssues.length, items: closedIssues }, { total_count: closedIssues.length, items: [] }];
     return args.includes('--paginate') ? [openIssues, []] : { number: 42 };
   };
   return { calls, gh };
@@ -94,12 +96,16 @@ describe('live video audit issue', () => {
     const result = await publish(report, { gh, runUrl: 'https://github.com/owner/repo/actions/runs/7', summaryPath });
 
     assert.deepEqual(result, { findings: 1, action: 'created' });
-    assert.equal(calls.length, 2);
+    assert.equal(calls.length, 3);
     assert.deepEqual(calls[0].args, ['api', '--paginate', '--slurp', 'repos/owner/repo/issues?state=open&per_page=100']);
-    assert.deepEqual(calls[1].args, ['api', '--method', 'POST', 'repos/owner/repo/issues', '--input', '-']);
-    const { title, body } = calls[1].payload;
+    assert.deepEqual(calls[1].args, [
+      'api', '--paginate', '--slurp', '--method', 'GET', 'search/issues',
+      '-f', `q=repo:owner/repo is:issue is:closed in:title "${ISSUE_TITLE}"`, '-f', 'per_page=100',
+    ]);
+    assert.deepEqual(calls[2].args, ['api', '--method', 'POST', 'repos/owner/repo/issues', '--input', '-']);
+    const { title, body } = calls[2].payload;
     assert.equal(title, ISSUE_TITLE);
-    assert.equal(calls[1].payload.state, undefined, 'a new issue sends no state');
+    assert.equal(calls[2].payload.state, undefined, 'a new issue sends no state');
     assert.match(body, /^\| Slot \| Where it shows \| Status \| Entry \| Why \| Shown instead \|$/m);
     assert.match(body, /^\| webcams\/jerusalem \| Webcam grid cell 1 \| needs-replacement \| `https:\/\/www\.youtube\.com\/watch\?v=zp6LNSoq000` \| YouTube player error 150: [^|]+ \| webcams\/tel-aviv \|$/m);
     assert.match(body, /actions\/runs\/7/);
@@ -116,7 +122,7 @@ describe('live video audit issue', () => {
       { number: 4, title: ISSUE_TITLE, pull_request: {} },
       { number: 5, title: ISSUE_TITLE.toLowerCase() },
       { number: 6, title: ISSUE_TITLE },
-    ]);
+    ], [{ number: 2, title: ISSUE_TITLE, state: 'closed', updated_at: '2026-09-14T05:20:00Z' }]);
 
     const result = await publish(report, { gh });
 
@@ -126,6 +132,49 @@ describe('live video audit issue', () => {
     assert.equal(calls[1].payload.title, ISSUE_TITLE);
     assert.equal(calls[1].payload.state, 'open', 'an issue closed between the lookup and the update is reopened');
     assert.match(calls[1].payload.body, /webcams\/kyiv/);
+  });
+
+  it('reopens the most recently updated closed issue with the exact title instead of creating another, with a Regressed comment', async () => {
+    const report = reportFor(baseCatalog, { 'webcams/kyiv': { status: 'needs-replacement', attempts: [dead(watch('e2gC37ILQmk')), dead(watch('VGnFLdQW39A'))] } });
+    const { calls, gh } = fakeGh([], [
+      { number: 11, title: ISSUE_TITLE, state: 'closed', updated_at: '2026-08-01T05:20:00Z' },
+      { number: 17, title: ISSUE_TITLE, state: 'closed', updated_at: '2026-09-10T05:20:00Z' },
+      { number: 14, title: ISSUE_TITLE, state: 'closed', updated_at: '2026-09-02T05:20:00Z' },
+      { number: 19, title: `${ISSUE_TITLE} (old)`, state: 'closed', updated_at: '2026-09-14T05:20:00Z' },
+      { number: 20, title: ISSUE_TITLE, state: 'closed', updated_at: '2026-09-14T06:00:00Z', pull_request: {} },
+    ]);
+
+    const result = await publish(report, { gh, runUrl: 'https://github.com/owner/repo/actions/runs/9' });
+
+    assert.deepEqual(result, { findings: 1, action: 'reopened', issue: 17 });
+    assert.equal(calls.length, 4);
+    assert.ok(calls[1].args.includes('search/issues'));
+    assert.deepEqual(calls[2].args, ['api', '--method', 'PATCH', 'repos/owner/repo/issues/17', '--input', '-']);
+    assert.equal(calls[2].payload.title, ISSUE_TITLE);
+    assert.equal(calls[2].payload.state, 'open');
+    assert.match(calls[2].payload.body, /webcams\/kyiv/);
+    assert.deepEqual(calls[3].args, ['api', '--method', 'POST', 'repos/owner/repo/issues/17/comments', '--input', '-']);
+    assert.match(calls[3].payload.body, /^Regressed: 1 slot\(s\) need attention as of 2026-09-15T05:17:00\.000Z\./);
+    assert.match(calls[3].payload.body, /actions\/runs\/9/);
+  });
+
+  it('creates a new issue only when no open or closed issue has the exact title', async () => {
+    const report = reportFor(baseCatalog, { 'webcams/kyiv': { status: 'needs-replacement', attempts: [dead(watch('e2gC37ILQmk')), dead(watch('VGnFLdQW39A'))] } });
+    const { calls, gh } = fakeGh([{ number: 3, title: ISSUE_TITLE.toUpperCase() }], [
+      { number: 19, title: `${ISSUE_TITLE} (old)`, state: 'closed', updated_at: '2026-09-14T05:20:00Z' },
+      { number: 20, title: ISSUE_TITLE, state: 'closed', updated_at: '2026-09-14T06:00:00Z', pull_request: {} },
+      { number: 21, title: `Re: ${ISSUE_TITLE}`, state: 'closed', updated_at: '2026-09-14T07:00:00Z' },
+    ]);
+
+    assert.deepEqual(await publish(report, { gh }), { findings: 1, action: 'created' });
+    assert.equal(calls.length, 3);
+    assert.deepEqual(calls[2].args, ['api', '--method', 'POST', 'repos/owner/repo/issues', '--input', '-']);
+  });
+
+  it('leaves a closed issue closed when nothing needs attention', async () => {
+    const { calls, gh } = fakeGh([], [{ number: 17, title: ISSUE_TITLE, state: 'closed', updated_at: '2026-09-10T05:20:00Z' }]);
+    assert.deepEqual(await publish(reportFor(baseCatalog), { gh }), { findings: 0, action: 'none' });
+    assert.equal(calls.length, 1, 'only the open-issue lookup: no search, no reopen');
   });
 
   it('comments "Recovered" and closes the open issue when no slot needs attention', async () => {
@@ -181,7 +230,7 @@ describe('live video audit issue', () => {
 
     assert.deepEqual(retries, [[CANARY_1, CANARY_2]]);
     assert.equal(result.action, 'created');
-    assert.match(calls[1].payload.body, /Canaries: 1 of 2 live on retry/);
+    assert.match(calls.at(-1).payload.body, /Canaries: 1 of 2 live on retry/);
   });
 
   it('throws before any GitHub call when every canary fails the retry too', async () => {
@@ -268,7 +317,7 @@ describe('live video audit issue', () => {
     const { calls, gh } = fakeGh([]);
 
     assert.deepEqual(await publish(report, { gh }), { findings: 1, action: 'created' });
-    const { body } = calls[1].payload;
+    const { body } = calls.at(-1).payload;
     const section = body.indexOf('### Could not verify from the runner');
     assert.ok(section > 0, body);
     assert.equal(body.indexOf('live-news/bbc-news'), body.lastIndexOf('live-news/bbc-news'), 'listed once');
@@ -326,7 +375,7 @@ describe('live video audit issue', () => {
     const { calls, gh } = fakeGh([]);
 
     assert.deepEqual(await publish(report, { gh, catalog }), { findings: 2, action: 'created' });
-    const { body } = calls[1].payload;
+    const { body } = calls.at(-1).payload;
     const rows = body.split('\n').filter((line) => /^\| (webcams|live-news)\//.test(line));
     assert.equal(rows[0], '| webcams/jerusalem | Webcam grid cell 1 | empty | — | no entries configured | webcams/tel-aviv |');
     assert.match(rows[1], /^\| live-news\/bloomberg \|/);
@@ -346,7 +395,7 @@ describe('live video audit issue', () => {
 
     await publish(report, { gh });
 
-    const { body } = calls[1].payload;
+    const { body } = calls.at(-1).payload;
     const order = ['### Shown by default', '| webcams/kyiv |', '| live-news/bloomberg |', '### Not shown by default', '| webcams/tel-aviv |', '| live-news/rtve |']
       .map((needle) => [needle, body.indexOf(needle)]);
     for (const [needle, index] of order) assert.ok(index >= 0, `${needle} is missing:\n${body}`);
@@ -369,7 +418,7 @@ describe('live video audit issue', () => {
     const { calls, gh } = fakeGh([]);
 
     assert.deepEqual(await publish(report, { gh, catalog }), { findings: 1, action: 'created' });
-    const { body } = calls[1].payload;
+    const { body } = calls.at(-1).payload;
     assert.match(body, /^Daily live video source audit: 1 slot\(s\) need attention, 1 of them shown by default\.$/m);
     assert.doesNotMatch(body, /### Not shown by default/);
     const section = body.indexOf('### Unfilled slots (hidden from viewers)');
@@ -392,7 +441,7 @@ describe('live video audit issue', () => {
 
     await publish(report, { gh });
 
-    const rows = calls[1].payload.body.split('\n').filter((line) => /^\| (webcams|live-news)\//.test(line));
+    const rows = calls.at(-1).payload.body.split('\n').filter((line) => /^\| (webcams|live-news)\//.test(line));
     const shownInstead = rows.map((row) => row.split(' | ').at(-1).replace(/ \|$/, ''));
     assert.deepEqual(rows.map((row) => row.split(' | ')[0].slice(2)), ['webcams/jerusalem', 'webcams/kyiv', 'live-news/bloomberg']);
     assert.deepEqual(shownInstead, ['webcams/tel-aviv', 'entry 2 (live)', '—']);
@@ -407,7 +456,7 @@ describe('live video audit issue', () => {
     const { calls, gh } = fakeGh([]);
 
     assert.deepEqual(await publish(report, { gh }), { findings: 1, action: 'created' });
-    const { body } = calls[1].payload;
+    const { body } = calls.at(-1).payload;
     assert.deepEqual(body.split('\n').filter((line) => line.startsWith('| webcams/kyiv |')), [
       '| webcams/kyiv | Webcam grid cell 2 | degraded | `https://www.youtube.com/watch?v=e2gC37ILQmk` | YouTube player error 150: the owner does not allow embedding, or the video is unavailable here | entry 2 (unverified) |',
     ]);
@@ -439,7 +488,7 @@ describe('live video audit issue', () => {
     const { calls, gh } = fakeGh([]);
 
     assert.deepEqual(await publish(report, { gh, catalog, summaryPath }), { findings: 2, action: 'created' });
-    const { body } = calls[1].payload;
+    const { body } = calls.at(-1).payload;
     assert.equal(readFileSync(summaryPath, 'utf8'), `${body}\n`, 'the step summary carries the same inert body');
     const outsideCode = body.replace(/`[^`\n]*`/g, '');
     assert.doesNotMatch(outsideCode, /@\w/, 'a mention outside a code span');
@@ -484,7 +533,7 @@ describe('live video audit issue', () => {
     const { calls, gh } = fakeGh([]);
 
     assert.deepEqual(await publish(report, { gh, catalog, summaryPath }), { findings: count / 2, action: 'created' });
-    const { body } = calls[1].payload;
+    const { body } = calls.at(-1).payload;
     const summary = readFileSync(summaryPath, 'utf8');
     assert.ok(summary.length > 65_536, `the synthetic report must really be oversized (${summary.length} characters)`);
     assert.ok(body.length <= MAX_ISSUE_BODY_CHARS, `the issue body is ${body.length} characters`);
@@ -534,7 +583,9 @@ describe('live video audit command line', () => {
     });
     writeFileSync(join(dir, 'gh'), `#!/usr/bin/env node
 const fs = require('node:fs');
-if (process.argv.includes('--paginate')) {
+if (process.argv.includes('search/issues')) {
+  console.log(JSON.stringify([{ total_count: 1, items: [{ number: 2, title: 'Unrelated closed issue', updated_at: '2026-09-01T00:00:00Z' }] }]));
+} else if (process.argv.includes('--paginate')) {
   console.log(JSON.stringify([[{ number: 1, title: 'Unrelated issue', body: 'x'.repeat(1_100_000) }]]));
 } else {
   fs.writeFileSync(process.env.MOCK_PAYLOAD, fs.readFileSync(0, 'utf8'));

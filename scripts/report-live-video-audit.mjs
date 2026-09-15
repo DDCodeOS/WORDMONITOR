@@ -200,7 +200,7 @@ export function renderAuditBody(report, { runUrl = '', canaries, gridPriority = 
     '2. When it prints `LIVE`, paste its `paste:` line into the slot\'s list in `src/config/live-video-sources.ts`. Entries are tried in order.',
     '3. Re-check the slot before committing: `npm run live-video:check -- --slot <slot>`',
     '',
-    'Each daily run rewrites this issue, and closes it once no slot needs attention.',
+    'Each daily run rewrites this issue, closes it once no slot needs attention, and reopens it if a slot regresses.',
   );
   return lines.join('\n');
 }
@@ -214,6 +214,28 @@ function issueBody(report, rendering) {
     const body = renderAuditBody(report, { ...rendering, maxRows });
     if (body.length <= MAX_ISSUE_BODY_CHARS || maxRows === 0) return body;
   }
+}
+
+/**
+ * The most recently updated closed issue titled exactly ISSUE_TITLE, or null. Search narrows the candidates to that
+ * title: listing issues in every state would page through the whole repository (8,000+ issues and PRs) on each run.
+ * The exact-title and not-a-PR checks happen here, since search matches the phrase anywhere in a title.
+ */
+function latestClosedAuditIssue(repository, gh) {
+  const query = `repo:${repository} is:issue is:closed in:title "${ISSUE_TITLE}"`;
+  const pages = gh(['api', '--paginate', '--slurp', '--method', 'GET', 'search/issues', '-f', `q=${query}`, '-f', 'per_page=100']);
+  const matches = pages
+    .flatMap((page) => page?.items ?? [])
+    .filter((issue) => !issue.pull_request && issue.title === ISSUE_TITLE)
+    .sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
+  return matches[0] ?? null;
+}
+
+function regressedComment(report, findings, runUrl) {
+  return [
+    `Regressed: ${findings} slot(s) need attention as of ${new Date(report.checkedAt).toISOString()}. The issue body lists them.`,
+    runUrl ? `[Workflow run](${runUrl})` : '',
+  ].filter(Boolean).join(' ');
 }
 
 function recoveredComment(report, runUrl) {
@@ -252,11 +274,20 @@ export async function publishAudit(report, {
     gh(['api', '--method', 'PATCH', `repos/${repository}/issues/${existing.number}`, '--input', '-'], { state: 'closed', state_reason: 'completed' });
     return { findings, action: 'closed', issue: existing.number };
   }
-  const endpoint = `repos/${repository}/issues${existing ? `/${existing.number}` : ''}`;
-  // An issue closed between the lookup and this write is reopened, not left closed with a fresh body.
-  const payload = existing ? { title: ISSUE_TITLE, body, state: 'open' } : { title: ISSUE_TITLE, body };
-  gh(['api', '--method', existing ? 'PATCH' : 'POST', endpoint, '--input', '-'], payload);
-  return { findings, action: existing ? 'updated' : 'created' };
+  if (existing) {
+    // An issue closed between the lookup and this write is reopened, not left closed with a fresh body.
+    gh(['api', '--method', 'PATCH', `repos/${repository}/issues/${existing.number}`, '--input', '-'], { title: ISSUE_TITLE, body, state: 'open' });
+    return { findings, action: 'updated' };
+  }
+  // A regression after a recovery reopens the closed issue, so recover and regress cycles never pile up duplicates.
+  const closed = latestClosedAuditIssue(repository, gh);
+  if (closed) {
+    gh(['api', '--method', 'PATCH', `repos/${repository}/issues/${closed.number}`, '--input', '-'], { title: ISSUE_TITLE, body, state: 'open' });
+    gh(['api', '--method', 'POST', `repos/${repository}/issues/${closed.number}/comments`, '--input', '-'], { body: regressedComment(report, findings, runUrl) });
+    return { findings, action: 'reopened', issue: closed.number };
+  }
+  gh(['api', '--method', 'POST', `repos/${repository}/issues`, '--input', '-'], { title: ISSUE_TITLE, body });
+  return { findings, action: 'created' };
 }
 
 if (isMainModule(import.meta.url, process.argv[1])) {
