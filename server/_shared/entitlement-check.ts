@@ -124,9 +124,8 @@ export interface CachedEntitlements {
   // or visible to another isolate).
   //
   // A null return therefore means one of exactly two things: the backend is
-  // unconfigured so no lookup was attempted (server/gateway.ts detects that
-  // with isEntitlementBackendConfigured() and keeps its wm_-key fail-open
-  // exception), or Convex answered and this user has no entitlement row — a
+  // unconfigured so no lookup was attempted, or Convex answered and this user
+  // has no entitlement row — a
   // confirmed free account, which is the one state that may honestly upsell.
   verificationUnavailable?: true;
 }
@@ -600,11 +599,8 @@ async function _getEntitlementsImpl(userId: string): Promise<CachedEntitlements 
     // Convex fallback on cache miss or expired cache
     const convexSiteUrl = getConvexSiteUrl();
     const convexSharedSecret = getConvexSharedSecret();
-    // MISCONFIGURATION HAZARD: a deploy missing CONVEX_SITE_URL or
-    // CONVEX_SERVER_SHARED_SECRET returns null for every user on every request.
-    // The gateway recognizes that configuration state and logs before using its
-    // explicit fail-open deploy-defect exception; other entitlement gates remain
-    // fail closed. Warn once per variable here so neither missing value is silent.
+    // Missing configuration cannot resolve a cache miss. Both access gates
+    // fail closed; the getters warn once per missing variable.
     if (!convexSiteUrl || !convexSharedSecret) return null;
 
     const response = await fetch(`${convexSiteUrl}${CONVEX_INTERNAL_ENTITLEMENTS_PATH}`, {
