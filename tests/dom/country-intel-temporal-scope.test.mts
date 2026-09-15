@@ -2,7 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppContext } from '@/app/app-context';
 import type { CountrySignalCluster } from '@/services/signal-aggregator';
 
-const snapshot = vi.hoisted(() => ({ read: vi.fn() }));
+const snapshot = vi.hoisted(() => ({ read: vi.fn(), available: true }));
+vi.mock('@/services/temporal-baseline', () => ({ hasTemporalBaselineSnapshot: () => snapshot.available }));
 vi.mock('@/app/lazy-services', () => ({
   getSignalAggregator: async () => ({ getCountryClusters: snapshot.read }),
 }));
@@ -24,7 +25,7 @@ function manager() {
 }
 
 describe('Country Brief temporal observation scope', () => {
-  beforeEach(() => snapshot.read.mockReset());
+  beforeEach(() => { snapshot.read.mockReset(); snapshot.available = true; });
 
   it('never substitutes global observations for an empty country count', async () => {
     const intel = manager();
@@ -38,6 +39,14 @@ describe('Country Brief temporal observation scope', () => {
       expect(prompt).toContain(`Global context: temporal_anomalies=${count};`);
       expect(prompt).toContain('not attributed to France');
     }
+  });
+
+  it('keeps a failed temporal feed unavailable even when the aggregator loads', async () => {
+    snapshot.read.mockReturnValue([]);
+    snapshot.available = false;
+    const signals = await manager().getCountrySignals('FR', 'France');
+    expect(signals.temporalAnomalies).toBeNull();
+    expect(signals.globalTemporalAnomalies).toBeNull();
   });
 
   it('preserves actual country observations independently of global counts', async () => {

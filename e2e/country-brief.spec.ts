@@ -676,3 +676,17 @@ test('country brief excludes global temporal observations from country signals',
   await expect(panel.locator('#cdp-section-assessment')).toContainText('3 observed temporal anomalies; not attributed to this country');
   await page.screenshot({ path: testInfo.outputPath('country-global-temporal-scope.png') });
 });
+
+
+test('country brief shows unavailable temporal evidence after a failed feed read', async ({ page, countryBrief }, testInfo) => {
+  void countryBrief;
+  await page.route('**/api/infrastructure/v1/list-temporal-anomalies*', route => route.fulfill({ status: 503, json: { error: 'Synthetic feed failure' } }));
+  await page.goto('/dashboard?country=UA');
+  const panel = page.locator('#country-deep-dive-panel');
+  await expect(panel.locator('.cdp-country-name')).toHaveText('Ukraine');
+  await panel.getByRole('navigation', { name: 'Country topics' }).getByRole('button', { name: 'Security', exact: true }).click();
+  const signals = panel.locator('#cdp-section-signals');
+  await signals.scrollIntoViewIfNeeded();
+  await expect(signals).toContainText('Temporal observations unavailable');
+  await page.screenshot({ path: testInfo.outputPath('country-temporal-unavailable.png') });
+});

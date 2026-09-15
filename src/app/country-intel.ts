@@ -1,3 +1,4 @@
+import { hasTemporalBaselineSnapshot } from '@/services/temporal-baseline';
 import type { AppContext, AppModule, CountryBriefSignals } from '@/app/app-context';
 import { getSignalAggregator } from '@/app/lazy-services';
 import type { CountrySignalCluster } from '@/services/signal-aggregator';
@@ -1593,8 +1594,8 @@ export class CountryIntelManager implements AppModule {
       aisDisruptions: signalTypeCounts.aisDisruptions,
       satelliteFires: signalTypeCounts.satelliteFires,
       radiationAnomalies: signalTypeCounts.radiationAnomalies,
-      temporalAnomalies: clustersAvailable ? signalTypeCounts.temporalAnomalies : null,
-      globalTemporalAnomalies: clustersAvailable ? globalTemporalAnomalies : null,
+      temporalAnomalies: clustersAvailable && hasTemporalBaselineSnapshot() ? signalTypeCounts.temporalAnomalies : null,
+      globalTemporalAnomalies: clustersAvailable && hasTemporalBaselineSnapshot() ? globalTemporalAnomalies : null,
       cyberThreats,
       earthquakes,
       displacementOutflow: ciiData?.displacementOutflow ?? 0,

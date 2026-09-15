@@ -25,6 +25,11 @@ export interface TemporalAnomaly {
 const client = new InfrastructureServiceClient(getRpcBaseUrl(), { fetch: (...args) => globalThis.fetch(...args) });
 
 const getSeverity = getAnomalySeverity;
+let snapshotAvailable = false;
+
+export function hasTemporalBaselineSnapshot(): boolean {
+  return snapshotAvailable;
+}
 
 function mapServerAnomaly(a: TemporalAnomalyProto): TemporalAnomaly {
   return {
@@ -45,6 +50,7 @@ export function consumeServerAnomalies(): { anomalies: TemporalAnomaly[]; tracke
     computedAt?: string;
   } | undefined;
 
+  snapshotAvailable = Boolean(raw?.computedAt && Number.isFinite(Date.parse(raw.computedAt)));
   if (!raw?.anomalies) return { anomalies: [], trackedTypes: [] };
   return {
     anomalies: raw.anomalies.map(mapServerAnomaly),
@@ -55,11 +61,13 @@ export function consumeServerAnomalies(): { anomalies: TemporalAnomaly[]; tracke
 export async function fetchLiveAnomalies(): Promise<{ anomalies: TemporalAnomaly[]; trackedTypes: string[] }> {
   try {
     const resp = await client.listTemporalAnomalies({});
+    snapshotAvailable = Boolean(resp.computedAt && Number.isFinite(Date.parse(resp.computedAt)));
     return {
       anomalies: (resp.anomalies ?? []).map(mapServerAnomaly),
       trackedTypes: resp.trackedTypes ?? [],
     };
   } catch (e) {
+    snapshotAvailable = false;
     console.warn('[TemporalBaseline] Live fetch failed:', e);
     return { anomalies: [], trackedTypes: [] };
   }
