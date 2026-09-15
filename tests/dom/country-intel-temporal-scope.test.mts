@@ -1,0 +1,82 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { AppContext } from '@/app/app-context';
+import type { CountrySignalCluster } from '@/services/signal-aggregator';
+
+const snapshot = vi.hoisted(() => ({ read: vi.fn() }));
+vi.mock('@/app/lazy-services', () => ({
+  getSignalAggregator: async () => ({ getCountryClusters: snapshot.read }),
+}));
+import { CountryIntelManager } from '@/app/country-intel';
+
+function cluster(country: string, temporalCount: number): CountrySignalCluster {
+  return {
+    country, countryName: country,
+    signals: Array.from({ length: temporalCount }, () => ({
+      type: 'temporal_anomaly' as const, country, countryName: country,
+      lat: 0, lon: 0, severity: 'medium' as const, title: 'Synthetic observation', timestamp: new Date(),
+    })),
+    signalTypes: new Set(['temporal_anomaly']), totalCount: temporalCount,
+    highSeverityCount: 0, convergenceScore: 0,
+  };
+}
+function manager() {
+  return new CountryIntelManager({ latestClusters: [], intelligenceCache: {} } as unknown as AppContext);
+}
+
+describe('Country Brief temporal observation scope', () => {
+  beforeEach(() => snapshot.read.mockReset());
+
+  it('never substitutes global observations for an empty country count', async () => {
+    const intel = manager();
+    for (const count of [1, 12, 0]) {
+      snapshot.read.mockReturnValue([cluster('XX', count), cluster('US', 2)]);
+      const signals = await intel.getCountrySignals('FR', 'France');
+      expect(signals.temporalAnomalies).toBe(0);
+      expect(signals.globalTemporalAnomalies).toBe(count);
+      const prompt = Reflect.get(intel, 'buildBriefContextSnapshot').call(intel, 'France', 'FR', null, signals, {});
+      expect(prompt).toContain('temporal_anomalies=0,');
+      expect(prompt).toContain(`Global context: temporal_anomalies=${count};`);
+      expect(prompt).toContain('not attributed to France');
+    }
+  });
+
+  it('preserves actual country observations independently of global counts', async () => {
+    const intel = manager();
+    for (const count of [0, 5, 20]) {
+      snapshot.read.mockReturnValue([cluster('FR', 2), cluster('XX', count)]);
+      expect((await intel.getCountrySignals('FR', 'France')).temporalAnomalies).toBe(2);
+    }
+  });
+
+  it('distinguishes a failed cluster read from zero observed signals', async () => {
+    const intel = manager();
+    snapshot.read.mockImplementation(() => { throw new Error('Synthetic snapshot failure'); });
+    const signals = await intel.getCountrySignals('FR', 'France');
+    expect(signals.temporalAnomalies).toBeNull();
+    expect(signals.globalTemporalAnomalies).toBeNull();
+    const prompt = Reflect.get(intel, 'buildBriefContextSnapshot').call(intel, 'France', 'FR', null, signals, {});
+    expect(prompt).toContain('temporal_anomalies=unavailable,');
+    snapshot.read.mockReturnValue([]);
+    expect((await intel.getCountrySignals('FR', 'France')).temporalAnomalies).toBe(0);
+  });
+});
+
+it('renders unavailable temporal evidence in both country views without counting global context', async () => {
+  const { CountryBriefPage } = await import('@/components/CountryBriefPage');
+  const { CountryDeepDivePanel } = await import('@/components/CountryDeepDivePanel');
+  snapshot.read.mockReturnValue([]);
+  const signals = { ...await manager().getCountrySignals('FR', 'France'), temporalAnomalies: null, globalTemporalAnomalies: 9 };
+  const page = new CountryBriefPage();
+  const html = Reflect.get(page, 'signalChips').call(page, signals);
+  const content = document.createElement('div');
+  content.innerHTML = html;
+  expect(content.textContent).toContain('Temporal observations unavailable');
+  expect(content.textContent).not.toContain('9');
+  const panel = new CountryDeepDivePanel();
+  const body = document.createElement('div');
+  Reflect.set(panel, 'signalsBody', body);
+  Reflect.get(panel, 'renderInitialSignals').call(panel, signals);
+  expect(body.textContent).toContain('Temporal observations unavailable');
+  expect(body.querySelector('.cdp-signal-chips')?.textContent).not.toContain('9');
+  document.body.replaceChildren();
+});
