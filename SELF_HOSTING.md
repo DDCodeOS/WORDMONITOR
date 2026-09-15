@@ -106,7 +106,8 @@ with the `X-WorldMonitor-Key` header, validated against `WORLDMONITOR_VALID_KEYS
 (the OAuth path is hosted-only). Generate a key, put it in `.env`, and restart:
 
 ```bash
-echo "WORLDMONITOR_VALID_KEYS=wm_$(openssl rand -hex 20)" >> .env
+YOUR_KEY="wm_$(openssl rand -hex 20)"
+echo "WORLDMONITOR_VALID_KEYS=$YOUR_KEY" >> .env
 docker compose up -d
 ```
 
