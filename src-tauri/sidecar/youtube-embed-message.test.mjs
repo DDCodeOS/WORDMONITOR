@@ -4,10 +4,14 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { runInNewContext } from 'node:vm';
+import { Window } from 'happy-dom';
 import { createLocalApiServer } from './local-api-server.mjs';
 
 function executeBridge(html) {
-  const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  const parserWindow = new Window();
+  const document = new parserWindow.DOMParser().parseFromString(html, 'text/html');
+  const script = document.querySelector('script')?.textContent;
+  parserWindow.close();
   assert.ok(script, 'execute the actual served bridge');
   const calls = [];
   const parent = { postMessage() {} };

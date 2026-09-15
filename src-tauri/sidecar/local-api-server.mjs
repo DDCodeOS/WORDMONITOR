@@ -1512,7 +1512,7 @@ async function dispatch(requestUrl, req, routes, context) {
       || /^https?:\/\/(?:[\w-]+\.)?tauri\.localhost(:\d{1,5})?$/.test(rawParentOrigin);
     const safeVideoId = JSON.stringify(String(videoId));
     const safeOrigin = JSON.stringify(origin);
-    const safeParentOrigin = JSON.stringify(isAllowedParentOrigin ? rawParentOrigin : null);
+    const safeParentOrigin = JSON.stringify(isAllowedParentOrigin ? rawParentOrigin : null).replace(/</g, '\\u003c');
     const bridgePostMessageScript = isAllowedParentOrigin
       ? `function postToParent(message){window.parent.postMessage(message,${safeParentOrigin})}`
       : 'function postToParent(){}';
