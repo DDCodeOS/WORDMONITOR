@@ -425,6 +425,11 @@ describe('credentialed CORS app-host boundary', () => {
         }
       }
     });
+    it(`${surface} rejects non-default ports on translated app origins`, () => {
+      assert.equal(allows('https://worldmonitor-app.translate.goog:8443'), false);
+      assert.equal(allows('https://tech-worldmonitor-app.translate.goog.:8443'), false);
+      assert.equal(allows('https://worldmonitor-app.translate.goog:443'), true);
+    });
     it(`${surface} rejects vendor, unknown and nested hosts including translated forms`, () => {
       for (const label of ['clerk.', 'abacus.', 'unknown.', 'nested.tech.']) {
         const host = `${label}worldmonitor.app`;

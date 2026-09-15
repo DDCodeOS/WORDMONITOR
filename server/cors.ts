@@ -111,7 +111,7 @@ function originForAllowlistMatch(origin: string): string {
 function isWorldMonitorGoogleTranslateOrigin(origin: string): boolean {
   try {
     const url = new URL(origin);
-    if (url.protocol !== 'https:') return false;
+    if (url.protocol !== 'https:' || url.port !== '') return false;
     const host = url.hostname.replace(/\.+$/, '');
     const suffix = '.translate.goog';
     if (!host.endsWith(suffix)) return false;

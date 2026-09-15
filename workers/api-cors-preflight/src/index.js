@@ -152,7 +152,7 @@ function originForAllowlistMatch(origin) {
 function isWorldMonitorGoogleTranslateOrigin(origin) {
   try {
     const url = new URL(origin);
-    if (url.protocol !== 'https:') return false;
+    if (url.protocol !== 'https:' || url.port !== '') return false;
     const host = url.hostname.replace(/\.+$/, '');
     const suffix = '.translate.goog';
     if (!host.endsWith(suffix)) return false;
