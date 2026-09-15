@@ -65,6 +65,36 @@ test('a video is named from YouTube oEmbed alone, even when a channel is also gi
     assert.equal(url.searchParams.get('url'), 'https://www.youtube.com/watch?v=LuKwFajn37U');
   }
 });
+test('a video lookup YouTube never answers ends at the 5 s oEmbed deadline with the unnamed video, uncached', { timeout: 2_000 }, async (t) => {
+  const surface = edge();
+  const issued = [];
+  t.mock.method(AbortSignal, 'timeout', (ms) => {
+    const controller = new AbortController();
+    issued.push({ ms, controller });
+    return controller.signal;
+  });
+  let oembedInit;
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  globalThis.fetch = async (input, init) => {
+    if (String(input).includes('redis.example')) return Response.json([{ result: [29, 30] }]);
+    oembedInit = init;
+    markStarted();
+    // YouTube accepts the connection and never answers; only the request's own deadline ends it.
+    return new Promise((_, reject) => init?.signal?.addEventListener('abort', () => reject(init.signal.reason), { once: true }));
+  };
+
+  const pending = surface.request({ videoId: 'LuKwFajn37U' });
+  await started;
+  const deadline = issued.find(({ controller }) => controller.signal === oembedInit?.signal);
+  assert.equal(deadline?.ms, 5_000, 'the oEmbed request must carry the same 5 s deadline as the RPC');
+  deadline.controller.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+
+  const response = await pending;
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { channelName: null, title: null, videoId: 'LuKwFajn37U' });
+  assert.equal(response.headers.get('Cache-Control'), null);
+});
 test('the relay no longer serves, proxies or configures YouTube live detection', () => {
   // Positive controls: the absence checks below read the real route table and the helper the relay keeps.
   assert.match(relaySource, /pathname === '\/yahoo-chart'/, 'the relay route table must still be readable');

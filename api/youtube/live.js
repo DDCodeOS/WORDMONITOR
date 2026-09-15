@@ -17,6 +17,8 @@ const RATE_LIMIT_PER_MINUTE = 30;
 const CHANNEL_ID_RE = /^UC[A-Za-z0-9_-]{22}$/;
 const HANDLE_RE = /^[\p{L}\p{N}](?:[\p{L}\p{N}\p{M}._·-]{0,28}[\p{L}\p{N}\p{M}])?$/u;
 const CHANNEL_DETECTION_RETIRED = 'channel_live_detection_retired';
+// Matches the RPC's oEmbed deadline (server/worldmonitor/aviation/v1/get-youtube-live-stream-info.ts).
+const OEMBED_TIMEOUT_MS = 5_000;
 
 export default async function handler(request, ctx) {
   const cors = getCorsHeaders(request);
@@ -63,7 +65,10 @@ export default async function handler(request, ctx) {
     try {
       const oembedRes = await fetch(
         `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoIdParam}&format=json`,
-        { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' } },
+        {
+          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+          signal: AbortSignal.timeout(OEMBED_TIMEOUT_MS),
+        },
       );
       if (oembedRes.ok) {
         const data = await oembedRes.json();
@@ -72,7 +77,7 @@ export default async function handler(request, ctx) {
           headers: { ...cors, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=3600, s-maxage=3600' },
         });
       }
-    } catch { /* oembed failed — return minimal response */ }
+    } catch { /* oembed failed or passed its deadline — return minimal response */ }
     return new Response(JSON.stringify({ channelName: null, title: null, videoId: videoIdParam }), {
       status: 200,
       headers: { ...cors, 'Content-Type': 'application/json' },
