@@ -200,6 +200,25 @@ describe('OpenAPI deprecated + operation-description contract', () => {
     assert.deepEqual(example.hackerNewsMentions, []);
     assert.ok(example.secFilings.recentFilings[0].items.length > 0);
   });
+
+  it('keeps the YouTube video lookup example truthful to the retired live detection', () => {
+    const path = '/api/aviation/v1/get-youtube-live-stream-info';
+    const json = JSON.parse(readFileSync(resolve(apiDir, 'AviationService.openapi.json'), 'utf8'));
+    const example = json.paths[path].get.responses['200'].content['application/json'].example;
+    assert.equal(example.isLive, false, 'oEmbed never reports a video as live');
+    assert.equal(example.hlsUrl, '', 'manifest URLs are no longer returned');
+    assert.equal(example.error, '', 'a successful lookup carries no error');
+    assert.match(example.videoId, /^[A-Za-z0-9_-]{11}$/);
+    assert.equal(example.channelExists, true);
+    assert.ok(example.title && example.channelName, 'a named video has a title and a channel name');
+
+    for (const file of ['AviationService.openapi.yaml', 'worldmonitor.openapi.yaml']) {
+      const block = yamlPathBlock(readFileSync(resolve(apiDir, file), 'utf8'), path);
+      assert.match(block, /"isLive": false/, `${file} isLive`);
+      assert.match(block, /"hlsUrl": ""/, `${file} hlsUrl`);
+      assert.doesNotMatch(block, /"error": "example"|example\.com\/worldmonitor/, `${file} placeholder values`);
+    }
+  });
 });
 
 function yamlSchemaBlock(text, name) {
