@@ -55,8 +55,8 @@ if (mode) {
   sdk.captureEvent({
     exception: { values: [{ type: 'Error', value: 'Owned error https://example.test/api?token=SYNTH_MESSAGE', stacktrace: { frames: [{ filename: 'https://worldmonitor.app/assets/main-ABC123.js?token=SYNTH_FRAME', lineno: 12, function: 'ownedOperation' }] } }] },
     tags: { kind: 'checkout_request_failed' },
-    extra: { diagnosticUrl: '//example.test/api?token=SYNTH_EXTRA#fragment', relative: { url: 'api/test?token=SYNTH_RELATIVE' }, message: 'GET /api?token=SYNTH_RELATIVE_TEXT' },
-    request: { headers: { Authorization: 'SYNTH_REQUEST_AUTH', Cookie: 'SYNTH_COOKIE' }, query_string: 'token=SYNTH_QUERY' },
+    extra: { accessToken: 'SYNTH_ACCESS_TOKEN', refreshToken: 'SYNTH_REFRESH_TOKEN', client_secret: 'SYNTH_CLIENT_SECRET', diagnosticUrl: '//example.test/api?token=SYNTH_EXTRA#fragment', relative: { url: 'api/test?token=SYNTH_RELATIVE' }, message: 'GET /api?token=SYNTH_RELATIVE_TEXT' },
+    request: { headers: { 'X-Api-Key': 'SYNTH_API_KEY', Authorization: 'SYNTH_REQUEST_AUTH', Cookie: 'SYNTH_COOKIE' }, query_string: 'token=SYNTH_QUERY' },
   });
   sdk.captureEvent({ type: 'transaction', transaction: '/pro?code=SYNTH_TRANSACTION', start_timestamp: Date.now() / 1000 - 1, timestamp: Date.now() / 1000,
     contexts: { trace: { trace_id: 'a'.repeat(32), span_id: 'b'.repeat(16) } },
