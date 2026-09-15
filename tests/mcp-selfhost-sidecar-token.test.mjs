@@ -1,28 +1,8 @@
-// Self-hosted Docker: the nginx-injected sidecar token must not masquerade as
-// an MCP OAuth credential.
-//
-// Background. In the Docker self-host, `docker/nginx.conf` sets
-//   proxy_set_header Authorization "Bearer ${LOCAL_API_TOKEN}"
-// on every /api/ request, because the sidecar's global auth gate
-// (src-tauri/sidecar/local-api-server.mjs) rejects anything without it. That
-// header is transport auth between nginx and the sidecar. `resolveAuthContext`
-// used to treat ANY bearer as an OAuth token, so it tried (and failed) to
-// resolve the sidecar token and returned 401 before ever reaching the
-// `X-WorldMonitor-Key` branch that `WORLDMONITOR_VALID_KEYS` exists to serve.
-//
-// nginx OVERWRITES the header rather than appending, so no client could work
-// around it: strip it and the sidecar gate rejects the request; keep it and MCP
-// rejects it. /api/mcp was therefore unreachable on every self-hosted
-// deployment, by any header combination.
-//
-// These tests pin both halves of the fix AND the security boundary: the
-// transport token grants no authority of its own — a valid
-// WORLDMONITOR_VALID_KEYS entry is still required.
-
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 
 import { buildAuthHeaders, resolveAuthContext } from '../api/mcp/auth.ts';
+import { buildMcpDownstreamHeaders, createMcpToolExecutionContext } from '../api/mcp/downstream.ts';
 
 const SIDECAR_TOKEN = 'sidecar-transport-token-abc123';
 const VALID_KEY = 'wm_selfhost_valid_key';
@@ -38,6 +18,7 @@ const throwingDeps = {
   validateProMcpToken: async () => null,
   getEntitlements: async () => null,
   validateUserApiKey: async () => null,
+  guardUserApiKeyValidation: async () => null,
   redisPipeline: async () => [],
 };
 
@@ -63,10 +44,10 @@ describe('self-hosted sidecar token vs MCP auth', () => {
     else process.env.WORLDMONITOR_VALID_KEYS = priorKeys;
   });
 
-  it('authenticates via X-WorldMonitor-Key despite the nginx-injected bearer', async () => {
+  it('authenticates via X-WorldMonitor-Key alongside the nginx transport header', async () => {
     const result = await resolveAuthContext(
       request({
-        Authorization: `Bearer ${SIDECAR_TOKEN}`,
+        'X-WorldMonitor-Local-Token': SIDECAR_TOKEN,
         'X-WorldMonitor-Key': VALID_KEY,
       }),
       throwingDeps,
@@ -81,7 +62,7 @@ describe('self-hosted sidecar token vs MCP auth', () => {
 
   it('grants NO authority on its own — sidecar token without a valid key is 401', async () => {
     const result = await resolveAuthContext(
-      request({ Authorization: `Bearer ${SIDECAR_TOKEN}` }),
+      request({ 'X-WorldMonitor-Local-Token': SIDECAR_TOKEN }),
       throwingDeps,
       RESOURCE_METADATA_URL,
       {},
@@ -94,7 +75,7 @@ describe('self-hosted sidecar token vs MCP auth', () => {
   it('rejects an invalid API key even when the sidecar token is present', async () => {
     const result = await resolveAuthContext(
       request({
-        Authorization: `Bearer ${SIDECAR_TOKEN}`,
+        'X-WorldMonitor-Local-Token': SIDECAR_TOKEN,
         'X-WorldMonitor-Key': 'wm_not_a_configured_key',
       }),
       throwingDeps,
@@ -130,15 +111,18 @@ describe('self-hosted sidecar token vs MCP auth', () => {
     // A tool's `_execute` targets the sidecar directly (origin of req.url),
     // bypassing the nginx hop that would have added this header — without it
     // the sidecar gate 401s and the tool reports "data fetch failed".
-    const headers = await buildAuthHeaders(
+    const auth = await buildAuthHeaders(
       { kind: 'env_key', apiKey: VALID_KEY },
       'GET',
       'http://127.0.0.1:46123/api/intelligence/v1/get-country-risk',
       null,
     );
 
+    const origin = 'http://127.0.0.1:46123';
+    const headers = buildMcpDownstreamHeaders(origin, createMcpToolExecutionContext(`${origin}/api/mcp`), auth);
     assert.equal(headers['X-WorldMonitor-Key'], VALID_KEY);
-    assert.equal(headers.Authorization, `Bearer ${SIDECAR_TOKEN}`);
+    assert.equal(headers['X-WorldMonitor-Local-Token'], SIDECAR_TOKEN);
+    assert.equal(headers.Authorization, undefined);
   });
 
   it('adds no Authorization header when not self-hosted', async () => {
