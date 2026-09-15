@@ -145,7 +145,7 @@ describe('desktop generic recovery', () => {
     const controller = new AbortController();
     const request = new Request(ORIGIN + PATH, { headers: { 'X-Test': 'retained' }, signal: controller.signal });
     expect((await window.fetch(request)).status).toBe(200);
-    const forwarded = native.mock.calls[0][0];
+    const forwarded = native.mock.calls[0]?.[0];
     expect(forwarded).toBeInstanceOf(Request);
     if (!(forwarded instanceof Request)) throw new Error('Expected a Request');
     expect(forwarded.headers.get('X-Test')).toBe('retained');
