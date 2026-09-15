@@ -302,7 +302,7 @@ jobs:
         # duplicate name within a run, which collides on the re-run someone
         # starts to chase the failure.
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: openapi-capacity-${{ github.run_attempt }}
           path: ${{ runner.temp }}/openapi-capacity.json
@@ -682,7 +682,7 @@ jobs:
       # would land exactly when someone re-runs the job to chase a flake.
       - name: Upload ci-smoke Playwright artifacts
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: playwright-ci-smoke-${{ github.run_id }}-${{ github.run_attempt }}
           path: test-results/
@@ -698,7 +698,7 @@ jobs:
         run: npm run test:e2e:prehydration
       - name: Upload prehydration Playwright artifacts
         if: ${{ !cancelled() && steps.prehydration.outcome != 'skipped' }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: playwright-prehydration-${{ github.run_id }}-${{ github.run_attempt }}
           path: test-results/
@@ -719,7 +719,7 @@ jobs:
       # gate's failure trace before anyone could read it.
       - name: Upload critical-CSS CLS Playwright artifacts
         if: ${{ !cancelled() && steps.pro-cls.outcome != 'skipped' }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: playwright-pro-cls-${{ github.run_id }}-${{ github.run_attempt }}
           path: test-results/
@@ -739,7 +739,7 @@ jobs:
       # itself a failure signal.
       - name: Upload WebMCP Playwright artifacts
         if: ${{ !cancelled() && steps.webmcp.outcome != 'skipped' }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: playwright-webmcp-${{ github.run_id }}-${{ github.run_attempt }}
           path: test-results/
