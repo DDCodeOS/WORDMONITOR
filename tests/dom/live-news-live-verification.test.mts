@@ -117,6 +117,11 @@ function content(): HTMLElement {
   return internals().content;
 }
 
+/** Saves the one custom stream the way channel management does after an edit that keeps its id. */
+function saveCustomStream(hlsUrl: string, name = 'Local TV'): void {
+  localStorage.setItem(STORAGE_KEYS.liveChannels, JSON.stringify({ order: ['custom-hls-1'], custom: [{ id: 'custom-hls-1', name, hlsUrl }], displayNameOverrides: {} }));
+}
+
 function contentButton(label: string): HTMLButtonElement {
   const match = Array.from(content().querySelectorAll('button')).find((candidate) => candidate.textContent === label);
   if (!match) throw new Error(`no "${label}" button in panel content`);
@@ -322,6 +327,25 @@ describe('Live News live verification', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it('keeps a saved handle channel whose id carries a stream, video or channel prefix, and asks for its channel URL', async () => {
+    // Before channel URLs, a handle was saved as custom-<handle>, so @hls-news became custom-hls-news.
+    for (const [id, name, handle] of [
+      ['custom-hls-news', 'HLS News', '@hls-news'],
+      ['custom-vid-x', 'Vid X', '@vid-x'],
+      ['custom-uc-desk', 'UC Desk', '@uc-desk'],
+    ] as const) {
+      panel?.destroy();
+      document.body.innerHTML = '';
+      mount([id], { custom: [{ id, name, handle }] });
+      expect(channelButton(id)).toBeTruthy();
+
+      await playFromPlaceholder();
+      expect(offlineText()).toBe(`Add ${name} again with its channel URL (youtube.com/channel/UC…) or a live video URL`);
+    }
+    expect(hlsState.instances).toHaveLength(0);
+    expect(api().players).toHaveLength(0);
+  });
+
   it('plays a user-added ended video labelled as a recording, never as live', async () => {
     mount(['custom-vid-AbCdEfGhIjK'], {
       custom: [{ id: 'custom-vid-AbCdEfGhIjK', name: 'My stream', handle: '@video', fallbackVideoId: 'AbCdEfGhIjK', useFallbackOnly: true }],
@@ -454,6 +478,41 @@ describe('Live News live verification', () => {
     expect(savedActiveChannel()).toBe('bloomberg');
     expect(latestHls().url).toBe(BLOOMBERG_HLS);
     expect(getActiveLiveMedia('live-news')?.streamId).toBe('bloomberg');
+  });
+
+  it('restarts a playing custom stream on its new URL when an edit keeps the channel id', async () => {
+    mount(['custom-hls-1'], { custom: [{ id: 'custom-hls-1', name: 'Local TV', hlsUrl: 'https://tv.example/old.m3u8' }] });
+    await playFromPlaceholder();
+    await playHlsLive();
+    const old = latestHls();
+
+    // A rename leaves the running stream alone.
+    saveCustomStream('https://tv.example/old.m3u8', 'Local TV 2');
+    panel?.refreshChannelsFromStorage();
+    await flush();
+    expect(old.destroyed).toBe(false);
+    expect(hlsState.instances).toHaveLength(1);
+
+    saveCustomStream('https://tv.example/new.m3u8');
+    panel?.refreshChannelsFromStorage();
+    await flush();
+
+    expect(old.destroyed).toBe(true);
+    expect(latestHls().url).toBe('https://tv.example/new.m3u8');
+    expect(content().querySelectorAll('video.live-news-media')).toHaveLength(1);
+    expect(getActiveLiveMedia('live-news')?.streamId).toBe('custom-hls-1');
+  });
+
+  it('plays the edited URL next time without starting a stopped custom stream', async () => {
+    mount(['custom-hls-1'], { custom: [{ id: 'custom-hls-1', name: 'Local TV', hlsUrl: 'https://tv.example/old.m3u8' }] });
+
+    saveCustomStream('https://tv.example/new.m3u8');
+    panel?.refreshChannelsFromStorage();
+    await flush();
+    expect(hlsState.instances).toHaveLength(0);
+
+    await playFromPlaceholder();
+    expect(latestHls().url).toBe('https://tv.example/new.m3u8');
   });
 
   it('keeps an idle stop when the panel scrolls back into view for an auto-play user', async () => {

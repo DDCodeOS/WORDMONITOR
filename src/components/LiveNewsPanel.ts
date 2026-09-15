@@ -240,17 +240,18 @@ interface StoredCustomChannel {
   fallbackVideoId?: string;
 }
 
-/** Keeps only what playback reads, by the id prefix channel management gives each kind of custom channel. */
+/**
+ * Keeps only what playback reads. The saved fields decide the kind, not the id: before channel URLs a
+ * handle was saved as custom-<handle>, so @hls-news carries the prefix a stream id uses today.
+ */
 function customChannelFromStorage(stored: StoredCustomChannel): LiveChannel | null {
   const { id } = stored;
   if (!id) return null;
   const name = stored.name || stored.handle || id;
-  if (id.startsWith('custom-hls-')) return stored.hlsUrl ? { id, name, hlsUrl: stored.hlsUrl } : null;
-  if (id.startsWith('custom-vid-')) {
-    const videoId = stored.videoId ?? stored.fallbackVideoId;
-    return videoId ? { id, name, videoId } : null;
-  }
-  if (id.startsWith('custom-uc-')) return stored.channelId ? { id, name, channelId: stored.channelId } : null;
+  if (stored.hlsUrl) return { id, name, hlsUrl: stored.hlsUrl };
+  const videoId = stored.videoId ?? stored.fallbackVideoId;
+  if (videoId) return { id, name, videoId };
+  if (stored.channelId) return { id, name, channelId: stored.channelId };
   // Saved as a handle alone. Its live video cannot be looked up, so playback asks for a channel URL.
   return stored.handle ? { id, name, handle: stored.handle } : null;
 }
@@ -1116,10 +1117,19 @@ export class LiveNewsPanel extends Panel {
     this.channels = loadChannelsFromStorage();
     if (this.channels.length === 0) this.channels = getDefaultLiveChannels();
     this.refreshChannelSwitcher();
-    // The active channel was removed. switchChannel ignores the channel it already holds, so hand it
-    // the replacement instead of assigning it first; it stops the removed channel and saves the new one.
-    const next = this.channels[0];
-    if (next && !this.channels.some((c) => c.id === this.activeChannel.id)) this.switchChannel(next);
+    const current = this.channels.find((c) => c.id === this.activeChannel.id);
+    if (!current) {
+      // The active channel was removed. switchChannel ignores the channel it already holds, so hand it
+      // the replacement instead of assigning it first; it stops the removed channel and saves the new one.
+      const next = this.channels[0];
+      if (next) this.switchChannel(next);
+      return;
+    }
+    // An edit can keep the id and change what plays (a custom stream URL). Hold the edited channel, and
+    // move a running session onto its new source; a stopped channel plays the new source next time.
+    const sourceChanged = liveVideoSourceFor(current).entries.join('\n') !== liveVideoSourceFor(this.activeChannel).entries.join('\n');
+    this.activeChannel = current;
+    if (sourceChanged && this.videoSession) this.renderPlayer();
   }
 
   public stopLiveMediaForClose(): void {
