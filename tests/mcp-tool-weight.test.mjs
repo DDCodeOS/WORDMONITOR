@@ -178,6 +178,7 @@ describe('fan-out matcher', () => {
 
   it('counts signed calls through the downstream transport policy', () => {
     async function transportFetches() {
+      const fetchMcpDownstream = async () => ({});
       const buildAuthHeaders = async () => ({});
       await buildAuthHeaders();
       await fetchMcpDownstream('https://example.test/a', {}, undefined);
