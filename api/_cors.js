@@ -1,5 +1,9 @@
+// App-serving hosts only; sibling vendor hosts do not inherit browser trust.
+// Keep aligned with convex/payments/returnUrlOrigin.ts and CORS parity tests.
+const APP_ORIGIN_PATTERN = /^https:\/\/(?:(?:www|app|api|tech|finance|commodity|happy|energy)\.)?worldmonitor\.app$/;
+
 const ALLOWED_ORIGIN_PATTERNS = [
-  /^https:\/\/(.*\.)?worldmonitor\.app$/,
+  APP_ORIGIN_PATTERN,
   // Vercel preview deployments under the "eliewm" team scope, e.g.
   //   worldmonitor-git-<branch>-eliewm.vercel.app  (git-branch alias)
   //   worldmonitor-<hash>-eliewm.vercel.app        (deployment URL)
@@ -99,8 +103,7 @@ function originForAllowlistMatch(origin) {
  * `https://www-worldmonitor-app.translate.goog` (`.` → `-`, and literal `-` →
  * `--`). Suffix-matching the encoded label would admit
  * `evil--worldmonitor-app.translate.goog` (`evil-worldmonitor.app`). Decode
- * first, then require the reconstructed host to be `worldmonitor.app` or a
- * subdomain (#6411 review).
+ * first, then require the reconstructed host to be an enumerated app host (#6411 review).
  */
 function isWorldMonitorGoogleTranslateOrigin(origin) {
   try {
@@ -112,7 +115,7 @@ function isWorldMonitorGoogleTranslateOrigin(origin) {
     const encoded = host.slice(0, -suffix.length);
     if (!encoded || encoded.includes('.')) return false;
     const decoded = encoded.replace(/--/g, '\0').replace(/-/g, '.').replace(/\0/g, '-');
-    return decoded === 'worldmonitor.app' || decoded.endsWith('.worldmonitor.app');
+    return APP_ORIGIN_PATTERN.test(`https://${decoded}`);
   } catch {
     return false;
   }
