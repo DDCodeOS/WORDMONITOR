@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { isAllowedWebcamEmbedMessageOrigin } from '../src/components/_live-webcams-origin.ts';
+import { isAllowedWebcamEmbedMessageOrigin } from '../src/services/live-video/embed-message-origin.ts';
 
 describe('LiveWebcamsPanel postMessage origin guard', () => {
   it('accepts YouTube iframe API messages from the iframe embed origin', () => {

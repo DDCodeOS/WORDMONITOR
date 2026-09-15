@@ -2,9 +2,9 @@
 // what is verified live, and tells the panel what to show. Panels render words from LiveVideoState;
 // they never see YT.Player, hls.js, player error codes or sidecar bridge messages.
 
-import { isAllowedWebcamEmbedMessageOrigin } from '@/components/_live-webcams-origin';
 import { getStreamQuality } from '@/services/ai-flow-settings';
 import { track } from '@/services/analytics';
+import { isAllowedWebcamEmbedMessageOrigin } from '@/services/live-video/embed-message-origin';
 import { getLocalApiPort, isDesktopRuntime } from '@/services/runtime';
 
 import {
