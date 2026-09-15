@@ -37,8 +37,11 @@ export const WEBCAM_SOURCES = {
   seoul: ['https://www.youtube.com/watch?v=vk5BHoDxXf0'],
   sydney: ['https://www.youtube.com/watch?v=5uZa3-RMFos'],
   'iss-earth': ['https://www.youtube.com/watch?v=M3HKLzjvKPc'],
-  'nasa-live': [],
-  'space-x': [],
+  // NASA's official "Live High-Definition Views from the International Space Station".
+  'nasa-live': ['https://www.youtube.com/watch?v=awQzjn72bI0'],
+  // NASASpaceflight's Starbase Live, then its Space Coast Live. Dream Trips' ISS stream
+  // (0FBiyFpV__g) was requested but does not allow embedding (player error 150, 2026-09-15).
+  'space-x': ['https://www.youtube.com/watch?v=mhJRzQsLZGg', 'https://www.youtube.com/watch?v=Jm8wRjD3xVA'],
   'space-walk': ['https://www.youtube.com/watch?v=fO9e9jnhYK8'],
 } as const satisfies Record<string, readonly string[]>;
 
