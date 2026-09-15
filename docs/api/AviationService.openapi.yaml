@@ -928,10 +928,12 @@ paths:
                         application/json:
                             example:
                                 "channelExists": true
-                                "channelName": "WorldMonitor Analyst"
-                                "error": "example"
-                                "hlsUrl": "https://example.com/worldmonitor"
-                                "isLive": true
+                                "channelName": "DW News"
+                                "error": ""
+                                "hlsUrl": ""
+                                "isLive": false
+                                "title": "DW News livestream"
+                                "videoId": "LuKwFajn37U"
                             schema:
                                 $ref: '#/components/schemas/GetYoutubeLiveStreamInfoResponse'
                 "400":
