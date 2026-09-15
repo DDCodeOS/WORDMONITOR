@@ -1,11 +1,12 @@
 ---
 title: "Track Global Conflicts in Real Time with World Monitor"
-description: "Monitor active conflicts, military movements, and geopolitical escalation in real time. World Monitor tracks 210+ bases across 9 theaters with live ADS-B data."
+description: "Monitor active conflicts, military movements, and geopolitical escalation in real time with the reviewed base and strategic-theater registries plus live ADS-B data."
 metaTitle: "Track Global Conflicts in Real Time | World Monitor"
 keywords: "real-time conflict map, geopolitical intelligence map, military tracking dashboard, conflict monitoring tool, global conflict tracker"
 audience: "Geopolitical analysts, defense researchers, policy makers, journalists covering conflict"
 heroImage: "/blog/images/blog/track-global-conflicts-in-real-time.jpg"
 pubDate: "2026-02-14"
+modifiedDate: "2026-09-10"
 ---
 
 When a military escalation begins, the first 24 hours define the narrative. Analysts who see the signals early, the unusual flight patterns, the naval repositioning, the news velocity spike, have a decisive advantage over those waiting for the morning briefing.
@@ -22,26 +23,28 @@ The answer comes from layering multiple intelligence sources onto a single inter
 - **[UCDP](https://ucdp.uu.se/) warfare events** for state-based and non-state conflicts
 - **Live ADS-B tracking** for military aircraft positions
 - **AIS vessel monitoring** merged with USNI fleet reports for naval movements
-- **26 Telegram OSINT channels** for raw, low-latency intelligence
+- **Curated Telegram OSINT channels** for raw, low-latency intelligence
 - **OREF rocket alerts** with 1,480 Hebrew-to-English siren translations
 - **GPS/GNSS jamming zones** detected from ADS-B anomalies
 - **NASA satellite fire detection** (VIIRS) for ground-truth verification
 
 Each layer can be toggled independently. Combine them to build a multi-source picture of any developing situation. For a broader look at what the platform offers, see [What Is World Monitor?](/blog/posts/what-is-worldmonitor-real-time-global-intelligence/).
 
-## 9 Strategic Theaters Under Continuous Assessment
+## Strategic Theaters Under Continuous Assessment
 
-World Monitor maintains real-time posture assessments for 9 operational theaters:
+World Monitor maintains real-time posture assessments for its operational-theater registry:
 
-1. **Iran / Persian Gulf:** Strait of Hormuz chokepoint, IRGC activity, proxy conflict indicators
-2. **Taiwan Strait:** PLA military exercises, naval deployments, airspace incursions
+1. **[Iran](https://www.worldmonitor.app/countries/iran/) / Persian Gulf:** [Strait of Hormuz](https://www.worldmonitor.app/chokepoints/strait-of-hormuz/) chokepoint, IRGC activity, proxy conflict indicators
+2. **[Taiwan Strait](https://www.worldmonitor.app/chokepoints/taiwan-strait/):** PLA military exercises, naval deployments, airspace incursions
 3. **Baltic Region:** NATO-Russia friction, Kaliningrad corridor, submarine activity
 4. **Korean Peninsula:** DMZ incidents, missile tests, force posture changes
 5. **Eastern Mediterranean:** Israel-Hezbollah dynamics, energy disputes, naval presence
 6. **Horn of Africa:** Houthi maritime threats, Red Sea shipping disruption, piracy
 7. **South China Sea:** Island militarization, fishing militia, freedom of navigation operations
 8. **Arctic:** Resource competition, Northern Sea Route, military basing
-9. **Black Sea:** Ukraine conflict, grain corridor, naval mine risk
+9. **Black Sea:** [Ukraine](https://www.worldmonitor.app/countries/ukraine/) conflict, grain corridor, naval mine risk
+
+For dated country-level conflict summaries, open the [Gulf security](https://www.worldmonitor.app/crises/hormuz-gulf-security/), [Red Sea security](https://www.worldmonitor.app/crises/red-sea-security/), and [Ukraine war](https://www.worldmonitor.app/crises/ukraine-war/) trackers. Each states its country coverage and observation period; that scope differs from the broader theaters above.
 
 Each theater's posture level is synthesized from news velocity, military movements, CII scores of involved nations, and historical escalation patterns.
 
@@ -76,9 +79,9 @@ World Monitor's escalation algorithm goes beyond showing where events are happen
 
 Geographic convergence is particularly powerful. When you see protests AND military deployments AND a communications outage in the same area within the same day, that pattern has predictive value that individual events don't.
 
-## 210+ Military Bases Mapped
+## Military Bases Mapped
 
-The military infrastructure layer maps over **210 bases from 9 operators**, including:
+The military infrastructure layer maps the authoritative base registry, including:
 
 - US military installations worldwide
 - Russian bases and deployment zones
@@ -105,14 +108,14 @@ World Monitor maps critical infrastructure alongside conflict data:
 - **Undersea cables** carrying 95% of intercontinental internet traffic
 - **Oil and gas pipelines** traversing conflict zones
 - **Nuclear facilities** and their proximity to active hostilities
-- **AI datacenters** (111 mapped globally)
-- **Strategic ports** (83) and airports (107)
+- **AI datacenters** (300+ mapped globally)
+- **Strategic ports** (60+) and airports (115)
 
 The Infrastructure Cascade panel shows what happens when a conflict zone overlaps with critical infrastructure. A pipeline through a hotspot, a cable landing station near an escalation zone. These second-order effects drive market moves and policy decisions.
 
-## 26 Telegram Channels: The Raw Feed
+## Telegram Channels: The Raw Feed
 
-For analysts who want unfiltered intelligence, World Monitor integrates 26 curated Telegram channels via MTProto. Learn more about how this fits into the broader OSINT landscape in [OSINT for Everyone](/blog/posts/osint-for-everyone-open-source-intelligence-democratized/).
+For analysts who want unfiltered intelligence, World Monitor integrates curated Telegram channels via MTProto. Learn more about how this fits into the broader OSINT landscape in [OSINT for Everyone](/blog/posts/osint-for-everyone-open-source-intelligence-democratized/).
 
 The channels are tiered by reliability. Tier 1 sources are verified primary reporters. Tier 2 includes established OSINT accounts like Aurora Intel, BNO News, and DeepState. Tier 3 captures secondary aggregators for broader coverage.
 
@@ -145,7 +148,7 @@ Think tanks and government analysts use the Strategic Theater Posture assessment
 
 ## 8 Regional Presets
 
-Jump between regions instantly with 8 preset views: Global, Americas, Europe, MENA, Asia, Africa, Oceania, and Latin America. Each preset adjusts the map view and highlights region-relevant layers.
+Jump between regions instantly with named preset views: Global, Americas, Europe, MENA, Asia, Africa, Oceania, and Latin America. Each preset adjusts the map view and highlights region-relevant layers.
 
 ## Shareable Intelligence
 
@@ -156,7 +159,7 @@ For public sharing, the story export feature generates social-ready briefs with 
 ## Frequently Asked Questions
 
 **What data sources does World Monitor use for conflict tracking?**
-World Monitor aggregates ACLED conflict events, UCDP warfare data, live ADS-B aircraft transponders, AIS maritime positions merged with USNI fleet reports, 26 Telegram OSINT channels, and NASA satellite fire detection. All sources are public and verifiable.
+World Monitor aggregates ACLED conflict events, UCDP warfare data, live ADS-B aircraft transponders, AIS maritime positions merged with USNI fleet reports, curated Telegram OSINT channels, and NASA satellite fire detection. All sources are public and verifiable.
 
 **Is World Monitor free to use for conflict monitoring?**
 Yes. World Monitor is completely free and open source under AGPL-3.0. There is no login, paywall, or data collection. You can also self-host it for full control.

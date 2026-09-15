@@ -1,10 +1,17 @@
 import { SITE_VARIANT } from '@/config/variant';
+import { safeStorageGet } from '@/utils/safe-storage';
 import { getClerkToken } from '@/services/clerk';
+import { withBillingVerificationRetry } from '@/services/billing-retry';
+import { hasExplicitDesktopSignals, isDesktopRuntime } from './desktop-runtime';
+
+// The detector lives in a dependency-free leaf (#5911) so consumers that need
+// only the boolean do not pull this module's variant/Clerk graph. Re-exported
+// here because every existing caller imports it from `@/services/runtime`.
+export { detectDesktopRuntime, isDesktopRuntime, type RuntimeProbe } from './desktop-runtime';
 
 const ENV = (() => {
   try {
     return {
-      VITE_DESKTOP_RUNTIME: import.meta.env.VITE_DESKTOP_RUNTIME,
       VITE_TAURI_API_BASE_URL: import.meta.env.VITE_TAURI_API_BASE_URL,
       VITE_TAURI_REMOTE_API_BASE_URL: import.meta.env.VITE_TAURI_REMOTE_API_BASE_URL,
       VITE_WS_API_URL: import.meta.env.VITE_WS_API_URL,
@@ -17,7 +24,6 @@ const ENV = (() => {
 
 const WS_API_URL = ENV.VITE_WS_API_URL || '';
 const DEFAULT_WEB_API_URL = 'https://api.worldmonitor.app';
-const KEYED_CLOUD_API_PATTERN = /^\/api\/(?:[^/]+\/v1\/|bootstrap(?:\?|$)|polymarket(?:\?|$)|ais-snapshot(?:\?|$))/;
 
 const DEFAULT_REMOTE_HOSTS: Record<string, string> = {
   tech: WS_API_URL,
@@ -28,7 +34,6 @@ const DEFAULT_REMOTE_HOSTS: Record<string, string> = {
 };
 
 const DEFAULT_LOCAL_API_PORT = 46123;
-const FORCE_DESKTOP_RUNTIME = ENV.VITE_DESKTOP_RUNTIME === '1';
 
 let _resolvedPort: number | null = null;
 let _portPromise: Promise<number> | null = null;
@@ -62,59 +67,20 @@ function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.replace(/\/$/, '');
 }
 
-type RuntimeProbe = {
-  hasTauriGlobals: boolean;
-  userAgent: string;
-  locationProtocol: string;
-  locationHost: string;
-  locationOrigin: string;
-};
-
-export function detectDesktopRuntime(probe: RuntimeProbe): boolean {
-  const tauriInUserAgent = probe.userAgent.includes('Tauri');
-  const secureLocalhostOrigin = (
-    probe.locationProtocol === 'https:' && (
-      probe.locationHost === 'localhost' ||
-      probe.locationHost.startsWith('localhost:') ||
-      probe.locationHost === '127.0.0.1' ||
-      probe.locationHost.startsWith('127.0.0.1:')
-    )
-  );
-
-  // Tauri production windows can expose tauri-like hosts/schemes without
-  // always exposing bridge globals at first paint.
-  const tauriLikeLocation = (
-    probe.locationProtocol === 'tauri:' ||
-    probe.locationProtocol === 'asset:' ||
-    probe.locationHost === 'tauri.localhost' ||
-    probe.locationHost.endsWith('.tauri.localhost') ||
-    probe.locationOrigin.startsWith('tauri://') ||
-    secureLocalhostOrigin
-  );
-
-  return probe.hasTauriGlobals || tauriInUserAgent || tauriLikeLocation;
-}
-
-export function isDesktopRuntime(): boolean {
-  if (FORCE_DESKTOP_RUNTIME) {
-    return true;
-  }
-
-  if (typeof window === 'undefined') {
-    return false;
-  }
-
-  return detectDesktopRuntime({
-    hasTauriGlobals: '__TAURI_INTERNALS__' in window || '__TAURI__' in window,
-    userAgent: window.navigator?.userAgent ?? '',
-    locationProtocol: window.location?.protocol ?? '',
-    locationHost: window.location?.host ?? '',
-    locationOrigin: window.location?.origin ?? '',
-  });
+/**
+ * Whether /api/ traffic should take the desktop sidecar path.
+ *
+ * Same predicate as `suppressesRemoteBase`: a bare `https://localhost` origin
+ * is not enough. `isDesktopRuntime()` treats that origin as desktop, which
+ * would install the sidecar fetch patch and skip the same-origin web path —
+ * the exact HTTPS-dev failure `hasExplicitDesktopSignals()` exists to stop.
+ */
+function routesApiViaDesktop(): boolean {
+  return hasExplicitDesktopSignals();
 }
 
 export function getApiBaseUrl(): string {
-  if (!isDesktopRuntime()) {
+  if (!routesApiViaDesktop()) {
     return '';
   }
 
@@ -132,9 +98,53 @@ function isWorldMonitorWebHost(hostname: string): boolean {
     || hostname.endsWith('.worldmonitor.app');
 }
 
+// Loopback page origins the API deliberately refuses in production. Keep in
+// step with the bare-localhost entries in api/_cors.js and server/cors.ts.
+const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+
+function isLoopbackHostname(hostname: string): boolean {
+  return LOOPBACK_HOSTNAMES.has(hostname);
+}
+
+function hostnameOf(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * A page on loopback may not send /api/ to a remote origin.
+ *
+ * `api/_cors.js` and `server/cors.ts` both drop bare localhost/127.0.0.1 from
+ * the allow-list in production, so every such call returns 403 and the whole
+ * dashboard renders unavailable. `VITE_WS_API_URL=https://api.worldmonitor.app`
+ * in a developer's .env.local used to do exactly that to `npm run dev`, where
+ * the Vite sebuf plugin serves those routes same-origin anyway.
+ *
+ * Deliberately narrow. The Tauri shell is exempt: its tauri:// and asset://
+ * origins are allow-listed by name and it has no same-origin API to fall back
+ * to. A loopback base stays honoured, so pointing dev at a local API on another
+ * port still works. Deployed and self-hosted pages are untouched — and the
+ * self-hosted image proxies /api/ server-side (docker/nginx.conf.template).
+ *
+ * The exemption tests `hasExplicitDesktopSignals()`, NOT `isDesktopRuntime()`:
+ * the latter counts a bare `https://localhost` origin as desktop, so a dev
+ * server running over HTTPS would inherit the exemption and keep 403ing —
+ * the exact failure this guard exists to stop.
+ */
+function suppressesRemoteBase(configuredBaseUrl: string): boolean {
+  if (typeof window === 'undefined') return false;
+  if (hasExplicitDesktopSignals()) return false;
+  if (!isLoopbackHostname(window.location?.hostname ?? '')) return false;
+  return !isLoopbackHostname(hostnameOf(configuredBaseUrl));
+}
+
 export function getConfiguredWebApiBaseUrl(): string {
   if (WS_API_URL) {
-    return normalizeBaseUrl(WS_API_URL);
+    const configured = normalizeBaseUrl(WS_API_URL);
+    return suppressesRemoteBase(configured) ? '' : configured;
   }
 
   if (typeof window === 'undefined') {
@@ -194,7 +204,7 @@ export function toApiUrl(path: string): string {
     return path;
   }
 
-  if (isDesktopRuntime()) {
+  if (routesApiViaDesktop()) {
     return toRuntimeUrl(path);
   }
 
@@ -275,13 +285,23 @@ export type {
 } from './smart-poll-loop';
 
 export async function waitForSidecarReady(timeoutMs = 3000): Promise<boolean> {
+  // Resolve the Tauri-confirmed port first. The main app window otherwise never
+  // calls resolveLocalApiPort, so getApiBaseUrl would fall back to the guessed
+  // default port and could report not-ready for a sidecar that is actually up
+  // on an EADDRINUSE-fallback port — a false alarm now that the caller acts on
+  // the result (#6779).
+  await resolveLocalApiPort();
   const baseUrl = getApiBaseUrl();
   if (!baseUrl) return false;
   const pollInterval = 200;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const res = await fetch(`${baseUrl}/api/service-status`, { method: 'GET' });
+      // Probe the sidecar's own dependency-free liveness endpoint, not the
+      // generic /api/service-status page — /api/sidecar-health is served only
+      // by the local Node sidecar, so a 200 confirms *this* process is up on
+      // the resolved port rather than something else answering on it (#6779).
+      const res = await fetch(`${baseUrl}/api/sidecar-health`, { method: 'GET' });
       if (res.ok) return true;
     } catch {
       // sidecar not ready yet
@@ -305,21 +325,23 @@ function isKeyFreeApiTarget(target: string): boolean {
 }
 
 async function fetchLocalWithStartupRetry(
-  nativeFetch: typeof window.fetch,
-  localUrl: string,
+  target: string,
+  input: RequestInfo | URL,
   init?: RequestInit,
 ): Promise<Response> {
   const maxAttempts = 4;
   let lastError: unknown = null;
+  const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      return await nativeFetch(localUrl, init);
+      const { proxyLocalApiRequest } = await import('@/services/tauri-bridge');
+      return await proxyLocalApiRequest(target, input, init);
     } catch (error) {
       lastError = error;
 
       // Preserve caller intent for aborted requests.
-      if (init?.signal?.aborted) {
+      if (signal?.aborted) {
         throw error;
       }
 
@@ -337,39 +359,20 @@ async function fetchLocalWithStartupRetry(
 }
 
 // ── Security threat model for the fetch patch ──────────────────────────
-// The LOCAL_API_TOKEN exists to prevent OTHER local processes from
-// accessing the sidecar on port 46123. The renderer IS the intended
-// client — injecting the token automatically is correct by design.
-//
-// If the renderer is compromised (XSS, supply chain), the attacker
-// already has access to strictly more powerful Tauri IPC commands
-// (get_all_secrets, set_secret, etc.) via window.__TAURI_INTERNALS__.
-// The fetch patch does not expand the attack surface beyond what IPC
-// already provides.
-//
-// Defense layers that protect the renderer trust boundary:
-//   1. CSP: script-src 'self' (no unsafe-inline/eval)
-//   2. IPC origin validation: sensitive commands gated to trusted windows
-//   3. Sidecar allowlists: env-update restricted to ALLOWED_ENV_KEYS
-//   4. DevTools disabled in production builds
-//
-// The token has a 5-minute TTL in the closure to limit exposure window
-// if IPC access is revoked mid-session.
-const TOKEN_TTL_MS = 5 * 60 * 1000;
+// The native process exclusively owns LOCAL_API_TOKEN. Renderer API calls are
+// proxied through a narrow native command that rejects sidecar configuration
+// routes, so a compromised page cannot read the token or mutate the secret
+// cache through the local HTTP control plane.
 
 export function installRuntimeFetchPatch(): void {
-  if (!isDesktopRuntime() || typeof window === 'undefined' || (window as unknown as Record<string, unknown>).__wmFetchPatched) {
+  if (!routesApiViaDesktop() || typeof window === 'undefined' || (window as unknown as Record<string, unknown>).__wmFetchPatched) {
     return;
   }
 
   const nativeFetch = window.fetch.bind(window);
-  let localApiToken: string | null = null;
-  let tokenFetchedAt = 0;
-  let authRetryCooldownUntil = 0; // suppress 401 retries after consecutive failures
-
-  window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+  const dispatch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const target = getApiTargetFromRequestInput(input);
-    const debug = localStorage.getItem('wm-debug-log') === '1';
+    const debug = safeStorageGet('wm-debug-log') === '1';
 
     if (!target?.startsWith('/api/')) {
       if (debug) {
@@ -379,30 +382,6 @@ export function installRuntimeFetchPatch(): void {
       return nativeFetch(input, init);
     }
 
-    // Resolve dynamic sidecar port on first API call
-    if (_resolvedPort === null) {
-      try { await resolveLocalApiPort(); } catch { /* use default */ }
-    }
-
-    const tokenExpired = localApiToken && (Date.now() - tokenFetchedAt > TOKEN_TTL_MS);
-    if (!localApiToken || tokenExpired) {
-      try {
-        const { tryInvokeTauri } = await import('@/services/tauri-bridge');
-        localApiToken = await tryInvokeTauri<string>('get_local_api_token');
-        tokenFetchedAt = Date.now();
-      } catch {
-        localApiToken = null;
-        tokenFetchedAt = 0;
-      }
-    }
-
-    const headers = new Headers(init?.headers);
-    if (localApiToken) {
-      headers.set('Authorization', `Bearer ${localApiToken}`);
-    }
-    const localInit = { ...init, headers };
-
-    const localUrl = `${getApiBaseUrl()}${target}`;
     if (debug) console.log(`[fetch] intercept → ${target}`);
     let allowCloudFallback = !isLocalOnlyApiTarget(target);
 
@@ -425,47 +404,13 @@ export function installRuntimeFetchPatch(): void {
       }
       const cloudUrl = `${getRemoteApiBaseUrl()}${target}`;
       if (debug) console.log(`[fetch] cloud fallback → ${cloudUrl}`);
-      const cloudHeaders = new Headers(init?.headers);
-      if (KEYED_CLOUD_API_PATTERN.test(target)) {
-        const { getRuntimeConfigSnapshot } = await import('@/services/runtime-config');
-        const wmKeyValue = getRuntimeConfigSnapshot().secrets['WORLDMONITOR_API_KEY']?.value;
-        if (wmKeyValue) {
-          cloudHeaders.set('X-WorldMonitor-Key', wmKeyValue);
-        }
-      }
-      return nativeFetch(cloudUrl, { ...init, headers: cloudHeaders });
+      return nativeFetch(cloudUrl, init);
     };
 
     try {
       const t0 = performance.now();
-      let response = await fetchLocalWithStartupRetry(nativeFetch, localUrl, localInit);
+      const response = await fetchLocalWithStartupRetry(target, input, init);
       if (debug) console.log(`[fetch] ${target} → ${response.status} (${Math.round(performance.now() - t0)}ms)`);
-
-      // Token may be stale after a sidecar restart — refresh and retry once.
-      // Skip retry if we recently failed (avoid doubling every request during auth outages).
-      if (response.status === 401 && localApiToken && Date.now() > authRetryCooldownUntil) {
-        if (debug) console.log(`[fetch] 401 from sidecar, refreshing token and retrying`);
-        try {
-          const { tryInvokeTauri } = await import('@/services/tauri-bridge');
-          localApiToken = await tryInvokeTauri<string>('get_local_api_token');
-          tokenFetchedAt = Date.now();
-        } catch {
-          localApiToken = null;
-          tokenFetchedAt = 0;
-        }
-        if (localApiToken) {
-          const retryHeaders = new Headers(init?.headers);
-          retryHeaders.set('Authorization', `Bearer ${localApiToken}`);
-          response = await fetchLocalWithStartupRetry(nativeFetch, localUrl, { ...init, headers: retryHeaders });
-          if (debug) console.log(`[fetch] retry ${target} → ${response.status}`);
-          if (response.status === 401) {
-            authRetryCooldownUntil = Date.now() + 60_000;
-            if (debug) console.log(`[fetch] auth retry failed, suppressing retries for 60s`);
-          } else {
-            authRetryCooldownUntil = 0;
-          }
-        }
-      }
 
       if (!response.ok) {
         if (!allowCloudFallback) {
@@ -484,6 +429,11 @@ export function installRuntimeFetchPatch(): void {
       return cloudFallback();
     }
   };
+  // Desktop reaches the same cloud gateway through the native proxy, so it sees
+  // the same retryable billing-verification 503. This patch and the web one are
+  // mutually exclusive (each returns early on the other's runtime), so wrapping
+  // both is what makes the contract honored everywhere rather than only on web.
+  window.fetch = withBillingVerificationRetry(dispatch);
 
   (window as unknown as Record<string, unknown>).__wmFetchPatched = true;
 }
@@ -495,14 +445,14 @@ const ALLOWED_REDIRECT_HOSTS = /^https:\/\/([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)*wor
 function isAllowedRedirectTarget(url: string): boolean {
   try {
     const parsed = new URL(url);
-    return ALLOWED_REDIRECT_HOSTS.test(parsed.origin) || parsed.hostname === 'localhost';
+    return ALLOWED_REDIRECT_HOSTS.test(parsed.origin) || isLoopbackHostname(parsed.hostname);
   } catch {
     return false;
   }
 }
 
 export function installWebApiRedirect(): void {
-  if (isDesktopRuntime() || typeof window === 'undefined') return;
+  if (routesApiViaDesktop() || typeof window === 'undefined') return;
   if ((window as unknown as Record<string, unknown>).__wmWebRedirectPatched) return;
 
   const apiBase = getConfiguredWebApiBaseUrl();
@@ -582,19 +532,28 @@ export function installWebApiRedirect(): void {
       }
     };
 
-    window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const dispatch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       if (typeof input === 'string') {
         if (shouldRedirectPath(input)) {
           // Relative /api/... path — redirect to API base and inject auth.
           const enriched = await enrichInitForPremium(input, init);
           return fetchWithRedirectFallback(`${API_BASE}${input}`, input, enriched ? withCredentials(enriched) : withCredentials(init));
         }
-        // Absolute URL already targeting the API base (generated clients call fetch
-        // with full URLs like https://api.worldmonitor.app/api/...) — just inject auth.
+        // Generated clients construct an absolute API-base URL, so they cannot
+        // rely on the relative-path branch above for origin recovery. Keep the
+        // same fallback here: browser extensions and network policy can block
+        // api.worldmonitor.app while the page's own /api/ route remains usable.
+        // Only idempotent methods may retry automatically: replaying a mutation
+        // whose response was lost could enqueue or apply it twice server-side.
         if (input.startsWith(`${API_BASE}/api/`)) {
           const pathAndSearch = input.slice(API_BASE.length);
+          const method = (init?.method ?? 'GET').toUpperCase();
           const enriched = await enrichInitForPremium(pathAndSearch, init);
-          return nativeFetch(input, enriched ? withCredentials(enriched) : withCredentials(init));
+          const initWithCredentials = enriched ? withCredentials(enriched) : withCredentials(init);
+          if (method === 'GET' || method === 'HEAD') {
+            return fetchWithRedirectFallback(input, pathAndSearch, initWithCredentials);
+          }
+          return nativeFetch(input, initWithCredentials);
         }
       }
       if (input instanceof URL) {
@@ -628,9 +587,10 @@ export function installWebApiRedirect(): void {
       }
       return nativeFetch(input, init);
     };
+    window.fetch = withBillingVerificationRetry(dispatch);
   } else {
     // No API base redirect — only inject auth headers for premium paths.
-    window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const dispatch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       if (typeof input === 'string') {
         if (shouldRedirectPath(input)) {
           const enriched = await enrichInitForPremium(input, init);
@@ -661,6 +621,7 @@ export function installWebApiRedirect(): void {
       }
       return nativeFetch(input, init);
     };
+    window.fetch = withBillingVerificationRetry(dispatch);
   }
 
   (window as unknown as Record<string, unknown>).__wmWebRedirectPatched = true;

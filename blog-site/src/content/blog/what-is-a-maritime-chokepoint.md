@@ -1,11 +1,12 @@
 ---
 title: "What Is a Maritime Chokepoint?"
-description: "A plain-English explainer for maritime chokepoints, how WorldMonitor tracks 13 waterways, why only seven publish live flow estimates today, and how to read status scores."
+description: "Learn what maritime chokepoints are, how WorldMonitor tracks its waterway registry, and how to interpret live flow estimates, disruptions, and status scores."
 metaTitle: "What Is a Maritime Chokepoint? | WorldMonitor"
 keywords: "maritime chokepoint, shipping chokepoint, Strait of Hormuz, Suez Canal, supply chain risk, chokepoint monitoring"
 audience: "Logistics teams, maritime analysts, commodity traders, students, geopolitical risk readers"
-heroImage: "/blog/og/what-is-a-maritime-chokepoint.png"
+heroImage: "/blog/images/blog/what-is-a-maritime-chokepoint.jpg"
 pubDate: "2026-06-13"
+modifiedDate: "2026-09-10"
 ---
 
 A maritime chokepoint is a narrow passage where a large share of global trade, energy, food, or military movement must pass through a small physical space.
@@ -34,25 +35,25 @@ Chokepoints matter for five reasons:
 
 A chokepoint does not need to close completely to matter. A credible threat, navigation warning, or traffic anomaly can be enough to change routing and pricing.
 
-## The 13 monitored waterways
+## The monitored-waterway registry
 
-WorldMonitor's canonical chokepoint registry currently monitors 13 waterways:
+WorldMonitor's canonical chokepoint registry includes:
 
 | Canonical id | Public name |
 |---|---|
-| `hormuz_strait` | Strait of Hormuz |
-| `malacca_strait` | Strait of Malacca |
-| `suez` | Suez Canal / SUMED |
-| `bab_el_mandeb` | Bab el-Mandeb |
-| `panama` | Panama Canal |
-| `taiwan_strait` | Taiwan Strait |
-| `cape_of_good_hope` | Cape of Good Hope |
-| `gibraltar` | Strait of Gibraltar |
-| `bosphorus` | Bosporus Strait |
-| `korea_strait` | Korea Strait |
-| `dover_strait` | Dover Strait |
-| `kerch_strait` | Kerch Strait |
-| `lombok_strait` | Lombok Strait |
+| `hormuz_strait` | [Strait of Hormuz](https://www.worldmonitor.app/chokepoints/strait-of-hormuz/) |
+| `malacca_strait` | [Strait of Malacca](https://www.worldmonitor.app/chokepoints/strait-of-malacca/) |
+| `suez` | [Suez Canal / SUMED](https://www.worldmonitor.app/chokepoints/suez-canal/) |
+| `bab_el_mandeb` | [Bab el-Mandeb](https://www.worldmonitor.app/chokepoints/bab-el-mandeb/) |
+| `panama` | [Panama Canal](https://www.worldmonitor.app/chokepoints/panama-canal/) |
+| `taiwan_strait` | [Taiwan Strait](https://www.worldmonitor.app/chokepoints/taiwan-strait/) |
+| `cape_of_good_hope` | [Cape of Good Hope](https://www.worldmonitor.app/chokepoints/cape-of-good-hope/) |
+| `gibraltar` | [Strait of Gibraltar](https://www.worldmonitor.app/chokepoints/strait-of-gibraltar/) |
+| `bosphorus` | [Bosporus Strait](https://www.worldmonitor.app/chokepoints/bosporus-strait/) |
+| `korea_strait` | [Korea Strait](https://www.worldmonitor.app/chokepoints/korea-strait/) |
+| `dover_strait` | [Dover Strait](https://www.worldmonitor.app/chokepoints/dover-strait/) |
+| `kerch_strait` | [Kerch Strait](https://www.worldmonitor.app/chokepoints/kerch-strait/) |
+| `lombok_strait` | [Lombok Strait](https://www.worldmonitor.app/chokepoints/lombok-strait/) |
 
 All 13 can receive status, threat classification, warning context, AIS-disruption matching, disruption score, and war-risk tier.
 
@@ -67,9 +68,11 @@ The public status badge is a traffic-light score: green, yellow, or red. It is n
 The disruption score combines:
 
 - a baseline geopolitical threat weight
-- active navigational warnings
-- AIS disruption severity
-- a transit anomaly bonus when traffic drops sharply under high-threat conditions
+- active NGA navigational warnings
+- AIS congestion severity
+- a transit anomaly bonus when PortWatch daily transits drop sharply under high-threat conditions
+
+Nothing else moves the number. AIS event counts, relay transit counts, and PortWatch week-over-week movement are published as context rather than score inputs. PortWatch supplies both: the anomaly bonus compares its daily transit history, seven days against the prior thirty, while the week-over-week figure on the page is presentation only.
 
 The score is capped at 100. Green is below 20, yellow is 20 to 49, and red is 50 or higher.
 
@@ -102,13 +105,15 @@ WorldMonitor's chokepoint status combines Redis-backed transit summaries, flow e
 
 The model has known limits. AIS coverage can degrade near conflict zones or regions with jamming. Only the seven energy-baseline waterways have live oil/gas flow estimates today. Baseline values are used to convert observed ratios into flow estimates; they are not a promise that live observations perfectly capture every vessel.
 
+For independently published baselines and current definitions, see the U.S. Energy Information Administration's [World Oil Transit Chokepoints analysis](https://www.eia.gov/international/content/analysis/special_topics/World_Oil_Transit_Chokepoints/).
+
 ## Frequently Asked Questions
 
 **Is a red chokepoint always closed?**
 
 No. Red means the combined disruption score is high. It can reflect military threat, active warnings, AIS disruption, anomaly signals, or several of those at once.
 
-**Why do only seven waterways have live flow estimates?**
+**Why do only some waterways have live flow estimates?**
 
 Because those seven have EIA baseline IDs in the current energy-flow seeder. The other canonical waterways can still have status and risk context without publishing an oil/gas flow estimate.
 

@@ -25,6 +25,7 @@ export function parseArgs(argv = []) {
     envSource: process.env.WM_ENV_SOURCE || '',
     forceInstall: false,
     help: false,
+    hooksOnly: false,
     ignoreScripts: false,
     rootDir: process.cwd(),
     skipEnv: false,
@@ -52,6 +53,8 @@ export function parseArgs(argv = []) {
       options.skipInstall = true;
     } else if (arg === '--force-install') {
       options.forceInstall = true;
+    } else if (arg === '--hooks-only') {
+      options.hooksOnly = true;
     } else if (arg === '--ignore-scripts') {
       options.ignoreScripts = true;
     } else if (arg === '--env-source') {
@@ -85,8 +88,9 @@ Options:
                       from git's common .git directory.
   --cache <dir>       npm cache directory. Default: ${DEFAULT_NPM_CACHE}
   --skip-env          Do not create env symlinks.
-  --skip-install      Do not run npm ci when node_modules is missing.
+  --skip-install      Do not run npm ci, even when installation is not verified.
   --force-install     Run npm ci even when node_modules already exists.
+  --hooks-only        Normalize core.hooksPath, then exit without other bootstrap work.
   --ignore-scripts    Pass --ignore-scripts to npm ci for docs/test-only work.
   --dry-run           Print what would happen without changing files.
   -h, --help          Show this help text.`);
@@ -202,7 +206,19 @@ export function shouldInstallDependencies({
   forceInstall = false,
   rootDir = process.cwd(),
 } = {}) {
-  return forceInstall || !existsSync(resolve(rootDir, 'node_modules'));
+  return forceInstall || !existsSync(resolve(rootDir, 'node_modules/.package-lock.json'));
+}
+
+export function assertNodeModulesNotSymlink(rootDir = process.cwd(), label = 'node_modules') {
+  const target = resolve(rootDir, 'node_modules');
+  try {
+    if (lstatSync(target).isSymbolicLink()) {
+      throw new Error(`${label} is a symlink; copy, hardlink, or npm ci — never symlink`);
+    }
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
 }
 
 export function installDependencies({
@@ -212,7 +228,11 @@ export function installDependencies({
   log = console.log,
   rootDir = process.cwd(),
 } = {}) {
-  const args = ['ci', '--cache', cacheDir];
+  assertNodeModulesNotSymlink(
+    rootDir,
+    basename(rootDir) === 'pro-test' ? 'pro-test/node_modules' : 'node_modules',
+  );
+  const args = ['ci', '--cache', cacheDir, '--prefer-offline'];
   if (ignoreScripts) args.push('--ignore-scripts');
 
   if (dryRun) {
@@ -225,10 +245,7 @@ export function installDependencies({
 
   const result = spawnSync('npm', args, {
     cwd: rootDir,
-    env: {
-      ...process.env,
-      npm_config_cache: cacheDir,
-    },
+    env: createInstallEnvironment(process.env, cacheDir),
     stdio: 'inherit',
   });
 
@@ -239,14 +256,217 @@ export function installDependencies({
   return result;
 }
 
+/**
+ * Builds the child npm environment without the parent's project-scoped script policy.
+ *
+ * @param {NodeJS.ProcessEnv} environment Parent process environment.
+ * @param {string} cacheDir Shared npm cache directory.
+ * @returns {NodeJS.ProcessEnv} Environment for a project-scoped child npm install.
+ */
+export function createInstallEnvironment(environment, cacheDir) {
+  return {
+    ...Object.fromEntries(
+      Object.entries(environment).filter(([key]) => key !== 'npm_config_allow_scripts'),
+    ),
+    npm_config_cache: cacheDir,
+  };
+}
+
+// Relative, so git resolves it against whichever worktree the hook runs from.
+const RELATIVE_HOOKS_PATH = '.husky';
+
+// A stale absolute core.hooksPath makes every push from this worktree run
+// ANOTHER checkout's (possibly ancient) pre-push hook — the 2026-07-24
+// "pushes take minutes and time out" incident: the main checkout was parked
+// 800+ commits behind and its unconditional pre-#4800 gate ran on every
+// worktree push. Worktree-creation tooling copies the shared value into
+// .git/worktrees/<name>/config.worktree at creation time, so a one-time
+// absolute value keeps resurfacing in new worktrees.
+//
+// Policy (#5810): repair, do not merely report. Warning was tried and the
+// value came back three times — a log line at worktree-creation time is not a
+// gate, and the hook's own self-identity tripwire cannot help here because a
+// hook copy stale enough to be the problem predates the tripwire. Both layers
+// are therefore healed: a per-worktree override pointing outside this worktree
+// is unset, and an absolute SHARED value is rewritten to the relative form.
+// The two carve-outs keep the repair from clobbering a deliberate setup: a
+// hooks dir that is not a `.husky` (so, not this repo's shape) is left alone,
+// as is any value when WM_ALLOW_FOREIGN_HOOKS is set — the same escape hatch
+// .husky/pre-push honours.
+export function decideHooksPathAction({
+  allowForeignHooks = false,
+  hooksPathValue,
+  hooksPathOwnedByRepository = false,
+  originFile,
+  rootDir,
+}) {
+  if (!hooksPathValue) return { action: 'none', reason: 'core.hooksPath not set' };
+  if (!hooksPathValue.startsWith('/')) {
+    return { action: 'none', reason: `relative hooksPath (${hooksPathValue}) resolves per-worktree` };
+  }
+
+  // A worktree-local override only governs this worktree, so pointing at this
+  // worktree's own hooks is harmless. The same value in the SHARED config
+  // welds every OTHER worktree to this checkout's hook file, which is the bug.
+  if (originFile.includes('/config.worktree')) {
+    if (hooksPathValue === resolve(rootDir, RELATIVE_HOOKS_PATH)) {
+      return { action: 'none', reason: 'absolute hooksPath already points into this worktree' };
+    }
+    return {
+      action: 'unset-worktree',
+      reason: `per-worktree override points outside this worktree (${hooksPathValue})`,
+    };
+  }
+
+  if (basename(hooksPathValue) !== RELATIVE_HOOKS_PATH) {
+    return {
+      action: 'warn-shared',
+      reason: `shared config points at a non-husky hooks dir (${hooksPathValue}); leaving it alone`,
+    };
+  }
+  if (allowForeignHooks) {
+    return {
+      action: 'warn-shared',
+      reason: `shared config sets absolute hooksPath (${hooksPathValue}); WM_ALLOW_FOREIGN_HOOKS is set, leaving it alone`,
+    };
+  }
+  if (!hooksPathOwnedByRepository) {
+    return {
+      action: 'warn-shared',
+      reason: `shared config points at an unverified .husky dir (${hooksPathValue}); leaving it alone`,
+    };
+  }
+  return {
+    action: 'repair-shared',
+    reason: `shared config pins every worktree's hooks to one checkout (${hooksPathValue})`,
+  };
+}
+
+function probeHooksPath(rootDir, runGit) {
+  const probe = runGit(
+    'git',
+    ['config', '--show-origin', '--get', 'core.hooksPath'],
+    { cwd: rootDir, encoding: 'utf8' },
+  );
+  // Exit 1 = unset; other failures (not a repo, no git) are not bootstrap's problem.
+  if (probe.status !== 0) return null;
+
+  const [origin = '', ...valueParts] = probe.stdout.trim().split('\t');
+  return {
+    hooksPathValue: valueParts.join('\t'),
+    originFile: origin.replace(/^file:/, ''),
+  };
+}
+
+function getGitCommonDir(rootDir, runGit) {
+  const result = runGit(
+    'git',
+    ['rev-parse', '--path-format=absolute', '--git-common-dir'],
+    { cwd: rootDir, encoding: 'utf8' },
+  );
+  return result.status === 0 ? resolve(result.stdout.trim()) : null;
+}
+
+function hooksPathBelongsToRepository({ hooksPathValue, rootDir, runGit }) {
+  const currentCommonDir = getGitCommonDir(rootDir, runGit);
+  const hooksCheckoutCommonDir = getGitCommonDir(dirname(hooksPathValue), runGit);
+  return currentCommonDir !== null && currentCommonDir === hooksCheckoutCommonDir;
+}
+
+export function normalizeWorktreeHooksPath({
+  allowForeignHooks = Boolean(process.env.WM_ALLOW_FOREIGN_HOOKS),
+  dryRun = false,
+  log = console.log,
+  rootDir = process.cwd(),
+  runGit = spawnSync,
+} = {}) {
+  const decisions = [];
+
+  // Two passes, because `--show-origin` reports only the winning layer: a
+  // per-worktree override hides whatever the shared config says, so unsetting
+  // it can expose a second, broken value underneath. Fixing one layer and
+  // calling it done is exactly how the 2026-07-24 incident survived its first
+  // fix.
+  for (let pass = 0; pass < 2; pass += 1) {
+    const probed = probeHooksPath(rootDir, runGit);
+    if (!probed) {
+      decisions.push({ action: 'none', reason: 'core.hooksPath not set' });
+      break;
+    }
+
+    const decision = decideHooksPathAction({
+      allowForeignHooks,
+      hooksPathOwnedByRepository:
+        probed.hooksPathValue.startsWith('/')
+        && hooksPathBelongsToRepository({
+          hooksPathValue: probed.hooksPathValue,
+          rootDir,
+          runGit,
+        }),
+      rootDir,
+      ...probed,
+    });
+    decisions.push(decision);
+
+    if (decision.action === 'unset-worktree') {
+      log(`[worktree] removing stale hooksPath override: ${decision.reason}`);
+      if (dryRun) {
+        log('[worktree]   the shared value it masks cannot be read until the override is gone');
+        break;
+      }
+      const unset = runGit('git', ['config', '--worktree', '--unset', 'core.hooksPath'], {
+        cwd: rootDir,
+        stdio: 'inherit',
+      });
+      if (unset.status !== 0) {
+        throw new Error(
+          'failed to remove stale worktree hooksPath override; '
+          + 'run: git config --worktree --unset core.hooksPath',
+        );
+      }
+      continue;
+    }
+
+    if (decision.action === 'repair-shared') {
+      log(`[worktree] repairing shared hooksPath: ${decision.reason}`);
+      log(`[worktree]   setting core.hooksPath=${RELATIVE_HOOKS_PATH} so each worktree runs its own hook`);
+      if (!dryRun) {
+        const repair = runGit('git', ['config', 'core.hooksPath', RELATIVE_HOOKS_PATH], {
+          cwd: rootDir,
+          stdio: 'inherit',
+        });
+        if (repair.status !== 0) {
+          throw new Error(
+            'failed to repair shared hooksPath; run: git config core.hooksPath .husky',
+          );
+        }
+      }
+    } else if (decision.action === 'warn-shared') {
+      log(`[worktree] WARNING: ${decision.reason}`);
+      log('[worktree]   pushes here run that hooks dir, not this worktree\'s .husky/pre-push.');
+      log('[worktree]   To switch to per-worktree hooks: git config core.hooksPath .husky');
+    }
+    break;
+  }
+
+  // The top-level action is the FINAL state; `decisions` is the audit trail,
+  // which is the only place a two-layer repair is visible.
+  const last = decisions[decisions.length - 1];
+  return { ...last, decisions };
+}
+
 export function bootstrapWorktree(options = {}) {
   const rootDir = resolve(options.rootDir || process.cwd());
   const log = options.log || console.log;
+
+  assertProjectRoot(rootDir);
+
+  normalizeWorktreeHooksPath({ dryRun: options.dryRun, log, rootDir });
+  if (options.hooksOnly) return;
+
   const envSource = options.envSource
     ? resolve(options.envSource)
     : inferEnvSource(rootDir);
-
-  assertProjectRoot(rootDir);
 
   if (!options.skipEnv) {
     linkEnvFiles({
@@ -260,16 +480,27 @@ export function bootstrapWorktree(options = {}) {
   assertNoForbiddenEnvDumps(rootDir);
 
   if (!options.skipInstall) {
+    const installOpts = {
+      cacheDir: options.cacheDir || DEFAULT_NPM_CACHE,
+      dryRun: options.dryRun,
+      ignoreScripts: options.ignoreScripts,
+      log,
+    };
     if (shouldInstallDependencies({ forceInstall: options.forceInstall, rootDir })) {
-      installDependencies({
-        cacheDir: options.cacheDir || DEFAULT_NPM_CACHE,
-        dryRun: options.dryRun,
-        ignoreScripts: options.ignoreScripts,
-        log,
-        rootDir,
-      });
+      installDependencies({ ...installOpts, rootDir });
     } else {
-      log('[worktree] node_modules present; skipping npm ci');
+      assertNodeModulesNotSymlink(rootDir, 'node_modules');
+      log('[worktree] verified npm install present; skipping npm ci');
+    }
+
+    const proTestRoot = resolve(rootDir, 'pro-test');
+    if (existsSync(resolve(proTestRoot, 'package.json'))) {
+      if (shouldInstallDependencies({ forceInstall: options.forceInstall, rootDir: proTestRoot })) {
+        installDependencies({ ...installOpts, rootDir: proTestRoot });
+      } else {
+        assertNodeModulesNotSymlink(proTestRoot, 'pro-test/node_modules');
+        log('[worktree] verified pro-test npm install present; skipping npm ci');
+      }
     }
   }
 

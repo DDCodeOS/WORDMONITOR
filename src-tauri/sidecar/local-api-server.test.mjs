@@ -1,14 +1,124 @@
 import { strict as assert } from 'node:assert';
+import { readFileSync } from 'node:fs';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import http, { createServer, request as httpRequest } from 'node:http';
 import https from 'node:https';
 import { createHmac } from 'node:crypto';
+import dns from 'node:dns/promises';
 import { EventEmitter } from 'node:events';
+import net from 'node:net';
 import { brotliDecompressSync, gunzipSync } from 'node:zlib';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import test from 'node:test';
-import { createLocalApiServer } from './local-api-server.mjs';
+import { runInNewContext } from 'node:vm';
+import { createLocalApiServer, __testing__ } from './local-api-server.mjs';
+
+test('bundles the shared LLM health provider registry with the sidecar (#7126)', () => {
+  const config = JSON.parse(readFileSync(new URL('../tauri.conf.json', import.meta.url), 'utf8'));
+  const dockerfile = readFileSync(new URL('../../Dockerfile', import.meta.url), 'utf8');
+  assert.ok(config.bundle.resources.includes('../shared/llm-health-providers.js'));
+  assert.match(
+    dockerfile,
+    /COPY --from=builder \/app\/shared\/llm-health-providers\.js \.\/shared\/llm-health-providers\.js/,
+  );
+  assert.match(dockerfile, /^ENV LOCAL_API_RESOURCE_DIR=\/app$/m);
+});
+
+test('keeps seed-owned WSB snapshots cloud-preferred', () => {
+  assert.equal(__testing__.isCloudPreferred('/api/intelligence/v1/list-wsb-tickers'), true);
+});
+
+test('keeps seed-owned defense snapshots cloud-preferred regardless of relay configuration', () => {
+  assert.equal(__testing__.isCloudPreferred('/api/bootstrap'), true);
+  assert.equal(__testing__.isCloudPreferred('/api/military/v1/get-defense-industrial-base'), true);
+  assert.equal(__testing__.isCloudPreferred('/api/scorecard/v1/get-five-factor-scorecard'), true);
+  assert.equal(__testing__.isCloudPreferred('/api/scorecard/v1/get-bloc-scorecard'), true);
+  assert.equal(__testing__.isCloudPreferred('/api/scorecard/v1/list-five-factor-scorecards'), true);
+});
+
+test('keeps seed-owned commodity vulnerability snapshots cloud-preferred', async () => {
+  const endpoints = [
+    '/api/supply-chain/v1/get-country-vulnerabilities',
+    '/api/supply-chain/v1/get-chokepoint-dependencies',
+    '/api/supply-chain/v1/list-vulnerability-rankings',
+  ];
+  for (const endpoint of endpoints) {
+    assert.equal(__testing__.isCloudPreferred(endpoint), true);
+  }
+
+  const remote = await setupRemoteServer();
+  const unavailableHandler = `
+    export default async function handler() {
+      return new Response(JSON.stringify({ source: 'local-empty', upstreamUnavailable: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      });
+    }
+  `;
+  const localApi = await setupApiDir(Object.fromEntries(
+    endpoints.map((endpoint) => [`${endpoint.slice('/api/'.length)}.js`, unavailableHandler]),
+  ));
+  const app = await createLocalApiServer({
+    port: 0,
+    apiDir: localApi.apiDir,
+    remoteBase: remote.remoteBase,
+    cloudFallback: 'true',
+    allowPrivateRemoteBase: true,
+    logger: { log() { }, warn() { }, error() { } },
+  });
+  const { port } = await app.start();
+
+  try {
+    for (const endpoint of endpoints) {
+      const response = await authFetch(`http://127.0.0.1:${port}${endpoint}`);
+      assert.equal(response.status, 200);
+      const body = await response.json();
+      assert.equal(body.source, 'remote');
+    }
+    assert.deepEqual(remote.hits, endpoints);
+  } finally {
+    await app.close();
+    await localApi.cleanup();
+    await remote.close();
+  }
+});
+
+test('routes seed-only displacement requests to cloud before a local empty 200', async () => {
+  const endpoint = '/api/displacement/v1/get-displacement-summary';
+  const seeded = { summary: { year: 2025, countries: [{ code: 'SYR' }], topFlows: [] }, fetchedAt: 123456, dataAvailable: true };
+  const hits = [];
+  const remote = createServer((req, res) => {
+    hits.push(req.url);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(seeded));
+  });
+  const remotePort = await listen(remote);
+  const localApi = await setupApiDir({
+    'displacement/v1/get-displacement-summary.js': `export default async function handler() {
+      return Response.json({ dataAvailable: false, fetchedAt: 0 });
+    }`,
+  });
+  const app = await createLocalApiServer({
+    port: 0, apiDir: localApi.apiDir,
+    remoteBase: `http://127.0.0.1:${remotePort}`, cloudFallback: 'true', allowPrivateRemoteBase: true,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const { port } = await app.start();
+  try {
+    const query = '?year=0&flow_limit=50';
+    const response = await authFetch(`http://127.0.0.1:${port}${endpoint}${query}`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), seeded);
+    assert.deepEqual(hits, [`${endpoint}${query}`]);
+    assert.equal(__testing__.isCloudPreferred(endpoint), true);
+  } finally {
+    await app.close();
+    await localApi.cleanup();
+    await new Promise((resolve, reject) => remote.close(error => error ? reject(error) : resolve()));
+  }
+});
 
 // The sidecar default-denies when LOCAL_API_TOKEN is unset (security fix:
 // previously "unset" meant "auth disabled", which made any standalone run
@@ -47,6 +157,94 @@ async function listen(server, host = '127.0.0.1', port = 0) {
   }
   return address.port;
 }
+
+function executeYoutubeEmbedHtml(html) {
+  const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
+  assert.ok(script, 'youtube embed response must contain an executable script');
+  const posted = [];
+  const appendedScripts = [];
+  let playerEvents = null;
+  const parent = {};
+  Object.defineProperty(parent, 'postMessage', {
+    configurable: false,
+    get: () => (message, targetOrigin) => posted.push({ message, targetOrigin }),
+    set: () => {
+      throw new Error('child attempted to replace parent.postMessage');
+    },
+  });
+  const sandbox = {
+    console: { log() {}, warn() {}, error() {} },
+    window: { parent, addEventListener() {} },
+    document: {
+      createElement: () => ({}),
+      head: { appendChild: (node) => appendedScripts.push(node) },
+      getElementById: () => ({ classList: { add() {}, remove() {} } }),
+    },
+    MutationObserver: class {
+      observe() {}
+      disconnect() {}
+    },
+    setTimeout: () => 0,
+    clearTimeout() {},
+    setInterval: () => 0,
+    clearInterval() {},
+    YT: {
+      Player: class {
+        constructor(_elementId, options) {
+          playerEvents = options.events;
+        }
+
+        mute() {}
+        playVideo() {}
+        isMuted() { return true; }
+        getVolume() { return 0; }
+      },
+    },
+  };
+
+  runInNewContext(script, sandbox);
+  assert.equal(typeof sandbox.onYouTubeIframeAPIReady, 'function');
+  sandbox.onYouTubeIframeAPIReady();
+  playerEvents.onReady();
+  return { posted, appendedScripts };
+}
+
+test('youtube embed bridge accepts exact Tauri origin and no-ops rejected parents', async () => {
+  const localApi = await setupApiDir({});
+  const app = await createLocalApiServer({
+    port: 0,
+    apiDir: localApi.apiDir,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const { port } = await app.start();
+
+  try {
+    const allowedResponse = await fetch(
+      `http://127.0.0.1:${port}/api/youtube-embed?videoId=e34xb-Fbl0U&parentOrigin=${encodeURIComponent('https://tauri.localhost')}`,
+    );
+    assert.equal(allowedResponse.status, 200);
+    const allowed = executeYoutubeEmbedHtml(await allowedResponse.text());
+    assert.equal(allowed.appendedScripts.length, 1, 'the YouTube API must still initialize');
+    assert.ok(
+      allowed.posted.some(({ message, targetOrigin }) => message?.type === 'yt-ready' && targetOrigin === 'https://tauri.localhost'),
+      'supported Tauri parent must receive yt-ready at its exact origin',
+    );
+
+    for (const parentOrigin of ['', 'https://evil.example']) {
+      const query = parentOrigin ? `&parentOrigin=${encodeURIComponent(parentOrigin)}` : '';
+      const response = await fetch(
+        `http://127.0.0.1:${port}/api/youtube-embed?videoId=e34xb-Fbl0U${query}`,
+      );
+      assert.equal(response.status, 200);
+      const rejected = executeYoutubeEmbedHtml(await response.text());
+      assert.equal(rejected.appendedScripts.length, 1, 'rejected parents must not abort player setup');
+      assert.deepEqual(rejected.posted, [], 'rejected parents must receive no bridge messages');
+    }
+  } finally {
+    await app.close();
+    await localApi.cleanup();
+  }
+});
 
 async function postJsonViaHttp(url, payload, headers = {}) {
   const target = new URL(url);
@@ -135,10 +333,12 @@ function mockHttpsRequestOnce({ statusCode, headers, body }) {
 async function setupRemoteServer() {
   const hits = [];
   const origins = [];
+  const headers = [];
   const server = createServer((req, res) => {
     const url = new URL(req.url || '/', 'http://127.0.0.1');
     hits.push(url.pathname);
     origins.push(req.headers.origin || null);
+    headers.push(req.headers);
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
       source: 'remote',
@@ -151,6 +351,7 @@ async function setupRemoteServer() {
   return {
     hits,
     origins,
+    headers,
     remoteBase: `http://127.0.0.1:${port}`,
     async close() {
       await new Promise((resolve, reject) => {
@@ -531,7 +732,206 @@ test('replaces browser origin with localhost origin for local handlers', async (
   }
 });
 
-test('preserves Request body when handler uses fetch(Request)', async () => {
+test('injects the desktop product key into the product-only OpenSky local handler', async () => {
+  const originalProductKey = process.env.WORLDMONITOR_API_KEY;
+  process.env.WORLDMONITOR_API_KEY = 'desktop-product-key';
+  const remote = await setupRemoteServer();
+  const localApi = await setupApiDir({
+    'opensky.js': `
+      export default async function handler(req) {
+        return new Response(JSON.stringify({
+          origin: req.headers.get('origin'),
+          productKey: req.headers.get('x-worldmonitor-key'),
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+    `,
+  });
+
+  const app = await createLocalApiServer({
+    port: 0,
+    apiDir: localApi.apiDir,
+    remoteBase: remote.remoteBase,
+    logger: { log() { }, warn() { }, error() { } },
+  });
+  const { port } = await app.start();
+
+  try {
+    const response = await authFetch(`http://127.0.0.1:${port}/api/opensky`, {
+      headers: {
+        Origin: 'https://tauri.localhost',
+        'X-WorldMonitor-Key': 'renderer-supplied-key',
+      },
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      origin: `http://127.0.0.1:${port}`,
+      productKey: 'desktop-product-key',
+    });
+    assert.equal(remote.hits.length, 0);
+  } finally {
+    await app.close();
+    await localApi.cleanup();
+    await remote.close();
+    if (originalProductKey === undefined) delete process.env.WORLDMONITOR_API_KEY;
+    else process.env.WORLDMONITOR_API_KEY = originalProductKey;
+  }
+});
+
+test('preserves caller Authorization while hiding the sidecar transport token', async () => {
+  const localApi = await setupApiDir({
+    'header-check.js': `
+      export default async function handler(req) {
+        return new Response(JSON.stringify({
+          authorization: req.headers.get('authorization'),
+          transportToken: req.headers.get('x-worldmonitor-local-token'),
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+    `,
+  });
+
+  const app = await createLocalApiServer({
+    port: 0,
+    apiDir: localApi.apiDir,
+    logger: { log() { }, warn() { }, error() { } },
+  });
+  const { port } = await app.start();
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/api/header-check`, {
+      headers: {
+        Authorization: 'Bearer caller-oauth-token',
+        'X-WorldMonitor-Local-Token': TEST_LOCAL_API_TOKEN,
+      },
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      authorization: 'Bearer caller-oauth-token',
+      transportToken: null,
+    });
+  } finally {
+    await app.close();
+    await localApi.cleanup();
+  }
+});
+
+for (const registrationStatus of ['registered', 'already_registered']) {
+  test(`uses the authenticated Convex bridge for self-hosted register-interest (${registrationStatus})`, async () => {
+    const originalConvex = process.env.CONVEX_URL;
+    const originalSite = process.env.CONVEX_SITE_URL;
+    const originalSecret = process.env.CONVEX_SERVER_SHARED_SECRET;
+    const originalFetch = globalThis.fetch;
+    process.env.CONVEX_URL = 'https://self-hosted.convex.cloud';
+    process.env.CONVEX_SITE_URL = 'http://self-hosted.convex.site';
+    process.env.CONVEX_SERVER_SHARED_SECRET = 'convex-test-secret';
+
+    let captured;
+    globalThis.fetch = async (url, init) => {
+      captured = { url, init };
+      return new Response(JSON.stringify({
+        status: registrationStatus,
+        position: 7,
+        emailSuppressed: true,
+        referralCode: 'secret-referral-code',
+        referralCount: 9,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
+
+    const localApi = await setupApiDir({});
+    const app = await createLocalApiServer({
+      port: 0,
+      apiDir: localApi.apiDir,
+      remoteBase: 'https://worldmonitor.app',
+      logger: { log() { }, warn() { }, error() { } },
+    });
+    const { port } = await app.start();
+
+    try {
+      const response = await postJsonViaHttp(`http://127.0.0.1:${port}/api/register-interest`, {
+        email: 'self-hosted@example.com',
+        source: 'desktop-settings',
+        appVersion: '2.8.0',
+        referredBy: 'REF123',
+      });
+      assert.equal(response.status, 200);
+      assert.deepEqual(response.json, {
+        status: 'registered',
+        referralCode: '',
+        referralCount: 0,
+        position: 0,
+        emailSuppressed: false,
+      });
+      assert.equal(captured.url, 'http://self-hosted.convex.site/api/internal-register-interest');
+      assert.equal(captured.init.headers['x-convex-shared-secret'], 'convex-test-secret');
+      assert.equal(captured.init.headers['User-Agent'], 'worldmonitor-sidecar/1.0');
+      assert.deepEqual(JSON.parse(captured.init.body), {
+        email: 'self-hosted@example.com',
+        source: 'desktop-settings',
+        appVersion: '2.8.0',
+        referredBy: 'REF123',
+      });
+    } finally {
+      await app.close();
+      await localApi.cleanup();
+      globalThis.fetch = originalFetch;
+      if (originalConvex === undefined) delete process.env.CONVEX_URL;
+      else process.env.CONVEX_URL = originalConvex;
+      if (originalSite === undefined) delete process.env.CONVEX_SITE_URL;
+      else process.env.CONVEX_SITE_URL = originalSite;
+      if (originalSecret === undefined) delete process.env.CONVEX_SERVER_SHARED_SECRET;
+      else process.env.CONVEX_SERVER_SHARED_SECRET = originalSecret;
+    }
+  });
+}
+
+test('does not forward the sidecar transport token through Docker cloud proxy routes', async () => {
+  const originalConvex = process.env.CONVEX_URL;
+  delete process.env.CONVEX_URL;
+
+  const remote = await setupRemoteServer();
+  const localApi = await setupApiDir({});
+  const app = await createLocalApiServer({
+    port: 0,
+    apiDir: localApi.apiDir,
+    remoteBase: remote.remoteBase,
+    allowPrivateRemoteBase: true,
+    mode: 'docker',
+    logger: { log() { }, warn() { }, error() { } },
+  });
+  const { port } = await app.start();
+
+  try {
+    const headers = { 'X-WorldMonitor-Local-Token': TEST_LOCAL_API_TOKEN };
+    const youtubeResponse = await fetch(`http://127.0.0.1:${port}/api/youtube/live`, { headers });
+    assert.equal(youtubeResponse.status, 200);
+
+    const registerResponse = await fetch(`http://127.0.0.1:${port}/api/register-interest`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'docker@example.com', source: 'web-form' }),
+    });
+    assert.equal(registerResponse.status, 200);
+
+    assert.deepEqual(remote.hits, ['/api/youtube/live', '/api/leads/v1/register-interest']);
+    assert.equal(remote.headers.length, 2);
+    for (const upstreamHeaders of remote.headers) {
+      assert.equal(upstreamHeaders['x-worldmonitor-local-token'], undefined);
+    }
+  } finally {
+    await app.close();
+    await localApi.cleanup();
+    await remote.close();
+    if (originalConvex === undefined) delete process.env.CONVEX_URL;
+    else process.env.CONVEX_URL = originalConvex;
+  }
+});
+
+for (const inputKind of ['Request', 'URL']) test(`preserves body when handler uses fetch(${inputKind})`, async () => {
   // Use a DISTINCT upstream server (not the sidecar itself) so this test
   // exercises real "handler proxies to external host" semantics. The upstream
   // is on 127.0.0.1, so it must be opted into the SSRF allowlist via
@@ -558,7 +958,7 @@ test('preserves Request body when handler uses fetch(Request)', async () => {
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ secret: 'keep-body' }),
         });
-        const upstream = await fetch(request);
+        const upstream = await fetch(${inputKind === 'Request' ? 'request' : 'new URL(request.url), { method: request.method, headers: request.headers, body: await request.text() }'});
         const payload = await upstream.text();
         return new Response(payload, {
           status: upstream.status,
@@ -647,7 +1047,7 @@ test('returns local handler error when fetch(Request) uses a consumed body', asy
   }
 });
 
-test('blocks handler global fetches to private network targets (#3549)', async () => {
+for (const inputKind of ['string', 'URL', 'Request']) test(`blocks handler ${inputKind} fetches to private network targets (#3549, #7892)`, async () => {
   let upstreamHits = 0;
 
   const upstream = createServer((_req, res) => {
@@ -661,7 +1061,7 @@ test('blocks handler global fetches to private network targets (#3549)', async (
   const localApi = await setupApiDir({
     'private-proxy.js': `
       export default async function handler() {
-        const upstream = await fetch(process.env.WM_TEST_UPSTREAM);
+        const upstream = await fetch(${inputKind === 'string' ? 'process.env.WM_TEST_UPSTREAM' : `new ${inputKind}(process.env.WM_TEST_UPSTREAM)`});
         const payload = await upstream.text();
         return new Response(payload, {
           status: upstream.status,
@@ -763,6 +1163,120 @@ test('allows only Docker mode to fetch configured private Redis REST origin', as
     await new Promise((resolve, reject) => {
       upstream.close((error) => (error ? reject(error) : resolve()));
     });
+  }
+});
+
+test('allows only Docker mode to fetch configured private LLM origins', async () => {
+  const envSnapshot = {
+    LLM_API_URL: process.env.LLM_API_URL,
+    OLLAMA_API_URL: process.env.OLLAMA_API_URL,
+    UNCONFIGURED_PRIVATE_URL: process.env.UNCONFIGURED_PRIVATE_URL,
+  };
+  let handlerHits = 0;
+
+  const upstreams = [];
+  const warnings = [];
+  async function createProbeOrigin() {
+    const upstream = createServer((req, res) => {
+      if (req.headers['x-sidecar-test-probe'] === '1') handlerHits += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    upstreams.push(upstream);
+    const port = await listen(upstream);
+    return `http://127.0.0.1:${port}/v1/chat/completions`;
+  }
+
+  const [privateLlmUrl, privateOllamaUrl, unconfiguredPrivateUrl] = await Promise.all([
+    createProbeOrigin(),
+    createProbeOrigin(),
+    createProbeOrigin(),
+  ]);
+
+  const localApi = await setupApiDir({
+    'llm-probe.js': `
+      export default async function handler(request) {
+        const envKey = new URL(request.url).searchParams.get('envKey');
+        const upstream = await fetch(process.env[envKey], {
+          headers: { 'x-sidecar-test-probe': '1' },
+        });
+        const payload = await upstream.text();
+        return new Response(payload, {
+          status: upstream.status,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+    `,
+  });
+
+  async function runProbes(mode, envKeys) {
+    const app = await createLocalApiServer({
+      port: 0,
+      apiDir: localApi.apiDir,
+      mode,
+      logger: { log() { }, warn(message) { warnings.push(message); }, error() { } },
+    });
+    const { port } = await app.start();
+    try {
+      return await Promise.all(
+        envKeys.map((envKey) => authFetch(
+          `http://127.0.0.1:${port}/api/llm-probe?envKey=${encodeURIComponent(envKey)}`,
+        )),
+      );
+    } finally {
+      await app.close();
+    }
+  }
+
+  try {
+    process.env.LLM_API_URL = privateLlmUrl;
+    process.env.OLLAMA_API_URL = privateOllamaUrl;
+    process.env.UNCONFIGURED_PRIVATE_URL = unconfiguredPrivateUrl;
+    const envKeys = ['LLM_API_URL', 'OLLAMA_API_URL', 'UNCONFIGURED_PRIVATE_URL'];
+    const dockerResponses = await runProbes('docker', envKeys);
+    for (const [index, envKey] of envKeys.entries()) {
+      const dockerResponse = dockerResponses[index];
+      if (index < 2) {
+        assert.equal(dockerResponse.status, 200, envKey);
+        assert.deepEqual(await dockerResponse.json(), { ok: true });
+      } else {
+        assert.equal(dockerResponse.status, 502, envKey);
+        const dockerBody = await dockerResponse.json();
+        assert.equal(dockerBody.error, 'Local handler error');
+        assert.match(dockerBody.reason, /SSRF blocked/);
+      }
+    }
+
+    const desktopResponses = await runProbes('desktop-sidecar', envKeys);
+    for (const [index, envKey] of envKeys.entries()) {
+      const desktopResponse = desktopResponses[index];
+      assert.equal(desktopResponse.status, 502, envKey);
+      const desktopBody = await desktopResponse.json();
+      assert.equal(desktopBody.error, 'Local handler error');
+      assert.match(desktopBody.reason, /SSRF blocked/);
+    }
+    assert.equal(handlerHits, 2, 'only Docker handler probes should reach the upstream');
+
+    process.env.LLM_API_URL = 'not-a-url';
+    process.env.OLLAMA_API_URL = '://also-not-a-url';
+    const malformedResponses = await runProbes('docker', ['LLM_API_URL', 'OLLAMA_API_URL']);
+    for (const [index, envKey] of ['LLM_API_URL', 'OLLAMA_API_URL'].entries()) {
+      assert.equal(malformedResponses[index].status, 502, envKey);
+      const malformedBody = await malformedResponses[index].json();
+      assert.equal(malformedBody.error, 'Local handler error');
+      assert.match(malformedBody.reason, /(?:parse URL|Invalid URL)/i);
+    }
+    assert.ok(warnings.some((message) => message.includes('LLM_API_URL is not a valid URL')));
+    assert.ok(warnings.some((message) => message.includes('OLLAMA_API_URL is not a valid URL')));
+  } finally {
+    for (const [key, value] of Object.entries(envSnapshot)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await localApi.cleanup();
+    await Promise.all(upstreams.map((upstream) => new Promise((resolve, reject) => {
+      upstream.close((error) => (error ? reject(error) : resolve()));
+    })));
   }
 });
 
@@ -989,6 +1503,50 @@ test('uses IPv4 sidecar fetch for allowed private-network LLM probes (#3549)', a
   }
 });
 
+test('reports Groq health for configured keys without a gsk_ prefix (#7126)', async () => {
+  const envSnapshot = {
+    GROQ_API_KEY: process.env.GROQ_API_KEY,
+    OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
+    OLLAMA_API_URL: process.env.OLLAMA_API_URL,
+    LLM_API_URL: process.env.LLM_API_URL,
+  };
+  const restoreHttps = mockHttpsRequestOnce({
+    statusCode: 404,
+    headers: { 'content-type': 'application/json' },
+    body: '{}',
+  });
+
+  process.env.GROQ_API_KEY = 'groq-test-key';
+  delete process.env.OPENROUTER_API_KEY;
+  delete process.env.OLLAMA_API_URL;
+  delete process.env.LLM_API_URL;
+
+  const localApi = await setupApiDir({});
+  const app = await createLocalApiServer({
+    port: 0,
+    apiDir: localApi.apiDir,
+    logger: { log() { }, warn() { }, error() { } },
+  });
+  const { port } = await app.start();
+
+  try {
+    const response = await getJsonViaHttp(`http://127.0.0.1:${port}/api/llm-health`);
+    assert.equal(response.status, 200);
+    assert.equal(response.json.available, true);
+    assert.deepEqual(response.json.providers, [
+      { name: 'groq', url: 'https://api.groq.com', available: true },
+    ]);
+  } finally {
+    restoreHttps();
+    for (const [key, value] of Object.entries(envSnapshot)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await app.close();
+    await localApi.cleanup();
+  }
+});
+
 test('uses canonical app origin when proxying to cloud fallback (cloudFallback enabled)', async () => {
   const remote = await setupRemoteServer();
   const localApi = await setupApiDir({});
@@ -1167,7 +1725,106 @@ test('resolves packaged tauri resource layout under _up_/api', async () => {
 
 // ── Ollama env key allowlist + validation tests ──
 
-test('accepts OLLAMA_API_URL via /api/local-env-update', async () => {
+test('Docker rejects native administration without changing configuration, caches, or relay transport', async (t) => {
+  const originalEnv = { ...process.env };
+  const originalFetch = globalThis.fetch;
+  const relayCalls = [];
+  const operatorRelay = 'https://operator-relay.example';
+  const otherRelay = 'https://untrusted-relay.example';
+  process.env.WS_RELAY_URL = operatorRelay;
+  process.env.RELAY_SHARED_SECRET = 'synthetic-relay-secret';
+  delete process.env.RELAY_AUTH_HEADER;
+  globalThis.fetch = (input, options) => {
+    const url = String(input);
+    if (url.startsWith(operatorRelay) || url.startsWith(otherRelay)) {
+      relayCalls.push({ url, headers: new Headers(options?.headers) });
+      return Promise.resolve(new Response('[]', { headers: { 'content-type': 'application/json' } }));
+    }
+    return originalFetch(input, options);
+  };
+  let privateProbeHits = 0;
+  const privateProvider = createServer((_req, res) => {
+    privateProbeHits++;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"data":[{"id":"fixture-model"}]}');
+  });
+  const privatePort = await listen(privateProvider);
+  const relayModule = pathToFileURL(path.resolve(import.meta.dirname, '../../api/oref-alerts.js')).href;
+  const localApi = await setupApiDir({
+    'oref-alerts.js': `export { default } from ${JSON.stringify(relayModule)};`,
+    'missing.js': `import './absent.js'; export default () => new Response('unreachable');`,
+  });
+  const verboseStatePath = path.join(localApi.apiDir, 'verbose-mode.json');
+  await writeFile(verboseStatePath, '{"verboseMode":false}');
+  const app = await createLocalApiServer({
+    port: 0, apiDir: localApi.apiDir, dataDir: localApi.apiDir, mode: 'docker',
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const { port } = await app.start();
+  const base = `http://127.0.0.1:${port}`;
+  // This is the authority nginx grants even when the outside caller is anonymous.
+  const proxyHeaders = { 'X-WorldMonitor-Local-Token': TEST_LOCAL_API_TOKEN, Origin: 'http://localhost' };
+  try {
+    await authFetch(`${base}/api/missing`);
+    const requests = [
+      ['local-env-update', 'POST', { key: 'WS_RELAY_URL', value: otherRelay }],
+      ['local-env-update-batch', 'POST', { entries: [{ key: 'WS_RELAY_URL', value: otherRelay }] }],
+      ['local-validate-secret', 'POST', { key: 'OLLAMA_API_URL', value: `http://127.0.0.1:${privatePort}` }],
+      ['local-status', 'GET'],
+      ['local-traffic-log', 'GET'],
+      ['local-traffic-log', 'DELETE'],
+      ['local-debug-toggle', 'GET'],
+      ['local-debug-toggle', 'POST'],
+      ['local-env-update', 'OPTIONS'],
+    ];
+    for (const [route, method, body] of requests) {
+      await t.test(`${method} ${route}`, async () => {
+        const response = await fetch(`${base}/api/${route}`, {
+          method, headers: { ...proxyHeaders, 'Content-Type': 'application/json' },
+          body: body ? JSON.stringify(body) : undefined,
+        });
+        assert.equal(response.status, 403);
+      });
+    }
+    await t.test('spoofed and native credentials cannot override Docker mode', async () => {
+      for (const headers of [{}, { Authorization: `Bearer ${TEST_LOCAL_API_TOKEN}` }, {
+        Authorization: 'Bearer caller-oauth', Origin: 'https://tauri.localhost',
+        'X-WorldMonitor-Local-Token': 'spoofed-token',
+      }]) {
+        const response = await fetch(`${base}/api/local-status`, { headers });
+        assert.equal(response.status, 403);
+      }
+    });
+    await t.test('rejections leave validation transport and debug state untouched', () => {
+      assert.equal(privateProbeHits, 0);
+      assert.equal(readFileSync(verboseStatePath, 'utf8'), '{"verboseMode":false}');
+    });
+    await t.test('rejections preserve environment, failed-import cache, and outbound destination', async () => {
+      const relay = await fetch(`${base}/api/oref-alerts`, { headers: proxyHeaders });
+      assert.equal(relay.status, 200);
+      assert.equal(relayCalls.length, 1);
+      assert.equal(relayCalls[0].url, `${operatorRelay}/oref/alerts`);
+      assert.equal(relayCalls[0].headers.get('x-relay-key'), 'synthetic-relay-secret');
+      assert.equal(relayCalls[0].headers.get('authorization'), 'Bearer synthetic-relay-secret');
+      assert.equal(process.env.WS_RELAY_URL, operatorRelay);
+      const missing = await authFetch(`${base}/api/missing`);
+      assert.match((await missing.json()).reason, /cached-failure/);
+      const health = await fetch(`${base}/api/sidecar-health`);
+      assert.equal(health.status, 200);
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    for (const key of ['WS_RELAY_URL', 'RELAY_SHARED_SECRET', 'RELAY_AUTH_HEADER']) {
+      if (originalEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = originalEnv[key];
+    }
+    await app.close();
+    await localApi.cleanup();
+    await new Promise(resolve => privateProvider.close(resolve));
+  }
+});
+
+test('accepts OLLAMA_API_URL through desktop single and batch env updates', async () => {
   const localApi = await setupApiDir({});
 
   const app = await createLocalApiServer({
@@ -1188,6 +1845,13 @@ test('accepts OLLAMA_API_URL via /api/local-env-update', async () => {
     assert.equal(body.ok, true);
     assert.equal(body.key, 'OLLAMA_API_URL');
     assert.equal(process.env.OLLAMA_API_URL, 'http://127.0.0.1:11434');
+    const batchResponse = await authFetch(`http://127.0.0.1:${port}/api/local-env-update-batch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entries: [{ key: 'OLLAMA_API_URL', value: 'http://127.0.0.1:11435' }] }),
+    });
+    assert.equal(batchResponse.status, 200);
+    assert.equal(process.env.OLLAMA_API_URL, 'http://127.0.0.1:11435');
   } finally {
     delete process.env.OLLAMA_API_URL;
     await app.close();
@@ -1248,6 +1912,55 @@ test('accepts WM_DESKTOP_SHARED_SECRET via /api/local-env-update', async () => {
   } finally {
     if (originalSecret === undefined) delete process.env.WM_DESKTOP_SHARED_SECRET;
     else process.env.WM_DESKTOP_SHARED_SECRET = originalSecret;
+    await app.close();
+    await localApi.cleanup();
+  }
+});
+
+test('accepts ALPHA_VANTAGE_API_KEY via /api/local-env-update', async () => {
+  const originalKey = process.env.ALPHA_VANTAGE_API_KEY;
+  const localApi = await setupApiDir({});
+  const app = await createLocalApiServer({
+    port: 0,
+    apiDir: localApi.apiDir,
+    logger: { log() { }, warn() { }, error() { } },
+  });
+  const { port } = await app.start();
+
+  try {
+    const response = await authFetch(`http://127.0.0.1:${port}/api/local-env-update`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'ALPHA_VANTAGE_API_KEY', value: 'desktop-av-key' }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(process.env.ALPHA_VANTAGE_API_KEY, 'desktop-av-key');
+  } finally {
+    if (originalKey === undefined) delete process.env.ALPHA_VANTAGE_API_KEY;
+    else process.env.ALPHA_VANTAGE_API_KEY = originalKey;
+    await app.close();
+    await localApi.cleanup();
+  }
+});
+
+test('stores ALPHA_VANTAGE_API_KEY without claiming the provider demo response verifies it', async () => {
+  const localApi = await setupApiDir({});
+  const app = await createLocalApiServer({
+    port: 0,
+    apiDir: localApi.apiDir,
+    logger: { log() { }, warn() { }, error() { } },
+  });
+  const { port } = await app.start();
+
+  try {
+    const response = await postJsonViaHttp(`http://127.0.0.1:${port}/api/local-validate-secret`, {
+      key: 'ALPHA_VANTAGE_API_KEY',
+      value: 'desktop-av-key',
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.json?.valid, true);
+    assert.equal(response.json?.message, 'Key stored');
+  } finally {
     await app.close();
     await localApi.cleanup();
   }
@@ -1667,6 +2380,32 @@ test('uses gzip compression when Brotli is unavailable but gzip is accepted', as
   }
 });
 
+test('skips gzip/br for already-compressed raster image payloads (#7382)', () => {
+  const jpegBody = Buffer.alloc(2048, 0xff);
+  assert.equal(
+    __testing__.canCompress({ 'content-type': 'image/jpeg' }, jpegBody),
+    false,
+  );
+  assert.equal(
+    __testing__.canCompress({ 'content-type': 'image/png' }, jpegBody),
+    false,
+  );
+  assert.equal(
+    __testing__.canCompress({ 'content-type': 'image/webp' }, jpegBody),
+    false,
+  );
+  // SVG is text — still worth compressing (e.g. /api/og-story).
+  assert.equal(
+    __testing__.canCompress({ 'content-type': 'image/svg+xml' }, Buffer.from('x'.repeat(2048))),
+    true,
+  );
+  assert.equal(
+    __testing__.canCompress({ 'content-type': 'application/json' }, Buffer.from('x'.repeat(2048))),
+    true,
+  );
+});
+
+
 // ── Security hardening tests ────────────────────────────────────────────
 
 test('rejects unauthenticated requests to /api/local-status when token is set', async () => {
@@ -1917,6 +2656,252 @@ test('default-deny: rejects every authenticated route when LOCAL_API_TOKEN is un
   }
 });
 
+test('rss-proxy pins an IPv6-only hostname to the validated address', async () => {
+  const localApi = await setupApiDir({});
+  const originalResolve4 = dns.resolve4;
+  const originalResolve6 = dns.resolve6;
+  const originalHttpsRequest = https.request;
+  const publicIpv6 = '2606:4700:4700::1111';
+  let outboundOptions = null;
+  let pinnedLookup = null;
+
+  dns.resolve4 = async () => {
+    const error = new Error('No A records');
+    error.code = 'ENODATA';
+    throw error;
+  };
+  dns.resolve6 = async (hostname) => {
+    assert.equal(hostname, 'ipv6-only.example');
+    return [publicIpv6];
+  };
+  https.request = (options, onResponse) => {
+    outboundOptions = options;
+    if (typeof options.lookup === 'function') {
+      options.lookup(options.hostname, { family: options.family }, (error, address, family) => {
+        assert.ifError(error);
+        pinnedLookup = { address, family };
+      });
+    }
+
+    const req = new EventEmitter();
+    req.setTimeout = () => {};
+    req.write = () => {};
+    req.destroy = (error) => {
+      if (error) req.emit('error', error);
+    };
+    req.end = () => {
+      queueMicrotask(() => {
+        const res = new EventEmitter();
+        res.statusCode = 200;
+        res.statusMessage = 'OK';
+        res.headers = { 'content-type': 'application/rss+xml' };
+        onResponse(res);
+        res.emit('data', Buffer.from('<rss />'));
+        res.emit('end');
+      });
+    };
+    return req;
+  };
+
+  const app = await createLocalApiServer({
+    port: 0,
+    apiDir: localApi.apiDir,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const { port } = await app.start();
+
+  try {
+    const feedUrl = encodeURIComponent('https://ipv6-only.example/feed.xml');
+    const response = await authFetch(`http://127.0.0.1:${port}/api/rss-proxy?url=${feedUrl}`);
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), '<rss />');
+    assert.equal(outboundOptions?.hostname, 'ipv6-only.example');
+    assert.equal(outboundOptions?.family, 6);
+    assert.deepEqual(pinnedLookup, { address: publicIpv6, family: 6 });
+  } finally {
+    dns.resolve4 = originalResolve4;
+    dns.resolve6 = originalResolve6;
+    https.request = originalHttpsRequest;
+    await app.close();
+    await localApi.cleanup();
+  }
+});
+
+test('rss-proxy blocks IPv4-mapped IPv6 literals and DNS answers before transport', async () => {
+  const localApi = await setupApiDir({});
+  const originalResolve4 = dns.resolve4;
+  const originalResolve6 = dns.resolve6;
+  const originalHttpsRequest = https.request;
+  let outboundCalls = 0;
+
+  dns.resolve4 = async () => ['93.184.216.34'];
+  dns.resolve6 = async () => ['::ffff:7f00:1'];
+  https.request = () => {
+    outboundCalls += 1;
+    throw new Error('blocked mapped address must not reach the network');
+  };
+
+  const app = await createLocalApiServer({
+    port: 0,
+    apiDir: localApi.apiDir,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const { port } = await app.start();
+
+  try {
+    const mappedUrls = [
+      'https://[::ffff:127.0.0.1]/feed.xml',
+      'https://[0:0:0:0:0:ffff:127.0.0.1]/feed.xml',
+      'https://[::ffff:7f00:1]/feed.xml',
+      'https://[::ffff:c0a8:101]/feed.xml',
+      'https://[::ffff:a9fe:101]/feed.xml',
+      'https://[::ffff:c633:6401]/feed.xml',
+    ];
+    for (const feedUrl of mappedUrls) {
+      const response = await authFetch(
+        `http://127.0.0.1:${port}/api/rss-proxy?url=${encodeURIComponent(feedUrl)}`,
+      );
+      assert.equal(response.status, 403, feedUrl);
+      const body = await response.json();
+      assert.match(body.error, /private\/reserved/, feedUrl);
+    }
+
+    const dnsResponse = await authFetch(
+      `http://127.0.0.1:${port}/api/rss-proxy?url=${encodeURIComponent('https://mapped-dns.example/feed.xml')}`,
+    );
+    assert.equal(dnsResponse.status, 403);
+    assert.match((await dnsResponse.json()).error, /private\/reserved/);
+    assert.equal(outboundCalls, 0);
+  } finally {
+    dns.resolve4 = originalResolve4;
+    dns.resolve6 = originalResolve6;
+    https.request = originalHttpsRequest;
+    await app.close();
+    await localApi.cleanup();
+  }
+});
+
+test('rss-proxy forces active and error responses through an inert response policy', async () => {
+  const localApi = await setupApiDir({});
+  const originalResolve4 = dns.resolve4;
+  const originalResolve6 = dns.resolve6;
+  const originalHttpsRequest = https.request;
+  const upstreamResponses = [
+    {
+      statusCode: 200,
+      statusMessage: 'OK',
+      contentType: 'text/html; charset=utf-8',
+      body: '<html><script>globalThis.rssProxyExecuted = true;</script></html>',
+    },
+    {
+      statusCode: 502,
+      statusMessage: 'Bad Gateway',
+      contentType: 'image/svg+xml',
+      body: '<svg><script>globalThis.rssProxyExecuted = true;</script></svg>',
+    },
+  ];
+  let upstreamIndex = 0;
+
+  dns.resolve4 = async () => ['93.184.216.34'];
+  dns.resolve6 = async () => {
+    const error = new Error('No AAAA records');
+    error.code = 'ENODATA';
+    throw error;
+  };
+  https.request = (_options, onResponse) => {
+    const upstream = upstreamResponses[upstreamIndex++];
+    const req = new EventEmitter();
+    req.setTimeout = () => {};
+    req.write = () => {};
+    req.destroy = (error) => {
+      if (error) req.emit('error', error);
+    };
+    req.end = () => {
+      queueMicrotask(() => {
+        const res = new EventEmitter();
+        res.statusCode = upstream.statusCode;
+        res.statusMessage = upstream.statusMessage;
+        res.headers = { 'content-type': upstream.contentType };
+        onResponse(res);
+        res.emit('data', Buffer.from(upstream.body));
+        res.emit('end');
+      });
+    };
+    return req;
+  };
+
+  const app = await createLocalApiServer({
+    port: 0,
+    apiDir: localApi.apiDir,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const { port } = await app.start();
+
+  try {
+    for (const upstream of upstreamResponses) {
+      const response = await authFetch(
+        `http://127.0.0.1:${port}/api/rss-proxy?url=${encodeURIComponent('https://publisher.example/feed.xml')}`,
+      );
+      assert.equal(response.status, upstream.statusCode);
+      assert.equal(await response.text(), upstream.body);
+      assert.equal(response.headers.get('content-type'), 'application/xml; charset=utf-8');
+      assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+      assert.match(response.headers.get('content-security-policy') || '', /(?:^|;\s*)sandbox(?:;|$)/);
+      assert.match(response.headers.get('content-security-policy') || '', /script-src 'none'/);
+    }
+
+    for (const query of ['', '?url=http%3A%2F%2F127.0.0.1%2F']) {
+      const response = await authFetch(`http://127.0.0.1:${port}/api/rss-proxy${query}`);
+      assert.ok(response.status === 400 || response.status === 403);
+      assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+      assert.match(response.headers.get('content-security-policy') || '', /(?:^|;\s*)sandbox(?:;|$)/);
+    }
+  } finally {
+    dns.resolve4 = originalResolve4;
+    dns.resolve6 = originalResolve6;
+    https.request = originalHttpsRequest;
+    await app.close();
+    await localApi.cleanup();
+  }
+});
+
+test('rss-proxy rejects a hostname with mixed public and private DNS answers', async () => {
+  const localApi = await setupApiDir({});
+  const originalResolve4 = dns.resolve4;
+  const originalResolve6 = dns.resolve6;
+  const originalHttpsRequest = https.request;
+  let outboundCalls = 0;
+
+  dns.resolve4 = async () => ['93.184.216.34'];
+  dns.resolve6 = async () => ['fd00::1'];
+  https.request = () => {
+    outboundCalls += 1;
+    throw new Error('blocked DNS result must not reach the network');
+  };
+
+  const app = await createLocalApiServer({
+    port: 0,
+    apiDir: localApi.apiDir,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const { port } = await app.start();
+
+  try {
+    const feedUrl = encodeURIComponent('https://mixed-dns.example/feed.xml');
+    const response = await authFetch(`http://127.0.0.1:${port}/api/rss-proxy?url=${feedUrl}`);
+    assert.equal(response.status, 403);
+    const body = await response.json();
+    assert.match(body.error, /private\/reserved/);
+    assert.equal(outboundCalls, 0);
+  } finally {
+    dns.resolve4 = originalResolve4;
+    dns.resolve6 = originalResolve6;
+    https.request = originalHttpsRequest;
+    await app.close();
+    await localApi.cleanup();
+  }
+});
+
 test('rss-proxy blocks requests to localhost (SSRF protection)', async () => {
   const localApi = await setupApiDir({});
 
@@ -2077,6 +3062,316 @@ test('service-status reports bound fallback port after EADDRINUSE recovery', asy
     await localApi.cleanup();
     await new Promise((resolve, reject) => {
       blocker.close((error) => (error ? reject(error) : resolve()));
+    });
+  }
+});
+
+test('releases the upstream fetch semaphore when a response stalls mid-body (#5441)', async () => {
+  // Raw TCP, not http.createServer: sends valid headers with a Content-Length
+  // promising more body than it ever delivers, then destroys the socket
+  // shortly after — the "accepts connection, sends headers, stalls mid-body,
+  // connection eventually drops" failure mode from the issue. Node's http
+  // client surfaces this on `res` ('aborted'/'error'), not on `req` — which is
+  // exactly what the old globalThis.fetch wrapper never listened for, so the
+  // wrapped Promise never settled and the semaphore slot leaked permanently.
+  let stallConnections = 0;
+  const stallServer = net.createServer((socket) => {
+    socket.once('data', () => {
+      stallConnections += 1;
+      socket.write(
+        'HTTP/1.1 200 OK\r\n' +
+        'Content-Type: application/json\r\n' +
+        'Content-Length: 1000\r\n' +
+        '\r\n'
+      );
+      setTimeout(() => socket.destroy(), 20);
+    });
+  });
+  const stallPort = await listen(stallServer);
+
+  const healthy = createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const healthyPort = await listen(healthy);
+
+  const localApi = await setupApiDir({
+    'stall-proxy.js': `
+      export default async function handler() {
+        try {
+          await fetch('http://127.0.0.1:${stallPort}/');
+          return new Response(JSON.stringify({ settled: 'resolved' }), { status: 200 });
+        } catch (error) {
+          return new Response(JSON.stringify({ settled: 'rejected', message: error.message }), { status: 200 });
+        }
+      }
+    `,
+    'healthy-proxy.js': `
+      export default async function handler() {
+        const upstream = await fetch('http://127.0.0.1:${healthyPort}/');
+        const payload = await upstream.text();
+        return new Response(payload, { status: upstream.status, headers: { 'content-type': 'application/json' } });
+      }
+    `,
+  });
+
+  const app = await createLocalApiServer({
+    port: 0,
+    apiDir: localApi.apiDir,
+    logger: { log() { }, warn() { }, error() { } },
+    allowPrivateFetchOrigins: [
+      `http://127.0.0.1:${stallPort}`,
+      `http://127.0.0.1:${healthyPort}`,
+    ],
+  });
+  const { port } = await app.start();
+
+  try {
+    // getJsonViaHttp, NOT authFetch/global fetch: globalThis.fetch is
+    // monkey-patched by local-api-server.mjs and shares its 6-slot semaphore
+    // with the handler-side fetches this test is exercising. A real external
+    // client (a separate process/browser) never shares that counter — using
+    // the patched fetch for these outer calls too would have each one
+    // consume a slot just reaching the local API server, before its handler
+    // ever got to make its own inner request, self-deadlocking the test
+    // rather than reproducing the issue.
+    //
+    // MAX_CONCURRENT_UPSTREAM is 6 — fire exactly that many concurrent
+    // requests through the stalling upstream to exhaust every slot. Do not
+    // await them yet: under the pre-fix code these never settle at all, so
+    // awaiting here would hang the test itself, not just prove the bug.
+    const stallRequests = Array.from({ length: 6 }, () =>
+      getJsonViaHttp(`http://127.0.0.1:${port}/api/stall-proxy`)
+    );
+
+    // Wait until all 6 have actually reached the upstream (holding their
+    // semaphore slot) before touching the healthy endpoint, so the assertion
+    // below is exercising a genuinely exhausted semaphore, not a race.
+    const deadline = Date.now() + 2000;
+    while (stallConnections < 6 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(stallConnections, 6, 'all 6 stalling requests should have reached the upstream');
+
+    // The semaphore is now fully held by 6 in-flight stalling fetches. A 7th
+    // request to a completely healthy upstream must still complete quickly —
+    // proving the stalled slots were released rather than leaked forever.
+    const healthyResponse = await Promise.race([
+      getJsonViaHttp(`http://127.0.0.1:${port}/api/healthy-proxy`),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('healthy request did not complete — semaphore is wedged')), 3000)
+      ),
+    ]);
+    assert.equal(healthyResponse.status, 200);
+    assert.deepEqual(healthyResponse.json, { ok: true });
+
+    // The 6 stalling requests should also have settled (rejected) by now that
+    // their upstream connections were destroyed — confirm none of them hung.
+    const stallResults = await Promise.all(
+      stallRequests.map((p) =>
+        Promise.race([
+          p.then((r) => r.json),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('stall request never settled')), 1000)),
+        ])
+      )
+    );
+    for (const result of stallResults) {
+      assert.equal(result.settled, 'rejected');
+    }
+  } finally {
+    await app.close();
+    await localApi.cleanup();
+    await new Promise((resolve, reject) => {
+      stallServer.close((error) => (error ? reject(error) : resolve()));
+    });
+    await new Promise((resolve, reject) => {
+      healthy.close((error) => (error ? reject(error) : resolve()));
+    });
+  }
+});
+
+test('releases the upstream fetch semaphore when a connection goes silent forever (#5441 follow-up)', async () => {
+  // Accepts the connection and never writes anything, never closes -- no
+  // FIN/RST, no data. None of res 'error'/'aborted'/'end' or req 'error'/
+  // 'close' ever fire for this shape; only the new idle timeout observes it.
+  const openSockets = new Set();
+  const silentServer = net.createServer((socket) => {
+    // Intentionally do nothing with the data -- leave the connection open
+    // and silent. Track it so cleanup can force-close it: net.Server.close()
+    // waits for every accepted socket to end on its own, and a socket we
+    // never write to or read from (by design, to simulate a true silent
+    // stall) never will.
+    openSockets.add(socket);
+    socket.once('close', () => openSockets.delete(socket));
+  });
+  const silentPort = await listen(silentServer);
+
+  __testing__.setUpstreamIdleTimeoutMs(200);
+
+  const localApi = await setupApiDir({
+    'silent-proxy.js': `
+      export default async function handler() {
+        try {
+          await fetch('http://127.0.0.1:${silentPort}/');
+          return new Response(JSON.stringify({ settled: 'resolved' }), { status: 200 });
+        } catch (error) {
+          return new Response(JSON.stringify({ settled: 'rejected', message: error.message }), { status: 200 });
+        }
+      }
+    `,
+  });
+
+  const app = await createLocalApiServer({
+    port: 0,
+    apiDir: localApi.apiDir,
+    logger: { log() { }, warn() { }, error() { } },
+    allowPrivateFetchOrigins: [`http://127.0.0.1:${silentPort}`],
+  });
+  const { port } = await app.start();
+
+  try {
+    const result = await Promise.race([
+      getJsonViaHttp(`http://127.0.0.1:${port}/api/silent-proxy`).then((r) => r.json),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('silent stall never settled -- idle timeout did not fire')), 3000)
+      ),
+    ]);
+    assert.equal(result.settled, 'rejected');
+    assert.match(result.message, /idle-timed out/);
+
+    // Slot must be released: a request through the SAME fetch wrapper (any
+    // origin) must not be blocked by the leaked silent connection.
+    const stallRequests = Array.from({ length: 6 }, () =>
+      getJsonViaHttp(`http://127.0.0.1:${port}/api/silent-proxy`).then((r) => r.json)
+    );
+    const followUp = await Promise.race([
+      Promise.all(stallRequests),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('semaphore still wedged after idle timeout')), 5000)),
+    ]);
+    for (const r of followUp) assert.equal(r.settled, 'rejected');
+  } finally {
+    __testing__.setUpstreamIdleTimeoutMs(12000);
+    await app.close();
+    await localApi.cleanup();
+    for (const socket of openSockets) socket.destroy();
+    await new Promise((resolve, reject) => {
+      silentServer.close((error) => (error ? reject(error) : resolve()));
+    });
+  }
+});
+
+test('abort-signal path: mid-flight abort rejects promptly and releases the slot (#5441 follow-up)', async () => {
+  // Mirrors how fetchWithTimeout drives this exact branch in production: an
+  // AbortController whose signal is passed into fetch(), aborted mid-flight
+  // against an upstream that never responds.
+  const openSockets = new Set();
+  const neverResponds = net.createServer((socket) => {
+    // Accepts but never writes -- the abort must fire before any other
+    // listener would (idle timeout stays at its default 12s here). Tracked
+    // so cleanup can force-close it (see the silent-stall test above for why).
+    openSockets.add(socket);
+    socket.once('close', () => openSockets.delete(socket));
+  });
+  const neverRespondsPort = await listen(neverResponds);
+
+  const localApi = await setupApiDir({
+    'abort-proxy.js': `
+      export default async function handler() {
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(), 30);
+        try {
+          await fetch('http://127.0.0.1:${neverRespondsPort}/', { signal: controller.signal });
+          return new Response(JSON.stringify({ settled: 'resolved' }), { status: 200 });
+        } catch (error) {
+          return new Response(JSON.stringify({ settled: 'rejected', message: error.message, name: error.name }), { status: 200 });
+        }
+      }
+    `,
+    'healthy-proxy.js': `
+      export default async function handler() {
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+    `,
+  });
+
+  const app = await createLocalApiServer({
+    port: 0,
+    apiDir: localApi.apiDir,
+    logger: { log() { }, warn() { }, error() { } },
+    allowPrivateFetchOrigins: [`http://127.0.0.1:${neverRespondsPort}`],
+  });
+  const { port } = await app.start();
+
+  try {
+    const result = await Promise.race([
+      getJsonViaHttp(`http://127.0.0.1:${port}/api/abort-proxy`).then((r) => r.json),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('abort-signal path never settled -- semaphore leak reintroduced')), 2000)
+      ),
+    ]);
+    assert.equal(result.settled, 'rejected');
+    assert.match(result.message, /aborted by signal/);
+
+    // Slot released promptly (well under the 12s idle timeout): a healthy
+    // request right after must not be delayed by the aborted one.
+    const healthy = await Promise.race([
+      getJsonViaHttp(`http://127.0.0.1:${port}/api/healthy-proxy`).then((r) => r.json),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('slot not released after abort')), 1000)),
+    ]);
+    assert.deepEqual(healthy, { ok: true });
+  } finally {
+    await app.close();
+    await localApi.cleanup();
+    for (const socket of openSockets) socket.destroy();
+    await new Promise((resolve, reject) => {
+      neverResponds.close((error) => (error ? reject(error) : resolve()));
+    });
+  }
+});
+
+test('abort-signal path: an already-aborted signal rejects immediately without dispatching (#5441 follow-up)', async () => {
+  let connectionsReceived = 0;
+  const neverShouldConnect = net.createServer((_socket) => {
+    connectionsReceived += 1;
+  });
+  const neverShouldConnectPort = await listen(neverShouldConnect);
+
+  const localApi = await setupApiDir({
+    'preaborted-proxy.js': `
+      export default async function handler() {
+        const controller = new AbortController();
+        controller.abort();
+        try {
+          await fetch('http://127.0.0.1:${neverShouldConnectPort}/', { signal: controller.signal });
+          return new Response(JSON.stringify({ settled: 'resolved' }), { status: 200 });
+        } catch (error) {
+          return new Response(JSON.stringify({ settled: 'rejected', message: error.message }), { status: 200 });
+        }
+      }
+    `,
+  });
+
+  const app = await createLocalApiServer({
+    port: 0,
+    apiDir: localApi.apiDir,
+    logger: { log() { }, warn() { }, error() { } },
+    allowPrivateFetchOrigins: [`http://127.0.0.1:${neverShouldConnectPort}`],
+  });
+  const { port } = await app.start();
+
+  try {
+    const result = await Promise.race([
+      getJsonViaHttp(`http://127.0.0.1:${port}/api/preaborted-proxy`).then((r) => r.json),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('pre-aborted fetch never settled')), 1000)),
+    ]);
+    assert.equal(result.settled, 'rejected');
+    assert.match(result.message, /aborted by signal/);
+    assert.equal(connectionsReceived, 0, 'an already-aborted signal must not dispatch to the network at all');
+  } finally {
+    await app.close();
+    await localApi.cleanup();
+    await new Promise((resolve, reject) => {
+      neverShouldConnect.close((error) => (error ? reject(error) : resolve()));
     });
   }
 });

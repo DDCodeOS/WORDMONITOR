@@ -25,7 +25,6 @@ import { getCorsHeaders, isDisallowedOrigin } from '../../_cors.js';
 // @ts-expect-error — JS module, no declaration file
 import { captureSilentError } from '../../_sentry-edge.js';
 import { renderBriefMagazine } from '../../../server/_shared/brief-render.js';
-// @ts-expect-error — JS module, no declaration file
 import { readRawJsonFromUpstash, redisPipeline } from '../../_upstash-json.js';
 import { verifyBriefToken, BriefUrlError } from '../../../server/_shared/brief-url';
 import {
@@ -214,7 +213,9 @@ export default async function handler(
   // "expired" page.
   let envelope: unknown;
   try {
-    envelope = await readRawJsonFromUpstash(`brief:${userId}:${issueDate}`);
+    // Seeder-owned envelope (#7674): the Railway digest composer writes the
+    // per-user brief envelope key bare — read it raw in every environment.
+    envelope = await readRawJsonFromUpstash(`brief:${userId}:${issueDate}`, 3_000, true);
   } catch (err) {
     console.error('[api/brief] Upstash read failed:', (err as Error).message);
     captureSilentError(err, { tags: { route: 'api/brief', step: 'envelope-read' }, ctx });

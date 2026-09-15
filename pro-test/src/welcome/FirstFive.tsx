@@ -22,7 +22,7 @@ export const FirstFive = () => (
         subtitle={t('welcome.firstFive.sub')}
       />
       <motion.div
-        initial={{ opacity: 0, y: 20 }}
+        initial={false}
         whileInView={{ opacity: 1, y: 0 }}
         viewport={{ once: true, margin: '-60px' }}
         transition={{ duration: 0.5 }}
@@ -40,7 +40,7 @@ export const FirstFive = () => (
       </motion.div>
       <div className="text-center mt-10">
         <a
-          href={`${DASHBOARD_PATH}?ref=welcome-f5m`}
+          href={`${DASHBOARD_PATH}?utm_source=welcome&utm_content=f5m`}
           className="bg-wm-green text-wm-bg px-6 py-3 rounded-sm font-mono text-sm uppercase tracking-wider font-bold hover:bg-green-400 transition-colors inline-flex items-center gap-2"
         >
           {t('welcome.firstFive.cta')} <ArrowRight className="w-4 h-4" aria-hidden="true" />

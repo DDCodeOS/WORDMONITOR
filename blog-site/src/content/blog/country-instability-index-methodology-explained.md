@@ -6,7 +6,7 @@ keywords: "country instability index, political instability index methodology, c
 audience: "Risk analysts, researchers, students of international relations, data journalists, quantitative analysts"
 heroImage: "/blog/images/blog/country-instability-index-methodology-explained.jpg"
 pubDate: "2026-05-30"
-modifiedDate: "2026-06-13"
+modifiedDate: "2026-09-01"
 ---
 
 Every risk platform sells a number. A country is "72/100" or "high risk" or "amber." Almost none of them will tell you how the number is computed, which means you cannot challenge it, calibrate it, or defend it when a decision built on it goes wrong.
@@ -78,7 +78,15 @@ Floors are the model's defense against its own optimism. A country in an active 
 
 ## What the CII Deliberately Does Not Do
 
-**It does not measure structural fragility.** That is the job of the Country Resilience Index, a separate 196-country model of structural capacity across 20 dimensions, refreshed every six hours. CII is the fast clock (what is burning now); resilience is the slow clock (what breaks under fire). Reading them together is the [core of a sound country-risk workflow](/blog/posts/country-risk-monitoring-workflow-for-analysts/).
+The three common index types answer different questions:
+
+| Index | Main question | Coverage and cadence |
+|-------|---------------|----------------------|
+| Country Instability Index (CII) | How much current stress is the country under? | 31 Tier-1 countries, updated continuously |
+| Country Resilience Index (CRI) | How well can the country absorb and recover from shocks? | 196-country public universe, refreshed every six hours |
+| Fragile States Index (FSI) | Which states show long-term structural fragility? | Broad global coverage, published annually |
+
+**It does not measure structural fragility.** That is the job of the Country Resilience Index, a separate 196-country model of structural capacity across 72 indicators, 21 active dimensions, and 6 domains, refreshed every six hours. CII is the fast clock (what is burning now); resilience is the slow clock (what breaks under fire). Reading them together is the [core of a sound country-risk workflow](/blog/posts/country-risk-monitoring-workflow-for-analysts/).
 
 **It does not predict.** The CII describes current pressure. For forward-looking signals, World Monitor pairs it with [prediction markets and AI forecasting](/blog/posts/prediction-markets-ai-forecasting-geopolitics/), different tools for a different question.
 
@@ -96,6 +104,10 @@ The decomposition is the analysis. The number is just the index into it.
 - **API:** `get-country-risk` returns the score and component breakdown as JSON for [your own models](/blog/posts/build-on-worldmonitor-developer-api-open-source/).
 - **AI agents:** the `get_country_risk` tool on the [MCP server](/blog/posts/worldmonitor-mcp-server-ai-agents-real-time-intelligence/) gives Claude and other assistants the same data, so "why did Egypt's risk score move?" becomes a question your agent can actually answer.
 
+## Conflict Data References
+
+The index should be read alongside primary conflict datasets such as the [Uppsala Conflict Data Program](https://ucdp.uu.se/) and [ACLED](https://acleddata.com/). It is an analytical signal, not a substitute for the source event records or local verification.
+
 ## Frequently Asked Questions
 
 **How often is the Country Instability Index updated?**
@@ -112,4 +124,4 @@ Annual indices measure structural conditions with a 12-month cadence; the CII me
 
 ---
 
-**See every score, band, and delta live at [worldmonitor.app](https://www.worldmonitor.app). When a number surprises you, click into the country brief and take the score apart. That is what it is for.**
+**See every score, band, and delta on the [live Country Instability Index rankings](https://www.worldmonitor.app/country-instability-index/). When a number surprises you, open the country page and take the score apart. That is what it is for.**

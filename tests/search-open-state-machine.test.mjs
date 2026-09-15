@@ -4,6 +4,10 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
+import {
+  raceWebMcpAbort,
+  throwIfWebMcpAborted,
+} from '../src/services/webmcp.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const appSrc = readFileSync(resolve(__dirname, '../src/App.ts'), 'utf-8');
@@ -45,23 +49,72 @@ function extractOpenSearch() {
   const js = ts.transpileModule(classSrc, {
     compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.None },
   }).outputText;
-  // showToast is a free (module-level) reference inside the method — inject it.
+  // Module-level references inside the method are injected as recording doubles.
   // eslint-disable-next-line no-new-func
-  return new Function('showToast', `${js}\nreturn __OpenSearchHarness;`);
+  return new Function(
+    'showToast',
+    'overlayHistory',
+    'raceWebMcpAbort',
+    'throwIfWebMcpAborted',
+    `${js}\nreturn __OpenSearchHarness;`,
+  );
 }
 
 const toastMessages = [];
-const Harness = extractOpenSearch()((msg) => toastMessages.push(msg));
+const historyDouble = {
+  calls: [],
+  current: null,
+  beginPending(id, replaceOverlayId, onCancel) {
+    const state = { active: true, id, onCancel };
+    this.current = state;
+    this.calls.push({ method: 'beginPending', id, replaceOverlayId });
+    return {
+      isCurrent: () => state.active && this.current === state,
+      cancel: () => {
+        if (!state.active) return;
+        state.active = false;
+        onCancel();
+        this.calls.push({ method: 'cancel', id });
+      },
+    };
+  },
+  back() {
+    if (!this.current?.active) return;
+    this.current.active = false;
+    this.current.onCancel();
+    this.calls.push({ method: 'back', id: this.current.id });
+  },
+  reset() {
+    this.calls.length = 0;
+    this.current = null;
+  },
+};
+const Harness = extractOpenSearch()(
+  (msg) => toastMessages.push(msg),
+  historyDouble,
+  raceWebMcpAbort,
+  throwIfWebMcpAborted,
+);
 
 function makeInstance({ failLoad = false } = {}) {
   const inst = new Harness();
   const modal = {
-    _open: false, opens: 0, closes: 0,
-    open() { this._open = true; this.opens++; },
+    _open: false, opens: 0, closes: 0, openArgs: [], queryArgs: [],
+    open(replaceOverlayId) { this._open = true; this.opens++; this.openArgs.push(replaceOverlayId); },
+    applyQuery(term) { this.queryArgs.push(term); },
     close() { this._open = false; this.closes++; },
     isOpen() { return this._open; },
   };
-  const manager = { updateSearchIndex() { manager.indexBuilds++; }, indexBuilds: 0 };
+  const manager = {
+    indexBuilds: 0,
+    cancelCalls: 0,
+    onCancel: null,
+    updateSearchIndex() { manager.indexBuilds++; },
+    cancelPendingProgrammaticSelection() {
+      manager.cancelCalls++;
+      manager.onCancel?.();
+    },
+  };
   let resolveGate, rejectGate;
   const gate = new Promise((res, rej) => { resolveGate = res; rejectGate = rej; });
   inst.openSearchEpoch = 0;
@@ -85,7 +138,29 @@ function makeInstance({ failLoad = false } = {}) {
 }
 
 describe('App.openSearch lazy-load state machine (#4403)', () => {
-  beforeEach(() => { toastMessages.length = 0; });
+  it('startup consumes SearchAction ?q= through the lazy openSearch path', () => {
+    assert.match(appSrc, /readDashboardSearchQuery\(window\.location\.search\)/);
+    assert.match(
+      appSrc,
+      /pendingDeepLinkSearchQuery/,
+      'the term must be captured before URL sync rewrites the address bar',
+    );
+    assert.match(
+      appSrc,
+      /openSearch\(\{\s*initialQuery:\s*searchQuery\s*\}\)/,
+      'captured ?q= must enter the existing lazy search path',
+    );
+    assert.match(
+      appSrc,
+      /if \(options\.initialQuery\) modal\.applyQuery\(options\.initialQuery\)/,
+      'openSearch must hand the term to the modal after lazy init',
+    );
+  });
+
+  beforeEach(() => {
+    toastMessages.length = 0;
+    historyDouble.reset();
+  });
 
   it('opens on a single Cmd+K toggle (first load)', async () => {
     const h = makeInstance();
@@ -147,6 +222,19 @@ describe('App.openSearch lazy-load state machine (#4403)', () => {
     assert.equal(toastMessages.length, 0, 'agent path should not show a user toast');
   });
 
+  it('cancels a WebMCP open while the search chunk is loading without a late modal', async () => {
+    const h = makeInstance();
+    const controller = new AbortController();
+    const pending = h.inst.openSearch({ throwOnFailure: true, signal: controller.signal });
+    controller.abort();
+
+    await assert.rejects(pending, (error) => error === controller.signal.reason);
+    await h.resolveLoad();
+    await Promise.resolve();
+    assert.equal(h.modal.opens, 0);
+    assert.deepEqual(toastMessages, []);
+  });
+
   it('closes an already-open modal on toggle (loaded)', async () => {
     const h = makeInstance();
     const p = h.inst.openSearch({ toggle: true });
@@ -155,5 +243,75 @@ describe('App.openSearch lazy-load state machine (#4403)', () => {
     assert.equal(h.modal.opens, 1);
     await h.inst.openSearch({ toggle: true }); // second toggle, now loaded + open
     assert.equal(h.modal.closes, 1, 'toggle on an open modal closes it');
+  });
+
+  it('denies an older deferred result before reopening the human palette', async () => {
+    const h = makeInstance();
+    const load = h.inst.openSearch({});
+    await h.resolveLoad();
+    await load;
+    h.modal._open = false;
+
+    let resolveAgent;
+    const pendingAgent = new Promise((resolve) => { resolveAgent = resolve; });
+    h.manager.onCancel = () => resolveAgent({
+      ok: false,
+      status: 'denied',
+      reason: 'result_no_longer_executable',
+    });
+
+    assert.equal(await h.inst.openSearch({}), true);
+    assert.deepEqual(await pendingAgent, {
+      ok: false,
+      status: 'denied',
+      reason: 'result_no_longer_executable',
+    });
+    assert.equal(h.manager.cancelCalls, 1);
+    assert.equal(h.modal.isOpen(), true, 'the newer palette intent must remain open');
+    assert.equal(h.modal.closes, 0, 'the superseded agent must not close the palette later');
+  });
+
+  it('records replacement context and passes the pending marker to SearchModal', async () => {
+    const h = makeInstance();
+    const p = h.inst.openSearch({ historyPending: true, replaceOverlayId: 'menu' });
+    assert.deepEqual(historyDouble.calls, [
+      { method: 'beginPending', id: 'search-pending', replaceOverlayId: 'menu' },
+    ]);
+
+    await h.resolveLoad();
+    await p;
+    assert.deepEqual(h.modal.openArgs, ['search-pending']);
+  });
+
+  it('does not open Search after Back cancels its pending lazy load', async () => {
+    const h = makeInstance();
+    const p = h.inst.openSearch({ historyPending: true });
+    historyDouble.back();
+
+    await h.resolveLoad();
+    await p;
+    assert.equal(h.modal.opens, 0);
+    assert.equal(h.inst.searchToggleDesiredOpen, false);
+  });
+
+  it('passes a SearchAction query through the lazy path to the modal', async () => {
+    const h = makeInstance();
+    const p = h.inst.openSearch({ initialQuery: 'hormuz strait' });
+    await h.resolveLoad();
+    await p;
+    assert.equal(h.modal.opens, 1, 'lazy load must still open the modal');
+    assert.deepEqual(h.modal.queryArgs, ['hormuz strait'], 'modal must receive the deep-link term');
+  });
+
+  it('does not toast when a Back-cancelled Search chunk later fails', async () => {
+    const h = makeInstance({ failLoad: true });
+    const p = h.inst.openSearch({ historyPending: true });
+    await Promise.resolve(); // let openSearch attach its handler to the in-flight chunk
+    historyDouble.back();
+    h.failLoadNow();
+
+    await p;
+    assert.equal(h.modal.opens, 0);
+    assert.deepEqual(toastMessages, []);
   });
 });

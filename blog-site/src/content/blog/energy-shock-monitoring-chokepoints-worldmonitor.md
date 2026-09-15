@@ -4,9 +4,9 @@ description: "How analysts can monitor oil, gas, electricity, maritime chokepoin
 metaTitle: "Energy Shock Monitoring: Chokepoints | WorldMonitor"
 keywords: "energy shock monitoring, oil chokepoint dashboard, fuel shortage tracker, energy security intelligence, geopolitical energy risk"
 audience: "Energy analysts, commodity traders, policy teams, infrastructure risk managers"
-heroImage: "/blog/og/energy-shock-monitoring-chokepoints-worldmonitor.png"
+heroImage: "/blog/images/blog/energy-shock-monitoring-chokepoints-worldmonitor.jpg"
 pubDate: "2026-06-10"
-modifiedDate: "2026-06-13"
+modifiedDate: "2026-09-10"
 ---
 
 An energy shock rarely starts as a chart. It starts as a closure rumor, a tanker reroute, a fuel shortage, a policy announcement, a port delay, a pipeline disruption, or a military signal near a chokepoint. By the time the price chart explains it, the operational window has already narrowed.
@@ -15,11 +15,15 @@ WorldMonitor helps energy analysts watch the chain before it becomes one number 
 
 This is a practical workflow for monitoring energy-shock risk.
 
+For a worked example, open the [Strait of Hormuz tracker](https://www.worldmonitor.app/chokepoints/strait-of-hormuz/) to inspect its latest published transit and disruption readings. The [historical Strait of Hormuz Transit Report for July 2026](https://www.worldmonitor.app/research/strait-of-hormuz-transit-report-2026-07/) provides a dated comparison with Suez, Bab el-Mandeb, and the Cape of Good Hope. Its figures describe that report's observation period, not current traffic.
+
+For country context, open the [Iran](https://www.worldmonitor.app/countries/iran/) and [Oman](https://www.worldmonitor.app/countries/oman/) profiles. The [Gulf security tracker](https://www.worldmonitor.app/crises/hormuz-gulf-security/) summarizes conflict data for its stated regional coverage. The separate [Iran–Israel escalation tracker](https://www.worldmonitor.app/crises/iran-israel-escalation/) covers those two countries only.
+
 ## What is energy shock monitoring?
 
 Energy shock monitoring is the process of tracking the signals that can disrupt oil, gas, electricity, fuel distribution, or energy-linked commodities before the disruption fully appears in price or inventory data.
 
-A useful monitor combines five layers:
+A useful monitor combines these layers:
 
 | Layer | Example signals |
 |---|---|
@@ -158,6 +162,10 @@ Next checks:
 When a chokepoint becomes the main driver, pair live monitoring with the [Scenarios API](https://www.worldmonitor.app/docs/api-scenarios). Scenario templates let you ask what happens if a route disruption lasts a defined number of days or affects a specific country set.
 
 Use it for planning, not prediction. Scenario output answers "what would be exposed if..." rather than "what will happen next."
+
+## Primary Energy Reference
+
+Baseline flow estimates and strategic context should be checked against the EIA's [World Oil Transit Chokepoints](https://www.eia.gov/international/content/analysis/special_topics/World_Oil_Transit_Chokepoints/) analysis. Live risk scores add warning context but do not override the source agency's published methodology.
 
 ## Frequently Asked Questions
 

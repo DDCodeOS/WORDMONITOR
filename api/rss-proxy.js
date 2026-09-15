@@ -3,6 +3,7 @@ import { validateApiKey } from './_api-key.js';
 import { checkRateLimit } from './_rate-limit.js';
 import { getRelayBaseUrl, getRelayHeaders, fetchWithTimeout } from './_relay.js';
 import { isAllowedDomain, hostMatchForms } from './_rss-allowed-domain-match.js';
+import { RSS_BROWSER_UA, rssFetchHeadersForHost } from './_rss-fetch-headers.js';
 import { jsonResponse } from './_json-response.js';
 import { captureSilentError } from './_sentry-edge.js';
 
@@ -30,11 +31,8 @@ const RELAY_ONLY_DOMAINS = new Set([
   'www.atlanticcouncil.org',
 ]);
 
-const DIRECT_FETCH_HEADERS = Object.freeze({
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Accept': 'application/rss+xml, application/xml, text/xml, */*',
-  'Accept-Language': 'en-US,en;q=0.9',
-});
+// Browser UA for upstream RSS: see api/_rss-fetch-headers.js (#6624).
+const DIRECT_FETCH_HEADERS = rssFetchHeadersForHost('');
 const DIRECT_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const MAX_DIRECT_REDIRECTS = 3;
 
@@ -152,7 +150,7 @@ export default async function handler(req, ctx) {
 
       for (let redirectCount = 0; redirectCount <= MAX_DIRECT_REDIRECTS; redirectCount += 1) {
         const response = await fetchWithTimeout(currentUrl.href, {
-          headers: DIRECT_FETCH_HEADERS,
+          headers: rssFetchHeadersForHost(currentUrl.hostname),
           redirect: 'manual',
         }, timeout);
 
@@ -188,34 +186,64 @@ export default async function handler(req, ctx) {
         response = await fetchDirect();
       } catch (directError) {
         if (directError instanceof RssProxyPolicyError) throw directError;
-        response = await fetchViaRailway(feedUrl, timeout);
+        // A throwing relay leg here must not replace directError — a null or
+        // non-ok relay response already falls through to it below, so a thrown
+        // relay error should too, rather than becoming the reported failure.
+        let relayResponse = null;
+        try {
+          relayResponse = await fetchViaRailway(feedUrl, timeout);
+        } catch (relayError) {
+          console.error('RSS proxy relay fallback error:', feedUrl, relayError instanceof Error ? relayError.message : String(relayError));
+        }
+        response = relayResponse;
         usedRelay = !!response;
         if (!response) throw directError;
       }
 
       if (!response.ok && !usedRelay) {
-        const relayResponse = await fetchViaRailway(feedUrl, timeout);
+        // Same reasoning: a throwing relay retry must not discard the original
+        // non-ok direct response — fall through to it exactly as a null or
+        // non-ok relay response already would.
+        let relayResponse = null;
+        try {
+          relayResponse = await fetchViaRailway(feedUrl, timeout);
+        } catch (relayError) {
+          console.error('RSS proxy relay retry error:', feedUrl, relayError instanceof Error ? relayError.message : String(relayError));
+          // Skip Sentry on timeout, exactly as the outer catch does for the
+          // direct leg. fetchViaRailway aborts on the same feed timeout budget,
+          // and this retry is a best-effort SECOND attempt whose failure the
+          // caller never sees — the original non-ok direct response is returned
+          // either way. Capturing it reported routine upstream latency at error
+          // level (WORLDMONITOR-11G); #7438 made the same call for
+          // api/telegram-feed.js. Real relay failures still report.
+          if (relayError?.name !== 'AbortError') {
+            captureSilentError(relayError, { tags: { route: 'api/rss-proxy', step: 'relay-retry', feed: feedUrl }, ctx });
+          }
+        }
         if (relayResponse?.ok) {
           response = relayResponse;
+          usedRelay = true;
         }
       }
     }
 
     const data = await response.text();
-    const isSuccess = response.status >= 200 && response.status < 300;
-    // Relay-only feeds are slow-updating institutional sources — cache longer
-    const cdnTtl = isRelayOnly ? 3600 : 900;
-    const swr = isRelayOnly ? 7200 : 1800;
-    const sie = isRelayOnly ? 14400 : 3600;
-    const browserTtl = isRelayOnly ? 600 : 180;
+    const relayCacheState = usedRelay ? response.headers.get('x-cache') : null;
+    const relayStaleMarker = usedRelay ? response.headers.get('x-relay-stale') : null;
     return new Response(data, {
       status: response.status,
       headers: {
-        'Content-Type': response.headers.get('content-type') || 'application/xml',
-        'Cache-Control': isSuccess
-          ? `public, max-age=${browserTtl}, s-maxage=${cdnTtl}, stale-while-revalidate=${swr}, stale-if-error=${sie}`
-          : 'public, max-age=15, s-maxage=60, stale-while-revalidate=120',
-        ...(isSuccess && { 'CDN-Cache-Control': `public, s-maxage=${cdnTtl}, stale-while-revalidate=${swr}, stale-if-error=${sie}` }),
+        // Consumers parse response.text() as feed XML. Never let an upstream
+        // MIME type or active XML turn this same-origin URL into a document.
+        'Content-Type': 'text/plain; charset=utf-8',
+        'X-Content-Type-Options': 'nosniff',
+        'Content-Security-Policy': "sandbox; default-src 'none'",
+        // validateApiKey() gates every GET. Shared caches do not key on the
+        // credential header, so this must not be public / s-maxage / CDN-cached.
+        // `private` keeps CDNs out; max-age lets the SPA feedCache persist.
+        'Cache-Control': 'private, max-age=180',
+        ...(relayCacheState && { 'X-Cache': relayCacheState }),
+        ...(relayStaleMarker && { 'X-Relay-Stale': relayStaleMarker }),
         ...corsHeaders,
       },
     });
@@ -233,7 +261,6 @@ export default async function handler(req, ctx) {
     }
     return jsonResponse({
       error: isTimeout ? 'Feed timeout' : 'Failed to fetch feed',
-      details: error.message,
       url: feedUrl
     }, isTimeout ? 504 : 502, corsHeaders);
   }
@@ -246,4 +273,6 @@ export default async function handler(req, ctx) {
 // would 403 before the relay routing it exists for is ever consulted.
 export const __testing__ = {
   RELAY_ONLY_DOMAINS,
+  RSS_BROWSER_UA,
+  DIRECT_FETCH_HEADERS,
 };

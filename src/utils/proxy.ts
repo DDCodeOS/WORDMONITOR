@@ -3,6 +3,8 @@ import { getPersistentCache, setPersistentCache } from '../services/persistent-c
 
 const isDev = import.meta.env.DEV;
 const RESPONSE_CACHE_PREFIX = 'api-response:';
+const DEFAULT_PERSISTED_RESPONSE_MAX_AGE_MS = 5 * 60 * 1000;
+const PERSISTED_RESPONSE_MAX_AGE_CAP_MS = 15 * 60 * 1000;
 
 // RSS proxy: route directly to Railway relay via Cloudflare CDN when enabled.
 // Feature flag controls rollout; default off for safe staged deployment.
@@ -47,6 +49,14 @@ type CachedResponsePayload = {
   body: string;
 };
 
+export function hasNoStoreCacheDirective(headers: HeadersInit): boolean {
+  const cacheControl = new Headers(headers).get('cache-control');
+  return cacheControl?.split(',').some((directive) => {
+    const name = directive.trim().split('=', 1)[0]?.trim().toLowerCase();
+    return name === 'no-store';
+  }) ?? false;
+}
+
 // In production browser deployments, routes are handled by Vercel serverless functions.
 // In local dev, Vite proxy handles these routes.
 // In Tauri desktop mode, route requests need an absolute remote host.
@@ -64,6 +74,23 @@ export function proxyUrl(localPath: string): string {
 
 function shouldPersistResponse(url: string): boolean {
   return url.startsWith('/api/');
+}
+
+function requestPathname(url: string): string {
+  if (url.startsWith('/')) return url.split('?')[0] ?? url;
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return '';
+  }
+}
+
+// /api/fwdstart is a public wildcard-CORS feed. The session interceptor
+// defaults credentials to 'include'; browsers then reject ACAO: *.
+function proxyFetchInit(url: string, init: RequestInit = {}): RequestInit {
+  return requestPathname(url) === '/api/fwdstart'
+    ? { ...init, credentials: 'omit' }
+    : init;
 }
 
 function buildResponseCacheKey(url: string): string {
@@ -93,9 +120,41 @@ function toResponse(payload: CachedResponsePayload): Response {
   });
 }
 
-async function fetchAndPersist(url: string): Promise<Response> {
-  const response = await fetch(proxyUrl(url));
-  if (response.ok && shouldPersistResponse(url)) {
+function persistedResponseMaxAgeMs(payload: CachedResponsePayload): number {
+  const cacheControl = new Headers(payload.headers).get('cache-control');
+  const maxAgeMatch = cacheControl?.match(/(?:^|,)\s*max-age\s*=\s*"?(\d+)"?/i);
+  if (!maxAgeMatch?.[1]) return DEFAULT_PERSISTED_RESPONSE_MAX_AGE_MS;
+
+  const maxAgeSeconds = Number(maxAgeMatch[1]);
+  if (!Number.isFinite(maxAgeSeconds)) {
+    return DEFAULT_PERSISTED_RESPONSE_MAX_AGE_MS;
+  }
+  // Persisted responses hydrate reloads; they must not turn an upstream's long browser TTL
+  // into an equally long period where old news is presented as a successful live fetch.
+  return Math.min(maxAgeSeconds * 1000, PERSISTED_RESPONSE_MAX_AGE_CAP_MS);
+}
+
+function isPersistedResponseFresh(
+  cached: { updatedAt: number; data: CachedResponsePayload },
+  now = Date.now(),
+): boolean {
+  if (hasNoStoreCacheDirective(cached.data.headers)) return false;
+  const ageMs = now - cached.updatedAt;
+  return Number.isFinite(ageMs)
+    && ageMs >= 0
+    && ageMs < persistedResponseMaxAgeMs(cached.data);
+}
+
+function throwIfAborted(signal?: AbortSignal | null): void {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw new DOMException('The operation was aborted.', 'AbortError');
+}
+
+async function fetchAndPersist(url: string, init: RequestInit = {}): Promise<Response> {
+  const response = await fetch(proxyUrl(url), proxyFetchInit(url, { ...init, cache: 'no-store' }));
+  throwIfAborted(init.signal);
+  if (response.ok && shouldPersistResponse(url) && !hasNoStoreCacheDirective(response.headers)) {
     try {
       const body = await response.clone().text();
       void setPersistentCache(buildResponseCacheKey(url), toCachedPayload(url, response, body));
@@ -106,20 +165,22 @@ async function fetchAndPersist(url: string): Promise<Response> {
   return response;
 }
 
-export async function fetchWithProxy(url: string): Promise<Response> {
+export async function fetchWithProxy(url: string, init: RequestInit = {}): Promise<Response> {
+  throwIfAborted(init.signal);
   if (!shouldPersistResponse(url)) {
-    return fetch(proxyUrl(url));
+    return fetch(proxyUrl(url), proxyFetchInit(url, init));
   }
 
   const cacheKey = buildResponseCacheKey(url);
   const cached = await getPersistentCache<CachedResponsePayload>(cacheKey);
+  throwIfAborted(init.signal);
 
-  if (cached?.data) {
+  if (cached?.data && isPersistedResponseFresh(cached)) {
     void fetchAndPersist(url).catch((error) => {
       console.warn('[proxy] Background refresh failed for cached API response', error);
     });
     return toResponse(cached.data);
   }
 
-  return fetchAndPersist(url);
+  return fetchAndPersist(url, init);
 }

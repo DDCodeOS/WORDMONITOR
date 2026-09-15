@@ -105,14 +105,18 @@ export function safeHtml(html: string): DocumentFragment {
   const tpl = document.createElement('template');
   tpl.innerHTML = html;
   const walk = (parent: Element | DocumentFragment) => {
-    const children = Array.from(parent.childNodes);
-    for (const node of children) {
+    let index = 0;
+    while (index < parent.childNodes.length) {
+      const node = parent.childNodes[index];
+      if (!node) break;
       if (node.nodeType === Node.ELEMENT_NODE) {
         const el = node as Element;
         if (!SAFE_TAGS.has(el.tagName.toLowerCase())) {
           // Unwrap: keep children, remove the element itself
           while (el.firstChild) parent.insertBefore(el.firstChild, el);
           parent.removeChild(el);
+          // Promoted children now occupy this index. Visit them before moving
+          // on so nested rejected wrappers cannot hide unsafe descendants.
           continue;
         }
         // Strip unsafe attributes
@@ -143,6 +147,7 @@ export function safeHtml(html: string): DocumentFragment {
         }
         walk(el);
       }
+      index += 1;
     }
   };
   walk(tpl.content);
@@ -192,4 +197,26 @@ function appendChildren(
       parent.appendChild(document.createTextNode(String(child)));
     }
   }
+}
+
+/**
+ * Focusable elements within a modal/overlay root, for focus-trap Tab cycling.
+ * Filters out disabled, hidden, aria-hidden, and undisplayed (offsetParent-less)
+ * matches so the trap never focuses something the user can't see.
+ *
+ * Form controls are included: a dialog that traps Tab must be able to reach its
+ * own inputs, so this is the single definition every trap shares.
+ */
+export function getFocusableElements(root: ParentNode): HTMLElement[] {
+  return Array.from(
+    root.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    ),
+  ).filter(
+    (el) =>
+      !el.hasAttribute('disabled') &&
+      !el.hasAttribute('hidden') &&
+      el.getAttribute('aria-hidden') !== 'true' &&
+      el.offsetParent !== null,
+  );
 }

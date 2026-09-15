@@ -32,7 +32,7 @@ Two event types in dataset `wm_api_usage`:
 | `method`, `status` | `"GET"`, `200`                            |                                              |
 | `duration_ms`      | `412`                                     | wall-clock at the gateway                    |
 | `req_bytes`, `res_bytes` |                                     | response counted only on 200/304 GET         |
-| `customer_id`      | Clerk user ID, org ID, enterprise slug, or widget key | `null` only for anon                |
+| `customer_id`      | Clerk user ID, org ID, enterprise slug, or static `widget` label | `null` only for anon                |
 | `principal_id`     | user ID or **hash** of API/widget key     | never the raw secret                         |
 | `auth_kind`        | `clerk_jwt` \| `user_api_key` \| `enterprise_api_key` \| `widget_key` \| `anon` | |
 | `tier`             | `0` free / `1` pro / `2` api / `3` enterprise | `0` if unknown                          |
@@ -45,7 +45,7 @@ Two event types in dataset `wm_api_usage`:
 | `origin_kind`      | `api-key` \| `oauth` \| `browser-same-origin` \| `browser-cross-origin` \| `null` | derived from headers by `deriveOriginKind()` — `mcp` and `internal-cron` exist in the `OriginKind` type for upstream/future use but are not currently emitted on the request path |
 | `ua_hash`          | SHA-256 of the UA                         | hashed so PII doesn't land in Axiom          |
 | `sentry_trace_id`  | `"abc123…"`                               | join key into Sentry                         |
-| `reason`           | `ok` \| `origin_403` \| `rate_limit_429` \| `preflight` \| `auth_401` \| `auth_403` \| `tier_403` | `auth_*` distinguishes auth-rejection paths from genuine successes when filtering on `status` alone is ambiguous |
+| `reason`           | `ok` \| `origin_403` \| `rate_limit_429` \| `rate_limit_429_endpoint` \| `rate_limit_429_global` \| `rate_limit_429_direct_llm` \| `rate_limit_degraded` \| `preflight` \| `auth_401` \| `auth_403` \| `tier_403` \| `hmac_secret_unconfigured` \| `internal_mcp_no_user` \| `internal_mcp_malformed_sig` \| `internal_mcp_bad_nonce` \| `internal_mcp_ts_window` \| `internal_mcp_bad_request` \| `internal_mcp_sig_mismatch` \| `internal_mcp_replay` | Scoped 429 reasons identify the rejecting limiter directly; `auth_*` distinguishes auth-rejection paths from genuine successes when filtering on `status` alone is ambiguous. `hmac_secret_unconfigured` is the 500 CONFIGURATION path when `MCP_INTERNAL_HMAC_SECRET` is unset on a signed internal-MCP request — a deploy/config incident, not caller authentication failure. The `internal_mcp_*` reasons split a signed-request rejection by which check failed: the caller still receives one indistinguishable 401 (telling a forge probe which piece failed is the oracle that path must not be), so this field is the only place the modes are separable — query it when a signed MCP call is failing and you need to tell clock skew from a real mismatch from a spent nonce. `internal_mcp_bad_nonce` means the nonce header is missing or invalid; `internal_mcp_replay` means a valid signed nonce was already used |
 
 ### `upstream` (one per outbound fetch from a request handler)
 

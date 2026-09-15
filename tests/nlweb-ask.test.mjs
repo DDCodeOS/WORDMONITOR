@@ -31,6 +31,27 @@ describe('nlweb: /ask endpoint', () => {
     );
   }
 
+  for (const contentType of ['application/json', 'application/x-www-form-urlencoded']) {
+    for (const length of [undefined, '1', '20000']) {
+      it(`rejects oversized ${contentType} streams with length ${length}`, async () => {
+        let cancelled = false;
+        const headers = { 'Content-Type': contentType };
+        if (length) headers['Content-Length'] = length;
+        const req = new Request('https://worldmonitor.app/ask', {
+          method: 'POST', headers, duplex: 'half',
+          body: new ReadableStream({
+            pull(controller) { controller.enqueue(new TextEncoder().encode('x'.repeat(17000))); },
+            cancel() { cancelled = true; },
+          }),
+        });
+        const res = await handler(req);
+        assert.equal(res.status, 413);
+        assert.equal((await res.json())._meta.response_type, 'error');
+        assert.equal(cancelled, true);
+      });
+    }
+  }
+
   it('POST {query} returns NLWeb JSON with the _meta envelope', async () => {
     const res = await post({ query: 'live shipping chokepoint status' });
     assert.equal(res.status, 200);
@@ -149,10 +170,16 @@ describe('nlweb: /ask endpoint', () => {
     const rewrite = vercelConfig.rewrites.find((r) => r.source === '/ask');
     assert.ok(rewrite, 'missing /ask rewrite');
     assert.equal(rewrite.destination, '/api/ask');
+    // #6575: the dashboard catch-all rewrite is gone — unknown paths 404.
+    // /ask keeps its explicit endpoint rewrite, which cannot be shadowed.
     const catchAll = vercelConfig.rewrites.find(
       (r) => r.destination === '/dashboard.html' && r.source.startsWith('/((?!'),
     );
-    assert.ok(catchAll.source.includes('ask'), 'ask must be excluded from the dashboard catch-all');
+    assert.equal(catchAll, undefined, 'dashboard catch-all rewrite must stay removed (#6575)');
+    const dashboardShadow = vercelConfig.rewrites.find(
+      (r) => r.destination === '/dashboard.html' && r.source === '/ask',
+    );
+    assert.equal(dashboardShadow, undefined, '/ask must not be rewritten to the dashboard');
     const corsBlock = vercelConfig.headers.find((h) => h.source === '/ask');
     assert.ok(corsBlock, 'missing /ask headers block');
   });

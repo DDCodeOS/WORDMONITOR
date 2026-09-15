@@ -1,6 +1,9 @@
 import type { AppContext, AppModule } from '@/app/app-context';
+import { CORRELATION_DOMAINS } from '@/types/correlation';
+import type { CorrelationPanel } from '@/components/CorrelationPanel';
 import { normalizeExclusiveChoropleths } from '@/components/resilience-choropleth-utils';
 import { replayPendingCalls, clearAllPendingCalls } from '@/app/pending-panel-data';
+import { hasPanelSettingEntry, newsPanelKeyForCategory, newsPanelKeyLookupsFor } from '@/app/news-panel-keys';
 import {
   createDeferredPanelShell,
   getDeferredPanelShellFootprint as resolveDeferredPanelShellFootprint,
@@ -8,6 +11,11 @@ import {
   shouldDeferInitialPanelMount,
   type DeferredPanelShellFootprint,
 } from '@/app/panel-mount-deferral';
+import {
+  SPLIT_LAYOUT_MIN_WIDTH,
+  mapRightClassForVisualSide,
+  type MapVisualSide,
+} from '@/app/split-layout';
 import {
   addResponsiveZoneListener,
   removeResponsiveZoneListener,
@@ -24,9 +32,7 @@ import { MobilePanelNav } from '@/components/MobilePanelNav';
 import { debounce, loadFromStorage, saveToStorage } from '@/utils';
 import { escapeHtml } from '@/utils/sanitize';
 import {
-  FEEDS,
   CANONICAL_FEEDS,
-  INTEL_SOURCES,
   STORAGE_KEYS,
   SITE_VARIANT,
   ALL_PANELS,
@@ -36,40 +42,103 @@ import {
   isPanelEntitled,
   enforceFreePanelLimit,
 } from '@/config';
-import { resolveNewsCategories, enabledNewsCategoryKeys } from '@/config/feed-resolution';
 import { BETA_MODE } from '@/config/beta';
+import { NQ_PULSE_DISCLOSURE } from '@/config/nq-context';
 import { t } from '@/services/i18n';
 import { getCurrentTheme } from '@/utils';
-import { trackCriticalBannerAction, trackCheckoutSuccess, trackCheckoutFailed, replayPendingCheckoutSuccess, replayPendingProFunnelEvents } from '@/services/analytics';
+import { trackCriticalBannerAction, trackCheckoutSuccess, trackCheckoutFailed, trackGateHit, trackMapViewChange, replayPendingCheckoutSuccess, replayPendingProFunnelEvents, replayPendingConversionEvents, replayPendingMissionReturn } from '@/services/analytics';
+import { ProPreviewSection } from '@/components/ProPreviewSection';
+import { syncPanelPreview } from '@/services/mission-preview-registry';
+import { loadStoredMissionPreset } from '@/services/mission-presets';
+import { peekPendingMissionAttribution } from '@/services/analytics';
 import { getStoredMapModePreference } from '@/services/map-mode-preference';
-import { loadWidgets, saveWidget, isProUser } from '@/services/widget-store';
+import { loadWidgets, saveWidget, isProUser, isProTierResolved } from '@/services/widget-store';
+import { sanitizeLockedLayers, shouldSanitizeLockedLayers } from '@/config/map-layer-definitions';
 import type { CustomWidgetSpec } from '@/services/widget-store';
-import { initEntitlementSubscription, destroyEntitlementSubscription, isEntitled, hasTier, getEntitlementState, onEntitlementChange, shouldReloadOnEntitlementChange } from '@/services/entitlements';
-import { initSubscriptionWatch, destroySubscriptionWatch } from '@/services/billing';
+import {
+  panelGateStateChanged,
+  sweepLegacyDisabledCustomWidgets,
+} from '@/app/free-tier-gate';
+import { initEntitlementSubscription, destroyEntitlementSubscription, isEntitlementActive, hasTier, getEntitlementState, onEntitlementChange } from '@/services/entitlements';
+import { createEntitlementReloadController } from '@/services/entitlement-reload-controller';
+import { initSubscriptionWatch, destroySubscriptionWatch, onSubscriptionChange } from '@/services/billing';
 import { initPaymentFailureBanner } from '@/components/payment-failure-banner';
-import { handleCheckoutReturn } from '@/services/checkout-return';
-import { registerCheckoutSuccessCallback, destroyCheckoutOverlay, showCheckoutSuccess, consumePostCheckoutFlag, clearCheckoutAttempt } from '@/services/checkout';
+import {
+  handleCheckoutReturn,
+  resolveCheckoutReturnRouting,
+} from '@/services/checkout-return';
+import { registerCheckoutSuccessCallback, destroyCheckoutOverlay, showCheckoutSuccess, consumePostCheckoutFlag, clearCheckoutAttempt, loadCheckoutAttempt } from '@/services/checkout';
+import {
+  markProActivationPending,
+  ProActivationController,
+} from '@/app/pro-activation-controller';
+import { PasskeyOfferBoot } from '@/app/passkey-offer-boot';
 import { showCheckoutFailureBanner } from '@/components/checkout-failure-banner';
-import { PanelTabBar } from '@/components/PanelTabBar';
+import { PanelTabBar, tabCapGateCopy } from '@/components/PanelTabBar';
 import {
   loadTabsState,
   saveTabsState,
   generateTabId,
   buildDefaultTabPanels,
 } from '@/services/tab-store';
-import type { PanelTab, TabsState } from '@/services/tab-store';
+import type { PanelTab, TabsPersistReceipt, TabsState } from '@/services/tab-store';
+import {
+  DASHBOARD_TAB_UNAVAILABLE_RESULT,
+  applyPersistReceipt,
+  describeDashboardTabs,
+  mutationApplied,
+  mutationDenied,
+  resolveCreateDashboardTab,
+  resolveDeleteDashboardTab,
+  resolveRenameDashboardTab,
+  resolveSelectDashboardTab,
+  type DashboardTabAction,
+  type DashboardTabActionResult,
+} from '@/services/dashboard-tab-actions';
+import {
+  PANEL_LAYOUT_PERSIST_FAILED_MESSAGE,
+  PANEL_LAYOUT_UNAVAILABLE_RESULT,
+  applyLayoutPersistReceipt,
+  describePanelLayout,
+  mutationApplied as layoutMutationApplied,
+  mutationDenied as layoutMutationDenied,
+  applyExclusiveFullscreenEnter,
+  resolveMovePanel,
+  resolveSetPanelCollapsed,
+  resolveSetPanelFullscreen,
+  type PanelLayoutEntry,
+  type PanelLayoutMutationResult,
+  type PanelLayoutRegion,
+  type PanelLayoutSnapshot,
+} from '@/services/panel-layout-actions';
 import { showToast } from '@/utils';
 import { loadMcpPanels, saveMcpPanel } from '@/services/mcp-store';
 import type { McpPanelSpec } from '@/services/mcp-store';
 import { getAuthState, subscribeAuthState } from '@/services/auth-state';
 import type { AuthSession } from '@/services/auth-state';
-import { PanelGateReason, getPanelGateReason, hasPremiumAccess } from '@/services/panel-gating';
+import { PanelGateReason, getPanelGateReason, hasPremiumAccess, resolveBillingAwareGateReason, resolveGateAction } from '@/services/panel-gating';
+import { evaluateTabCap, exportLockToGateReason } from '@/services/gates/export';
+import { primeExportGateActivation } from '@/services/gates/export-resolver';
+import type { TabCapVerdict } from '@/services/gates/export-resolver';
 import { markLcpDebug } from '@/utils/lcp-debug';
 import type { Panel } from '@/components/Panel';
 import type { SupplyChainPanel } from '@/components/SupplyChainPanel';
 import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
 import { loadPanelCollapsed, loadPanelColSpans, loadPanelSpans } from '@/utils/panel-storage';
 import { measure, mutate } from '@/utils/layout-batch';
+import { applyPanelFontScale } from '@/services/font-scale-settings';
+import {
+  hydrateGeoHubPanelFromClusters,
+  hydrateTechHubPanelFromClusters,
+} from '@/app/hub-activity-hydration';
+import { movePanelToKeyboardZone } from '@/app/panel-keyboard-reorder';
+import { isCatalogPanelLive, waitUntilPanelLive } from '@/app/panel-enablement';
+import {
+  armCheckoutReturnState,
+  loadCheckoutReturnState,
+  settleCheckoutReturnFocus,
+} from '@/services/checkout-return-state';
+import { resolveCheckoutContext, type CheckoutContext } from '../../shared/checkout-attribution';
 
 function readSessionStorageValue(key: string): string | null {
   try {
@@ -135,7 +204,53 @@ const WEB_CLERK_PRO_ONLY_PANELS = new Set([
   'latest-brief',
 ]);
 
-const COLLIDING_NEWS_PANEL_KEYS = new Set(['markets', 'crypto', 'economic']);
+/**
+ * Panel keys a dedicated panel owns but registers for AFTER the CANONICAL_FEEDS
+ * NewsPanel pass — the one thing that pass cannot derive for itself.
+ *
+ * Everything else it needs is live by the time it runs: `ctx.panels` and
+ * `lazyPanelRegistrations` already hold every panel registered above it, which is
+ * what lets the news/data key collision be derived instead of enumerated (#5871).
+ * A registration BELOW it is invisible to both.
+ *
+ * `live-news` is the only one. CANONICAL_FEEDS['live-news'] exists to seed the
+ * energy variant's headline sources, not to render a panel; the key belongs to
+ * LiveNewsPanel (24/7 video), registered near the end of createPanels(). Letting
+ * the pass claim it registers a generic NewsPanel first, and lazyPanel()'s dedup
+ * guard then blocks the real video panel — regression #4382, which shipped
+ * "LIVE NEWS / No items in the last 7 days" to the live dashboard. Declaring it
+ * claimed remaps it to `live-news-news`, which has no settings entry, so no panel
+ * is created on any variant. Guarded by tests/live-news-panel-guard.test.mts, and
+ * tests/news-panel-key-reachability.test.mts fails if a SECOND feed-category panel
+ * ever moves below the pass without being listed here.
+ */
+const LATE_REGISTERED_PANEL_KEYS = new Set(['live-news']);
+const CW_PRO_GATE_TAB_RECOVERY_KEY = 'worldmonitor-cw-pro-gate-tab-recovery-v1';
+
+const DASHBOARD_REFERENCE_LINKS = [
+  { label: 'Countries', path: '/countries/' },
+  { label: 'Chokepoints', path: '/chokepoints/' },
+  { label: 'Crises', path: '/crises/' },
+  { label: 'Tools', path: '/tools/' },
+  { label: 'Accuracy', path: '/accuracy/' },
+] as const;
+
+export const VARIANT_SWITCHER_DASHBOARD_URLS = {
+  full: 'https://www.worldmonitor.app/dashboard',
+  tech: 'https://tech.worldmonitor.app/dashboard',
+  finance: 'https://finance.worldmonitor.app/dashboard',
+  commodity: 'https://commodity.worldmonitor.app/dashboard',
+  energy: 'https://energy.worldmonitor.app/dashboard',
+  happy: 'https://happy.worldmonitor.app/dashboard',
+} as const;
+
+export function variantSwitcherHref(
+  targetVariant: keyof typeof VARIANT_SWITCHER_DASHBOARD_URLS,
+  currentVariant: string,
+  isLocal: boolean,
+): string {
+  return isLocal || currentVariant === targetVariant ? '#' : VARIANT_SWITCHER_DASHBOARD_URLS[targetVariant];
+}
 
 // TEMPORARY MIRROR of each panel constructor's footprint (`defaultRowSpan` /
 // `className: 'panel-wide'`, declared in src/components/*Panel.ts). A deferred
@@ -151,6 +266,8 @@ const COLLIDING_NEWS_PANEL_KEYS = new Set(['markets', 'crypto', 'economic']);
 export const DEFERRED_PANEL_NATURAL_FOOTPRINTS: Readonly<Record<string, DeferredPanelShellFootprint>> = {
   cii: { rowSpan: 2 },
   'chat-analyst': { rowSpan: 2 },
+  'china-corridors': { rowSpan: 2, className: 'panel-wide' },
+  'china-activity-nowcast': { rowSpan: 2, className: 'panel-wide' },
   'consumer-prices': { rowSpan: 2 },
   displacement: { rowSpan: 2 },
   economic: { rowSpan: 2 },
@@ -159,10 +276,12 @@ export const DEFERRED_PANEL_NATURAL_FOOTPRINTS: Readonly<Record<string, Deferred
   'energy-crisis': { rowSpan: 2 },
   'energy-disruptions': { rowSpan: 2 },
   'fuel-shortages': { rowSpan: 2 },
+  fx: { rowSpan: 2 },
   'gdelt-intel': { rowSpan: 2 },
   'internet-disruptions': { rowSpan: 2 },
   'live-news': { className: 'panel-wide' },
   'live-webcams': { className: 'panel-wide' },
+  'news-market-correlation': { rowSpan: 2, className: 'panel-wide' },
   'oil-inventories': { rowSpan: 2 },
   'pipeline-status': { rowSpan: 2 },
   'sanctions-pressure': { rowSpan: 2 },
@@ -171,6 +290,7 @@ export const DEFERRED_PANEL_NATURAL_FOOTPRINTS: Readonly<Record<string, Deferred
   'strategic-posture': { rowSpan: 2 },
   'supply-chain': { rowSpan: 2 },
   'telegram-intel': { rowSpan: 2 },
+  'x-intel': { rowSpan: 2 },
   'threat-timeline': { rowSpan: 2 },
   'trade-policy': { rowSpan: 2 },
   'ucdp-events': { rowSpan: 2 },
@@ -297,10 +417,13 @@ function warnOnBootShellFootprintDrift(snapshot: BootShellFootprintSnapshot): vo
 export interface PanelLayoutManagerCallbacks {
   openCountryStory: (code: string, name: string) => void;
   openCountryBrief: (code: string) => void;
+  openSearch: () => void;
   loadAllData: (forceAll?: boolean) => Promise<void>;
+  primeVisiblePanelData: () => void;
   updateMonitorResults: () => void;
   loadSecurityAdvisories?: () => Promise<void>;
   applyMapLayerChange?: (layer: keyof MapLayers, enabled: boolean, source: 'programmatic') => void;
+  isFreeTierFallbackActive?: () => boolean;
 }
 
 interface DeferredPanelMount {
@@ -347,10 +470,14 @@ export class PanelLayoutManager implements AppModule {
   private proBlockEntitlementUnsubscribe: (() => void) | null = null;
   private boundWidgetCreatorHandler: ((e: Event) => void) | null = null;
   private unsubscribeEntitlementChange: (() => void) | null = null;
+  private unsubscribeSubscriptionChange: (() => void) | null = null;
   private unsubscribePaymentFailureBanner: (() => void) | null = null;
   private scheduledLoadAllRaf: number | null = null;
   private scheduledLoadAllIdle: number | null = null;
   private responsiveZoneListener: ResponsiveZoneListener | null = null;
+  private readonly proActivationController: ProActivationController;
+  private readonly passkeyOfferController: PasskeyOfferBoot;
+  private readonly checkoutReturnFocusController = new AbortController();
 
   constructor(ctx: AppContext, callbacks: PanelLayoutManagerCallbacks) {
     this.ctx = ctx;
@@ -364,22 +491,77 @@ export class PanelLayoutManager implements AppModule {
     // entitlement updates after purchasing (P1: newly upgraded users must
     // see their premium access without a manual page reload).
     //
-    // Two return paths need to seed the transition detector as post-checkout:
+    // Two account-bound return paths need to seed the transition detector as
+    // post-checkout:
     //   1. Full-page Dodo redirect — handleCheckoutReturn() reads
     //      subscription_id/status URL params and cleans them.
     //   2. Dodo overlay success — setTimeout(reload) with no URL params;
     //      we stash a session flag before the reload and consume it here.
     const returnResult = handleCheckoutReturn();
-    const returnedFromOverlay = consumePostCheckoutFlag();
-    const returnedFromCheckout = returnResult.kind === 'success' || returnedFromOverlay;
+    const returnedFromOverlayFlag = consumePostCheckoutFlag();
+    const routing = resolveCheckoutReturnRouting(returnResult, returnedFromOverlayFlag);
+    const returnedFromDesktopBrowser = routing.kind === 'desktop';
+    const returnedFromCheckout = routing.kind !== 'none';
+    const returnedFromAccountCheckout = routing.kind === 'overlay' || routing.kind === 'account';
+    this.proActivationController = new ProActivationController(ctx, {
+      reloadPending: returnedFromAccountCheckout,
+      openAiAnalyst: () => this.revealAnalystPanel(),
+      openSearch: callbacks.openSearch,
+    });
+    // Boot shim only — the controller, prompt, and passkey services load on
+    // demand, keeping ~12 KB out of the first-paint chunk (see #7353 follow-up).
+    this.passkeyOfferController = new PasskeyOfferBoot(ctx);
     if (returnedFromCheckout) {
+      const attempt = loadCheckoutAttempt();
+      const pendingAttribution = peekPendingMissionAttribution();
+      const checkoutContext: CheckoutContext | null = attempt?.context ?? (
+        pendingAttribution
+          ? resolveCheckoutContext({
+            surface: pendingAttribution.surface,
+            attribution: pendingAttribution.panelKey
+              ? { missionId: pendingAttribution.missionId, panelKey: pendingAttribution.panelKey }
+              : undefined,
+            ambientMissionId: pendingAttribution.missionId,
+          })
+          : null
+      );
+      if (checkoutContext) {
+        armCheckoutReturnState(
+          checkoutContext,
+          returnedFromDesktopBrowser
+            ? 'desktop-return'
+            : returnResult.kind === 'success'
+              ? 'url-return'
+              : 'overlay-flag',
+        );
+      }
       // Funnel (#4931): the purchase-complete signal on the client side.
       // Queued by the analytics facade until Umami loads after first paint.
       trackCheckoutSuccess(returnResult.kind === 'success' ? 'url-return' : 'overlay-flag');
-      // Full-page return cleared its URL params; belt-and-braces clear
-      // of the attempt record here catches the success path where the
-      // overlay handler never ran (direct Dodo redirect).
-      clearCheckoutAttempt('success');
+      // Mission return leg (plan U4/R1): a checkout that started from a
+      // mission preview lands the buyer back on the originating mission and
+      // panel. The stored preset re-applies itself on boot; here we finish
+      // the leg — scroll+focus the originating panel and emit the
+      // completion-side attribution event.
+      // The durable carrier is the CheckoutAttempt (still present here — the
+      // clearCheckoutAttempt('success') below runs after this branch). The
+      // pending-conversion peek is only a fallback: the collector usually
+      // confirms and clears that entry BEFORE the Dodo redirect.
+      if (returnedFromAccountCheckout) {
+        // Pro Activation Onboarding: capture the plan identity from the attempt
+        // record and write the durable pending-onboarding marker BEFORE the
+        // clear below wipes the attempt. Success branch only (the `failed`
+        // branch structurally cannot reach here). An overlay-only return may
+        // carry no attempt record → the marker omits productId and the boot
+        // hook falls back to the live entitlement snapshot for plan identity
+        // (never a write-time frozen fallback — see decideActivationMount).
+        const activationProductId = loadCheckoutAttempt()?.productId ?? null;
+        markProActivationPending(activationProductId);
+        // Full-page return cleared its URL params; belt-and-braces clear
+        // of the attempt record here catches the success path where the
+        // overlay handler never ran (direct Dodo redirect).
+        clearCheckoutAttempt('success');
+      }
       // waitForEntitlement: true keeps the banner mounted across the
       // entitlement-watcher reload (post-PR-4 the watcher is the single
       // reload source). If the user is already entitled on mount the
@@ -389,8 +571,13 @@ export class PanelLayoutManager implements AppModule {
       // app) and masked in the banner before rendering to keep the raw
       // address out of screenshots / screen-shares of the banner.
       showCheckoutSuccess({
-        waitForEntitlement: true,
-        email: getAuthState().user?.email ?? null,
+        // The desktop marker acknowledges payment in an arbitrary browser;
+        // it cannot prove that browser is signed into the purchasing Clerk
+        // account. Keep that path informational instead of waiting on (or
+        // displaying) another browser identity's entitlement.
+        waitForEntitlement: !returnedFromDesktopBrowser,
+        accountAgnostic: returnedFromDesktopBrowser,
+        email: returnedFromDesktopBrowser ? null : getAuthState().user?.email ?? null,
       });
     } else if (returnResult.kind === 'failed') {
       trackCheckoutFailed(returnResult.rawStatus);
@@ -409,6 +596,12 @@ export class PanelLayoutManager implements AppModule {
     // in the same tab — on BOTH the checkout-return and ordinary branches —
     // so this replay is unconditional (no-op when nothing is pending).
     replayPendingProFunnelEvents();
+
+    // Dashboard checkout-start / checkout-failed have the same exposure: both
+    // are followed by a navigation (the Dodo redirect) that outlives any
+    // in-page retry, so their durable markers replay here too.
+    replayPendingConversionEvents();
+    replayPendingMissionReturn();
 
     // Always register the payment-failure-banner listener — onSubscriptionChange
     // is an in-memory listener registry, doesn't open any network connection,
@@ -460,10 +653,10 @@ export class PanelLayoutManager implements AppModule {
       email: getAuthState().user?.email ?? null,
     }));
 
-    // Reload only on a free→pro transition. Legacy-pro users whose first
-    // snapshot is already pro (lastEntitled === null) must not trigger a
-    // reload loop, but a user who pays mid-session (false → true) must see
-    // their panels unlock without manual refresh.
+    // Reload at most once per account and browser tab on a free→pro
+    // transition. Legacy-pro users whose first snapshot is already pro must
+    // not reload, while a newly upgraded user gets one clean boot with every
+    // premium panel initialized against the paid entitlement.
     //
     // When we just returned from a Dodo full-page redirect checkout, seed
     // lastEntitled = false instead of null. The webhook may have already
@@ -473,30 +666,54 @@ export class PanelLayoutManager implements AppModule {
     // the user would see locked panels until a manual refresh — exactly the
     // symptom that caused the 2026-04-17/18 duplicate-subscription incident.
     //
-    // REQUIRES_SKIP_INITIAL_SNAPSHOT_BEHAVIOR — the watcher is the SOLE
-    // automatic reload source for post-checkout success (the overlay
-    // handler in checkout.ts deliberately does NOT reload). If PR #3163's
-    // fix to `skipInitialSnapshot` is ever reverted, this detector
-    // swallows the activation silently and users see locked panels for
-    // 30s until the extended-unlock timeout fires a manual-refresh CTA.
-    // Regression guard: tests/entitlement-transition.test.mts locks the
-    // "incident sequence" semantics; see mirror marker in checkout.ts.
-    let lastEntitled: boolean | null = returnedFromCheckout ? false : null;
-    this.unsubscribeEntitlementChange = onEntitlementChange(() => {
-      const entitled = isEntitled();
-      const reload = shouldReloadOnEntitlementChange(lastEntitled, entitled);
-      lastEntitled = entitled;
-      if (reload) {
-        console.log('[entitlements] Subscription activated — reloading to unlock panels');
+    // The guard is persisted and verified BEFORE navigation. If storage is
+    // blocked, we fail closed to updatePanelGating() without reloading. This
+    // prevents the customer-visible failure where each new page boot receives
+    // another transient free→pro sequence and reloads again every ~500ms.
+    //
+    // REQUIRES_SKIP_INITIAL_SNAPSHOT_BEHAVIOR — this remains the sole
+    // automatic reload source for post-checkout success (the overlay handler
+    // in checkout.ts deliberately does NOT reload). Regression guards:
+    // tests/entitlement-transition.test.mts locks the raw transition semantics;
+    // tests/entitlement-reload-controller.test.mts locks the cross-boot
+    // one-navigation invariant from the daypesta customer recording.
+    const entitlementReloadController = createEntitlementReloadController({
+      returnedFromCheckout: returnedFromAccountCheckout,
+      onSnapshot: () => this.updatePanelGating(getAuthState()),
+      reload: () => {
+        console.log('[entitlements] Subscription activated — reloading once to unlock panels');
         window.location.reload();
-        return;
+      },
+    });
+    this.unsubscribeEntitlementChange = onEntitlementChange((state) => {
+      // Desktop checkout is handed to the OS browser, so the app itself never
+      // receives the Dodo return URL. Once its Clerk-bound entitlement becomes
+      // active, retire the app-local retry/referral state here instead. This
+      // is scoped to the desktop app; an anonymous or mismatched browser must
+      // never clear its own unrelated local checkout state.
+      // Preserve null for unavailable auth-handoff snapshots: isEntitlementActive
+      // collapses null→false, which would invent a free→pro edge and re-trigger
+      // the daypesta reload loop (see createEntitlementReloadController).
+      const entitlementActive =
+        state === null ? null : isEntitlementActive(state, Date.now());
+      if (
+        this.ctx.isDesktopApp &&
+        entitlementActive === true &&
+        loadCheckoutAttempt()
+      ) {
+        clearCheckoutAttempt('success');
       }
-      // Re-run panel gating on every entitlement snapshot. hasPremiumAccess()
-      // now consults isEntitled(), so a legacy-pro user whose first snapshot
-      // is already pro (null→true — intentionally not reloaded to avoid a
-      // loop) still needs the paywall overlay lifted; likewise on WS reconnect
-      // or entitlement revocation, the lock state must follow the current
-      // snapshot synchronously rather than waiting for the next auth event.
+      entitlementReloadController.handleSnapshot(
+        entitlementActive,
+        getAuthState().user?.id ?? null,
+      );
+    });
+
+    // #4771: billing-state transitions can arrive on the SUBSCRIPTION row
+    // alone (webhook flips to on_hold, renewal verification records a
+    // verdict) with no entitlement snapshot change. Re-run gating so the
+    // billing-aware CTA copy tracks the current state, not just the banner.
+    this.unsubscribeSubscriptionChange = onSubscriptionChange(() => {
       this.updatePanelGating(getAuthState());
     });
   }
@@ -504,6 +721,7 @@ export class PanelLayoutManager implements AppModule {
   async init(): Promise<void> {
     await this.renderLayout();
     if (this.ctx.isDestroyed) return;
+    void this.reconcileCheckoutReturnFocus();
 
     // Subscribe to auth state for reactive panel gating on web
     this.unsubscribeAuth = subscribeAuthState((state) => {
@@ -525,9 +743,80 @@ export class PanelLayoutManager implements AppModule {
       })).catch((err) => console.error('[widget-chat] failed to lazy-load WidgetChatModal', err));
     }) as EventListener;
     this.ctx.container.addEventListener('wm:open-widget-creator', this.boundWidgetCreatorHandler);
+
+    // Pro Activation Onboarding: after the dashboard settles, evaluate whether
+    // a pending-onboarding marker should open the interstitial (or surface the
+    // finish-setup chip). Deferred off the boot critical path like the panel
+    // hydration scheduler above.
+    this.proActivationController.init();
+    // Passkey offer: subscribes to auth and evaluates on a genuine sign-in.
+    // Registered after the Pro controller so the activation interstitial —
+    // which is a focus trap — wins the crowded post-sign-in moment; the offer
+    // hides behind it and restores when it closes.
+    this.passkeyOfferController.init();
+  }
+
+  /**
+   * Open + scroll the WM Analyst (chat-analyst) panel into view. The panel is a
+   * lazy/deferred premium panel, so it may not be in `ctx.panels` yet at click
+   * time; scrolling to its reserved grid slot trips the mount observer, and we
+   * retry briefly until the element appears (mirrors search-manager's
+   * scrollToPanelWhenReady contract).
+   */
+  private revealAnalystPanel(attemptsLeft = 12): void {
+    if (this.ctx.isDestroyed || typeof document === 'undefined') return;
+    const key = 'chat-analyst';
+    this.ctx.panels[key]?.show();
+    const el = document.querySelector(`[data-panel="${key}"]`);
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+    if (attemptsLeft <= 0) return;
+    window.setTimeout(() => this.revealAnalystPanel(attemptsLeft - 1), 80);
+  }
+
+  private async reconcileCheckoutReturnFocus(): Promise<void> {
+    const state = loadCheckoutReturnState();
+    if (!state || state.delivery.panelFocus !== 'pending') return;
+    if (state.context.origin.kind !== 'mission-preview') return;
+
+    const panelKey = state.context.origin.panelKey;
+    const escaped = typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+      ? CSS.escape(panelKey)
+      : panelKey.replace(/["\\]/g, '\\$&');
+    document.querySelector<HTMLElement>(`[data-panel="${escaped}"]`)?.scrollIntoView({
+      block: 'start',
+      behavior: 'smooth',
+    });
+
+    try {
+      const outcome = await waitUntilPanelLive({
+        isLive: () => isCatalogPanelLive(panelKey, this.ctx.panels),
+        signal: this.checkoutReturnFocusController.signal,
+      });
+      if (outcome !== 'live' || this.ctx.isDestroyed) return;
+      const panel = this.ctx.panels[panelKey] as { getElement?: () => HTMLElement | null } | undefined;
+      const instanceElement = panel?.getElement?.();
+      const element = instanceElement?.isConnected
+        ? instanceElement
+        : document.querySelector<HTMLElement>(
+          `[data-panel="${escaped}"]:not([data-deferred-panel])`,
+        );
+      if (!element?.isConnected || element.hasAttribute('data-deferred-panel')) return;
+      element.scrollIntoView({ block: 'start', behavior: 'smooth' });
+      element.tabIndex = -1;
+      element.focus({ preventScroll: true });
+      settleCheckoutReturnFocus();
+    } catch (error) {
+      if ((error as { name?: string }).name !== 'AbortError') {
+        console.warn('[checkout] Failed to restore preview panel focus', error);
+      }
+    }
   }
 
   destroy(): void {
+    this.checkoutReturnFocusController.abort();
     clearAllPendingCalls();
     this.applyTimeRangeFilterDebounced.cancel();
     this.unsubscribeAuth?.();
@@ -606,6 +895,10 @@ export class PanelLayoutManager implements AppModule {
 
     // Destroy every registered panel exactly once, including lazy-created
     // and self-fetching panels that own subscriptions, intervals, or aborts.
+    for (const preview of this.missionPreviews.values()) {
+      preview.destroy();
+    }
+    this.missionPreviews.clear();
     for (const panel of Object.values(this.ctx.panels)) {
       destroyOnce(panel);
     }
@@ -617,6 +910,10 @@ export class PanelLayoutManager implements AppModule {
     for (const key of Object.keys(this.ctx.newsPanels)) {
       delete this.ctx.newsPanels[key];
     }
+    // lazyPanelRegistrations was cleared above, so the category→panel-key registry
+    // must reset too: a re-init re-registers from scratch and would otherwise skip
+    // recording keys it believes are already mapped.
+    this.ctx.newsCategoryPanelKeys.clear();
 
     // Clean up billing subscription watch + entitlement subscription
     destroySubscriptionWatch();
@@ -626,9 +923,16 @@ export class PanelLayoutManager implements AppModule {
     this.unsubscribeEntitlementChange?.();
     this.unsubscribeEntitlementChange = null;
 
+    // Clean up subscription-change gating listener (#4771)
+    this.unsubscribeSubscriptionChange?.();
+    this.unsubscribeSubscriptionChange = null;
+
     // Clean up payment failure banner subscription
     this.unsubscribePaymentFailureBanner?.();
     this.unsubscribePaymentFailureBanner = null;
+
+    this.proActivationController.destroy();
+    this.passkeyOfferController.destroy();
 
     // Reset checkout overlay so next layout init can register its callback
     destroyCheckoutOverlay();
@@ -639,6 +943,11 @@ export class PanelLayoutManager implements AppModule {
 
   /** Reactively update premium panel gating based on auth state. */
   private updatePanelGating(state: AuthSession): void {
+    // #4771: resolve the billing-aware refinement of FREE_TIER once per pass
+    // — the inputs (subscription/entitlement snapshots, now) are invariant
+    // across the panel loop, and a single Date.now() keeps every panel on
+    // the same verdict at a period-end boundary.
+    const billingAwareFreeTier = resolveBillingAwareGateReason(PanelGateReason.FREE_TIER);
     for (const [key, panel] of Object.entries(this.ctx.panels)) {
       const isPremium = WEB_PREMIUM_PANELS.has(key);
       let reason = getPanelGateReason(state, isPremium);
@@ -670,36 +979,37 @@ export class PanelLayoutManager implements AppModule {
         reason = state.user ? PanelGateReason.FREE_TIER : PanelGateReason.ANONYMOUS;
       }
 
+      // #4771: a FREE_TIER verdict for a customer with stale paid evidence
+      // becomes a billing-state reason (verifying renewal / update payment /
+      // resubscribe) so we never push a paying user toward duplicate checkout.
+      if (reason === PanelGateReason.FREE_TIER) reason = billingAwareFreeTier;
+
       if (reason === PanelGateReason.NONE) {
         // User has access -- unlock if previously locked
         (panel as Panel).unlockPanel();
       } else {
         // User does NOT have access -- show appropriate CTA
-        const onAction = this.getGateAction(reason);
+        const onAction = resolveGateAction(reason, {
+          openAuthModal: () => this.ctx.authModal?.open(),
+        });
         (panel as Panel).showGatedCta(reason, onAction);
       }
     }
+
+    // KTD8: the tab cap rides the SAME pass, so it re-evaluates on both
+    // subscribeAuthState and onEntitlementChange (plus onSubscriptionChange).
+    // An auth-only subscription would miss the post-checkout snapshot — the
+    // bug documented at the proBlock wiring below.
+    this.updateTabCapLock();
   }
 
-  /** Return the action callback for a given gate reason. */
-  private getGateAction(reason: PanelGateReason): () => void {
-    switch (reason) {
-      case PanelGateReason.ANONYMOUS:
-        return () => this.ctx.authModal?.open();
-      case PanelGateReason.FREE_TIER:
-        return () => window.open('https://worldmonitor.app/pro', '_blank', 'noopener,noreferrer');
-      default:
-        return () => {};
-    }
-  }
-
-  /** #5159/#5205 review: storage access can throw (blocked cookies, sandboxed
+  /** #5159/#5205/#5201: storage access can throw (blocked cookies, sandboxed
    *  iframe) and this runs BEFORE the shell installs — an uncaught throw would
    *  strand users on the boot skeleton. loadFromStorage is try/catch-guarded;
-   *  default is expanded. Wire format stays 'true'/'false' (JSON booleans),
-   *  identical to the previous String(isCollapsed) writes. */
+   *  first-time mobile visitors default to the collapsed, feed-first Today
+   *  state. Wire format stays 'true'/'false' (JSON booleans). */
   private static isMobileMapCollapsedPreferred(): boolean {
-    return loadFromStorage<boolean>('mobile-map-collapsed', false) === true;
+    return loadFromStorage<boolean>('mobile-map-collapsed', true) === true;
   }
 
   async renderLayout(): Promise<void> {
@@ -713,7 +1023,28 @@ export class PanelLayoutManager implements AppModule {
     // section's first frame instead of ~150ms later via setupMobileMapToggle
     // (which shoved #panelsGrid up 698px, field CLS ~0.62 for this cohort).
     const mapStartsCollapsed = this.ctx.isMobile && PanelLayoutManager.isMobileMapCollapsedPreferred();
+    // Render the persisted map side into the markup so a right-side map does
+    // not flash on the left before EventHandlerManager.init() runs (#6417).
+    const mapRightClassActive = (() => {
+      try {
+        const storedSide = localStorage.getItem('map-side');
+        if (storedSide !== 'left' && storedSide !== 'right') return false;
+        return mapRightClassForVisualSide(
+          storedSide as MapVisualSide,
+          document.documentElement.dir === 'rtl',
+        );
+      } catch {
+        return false;
+      }
+    })();
     const bootShellFootprint = import.meta.env.DEV ? captureBootShellFootprint(this.ctx.container) : null;
+    const referenceOrigin = this.ctx.isDesktopApp || window.location.hostname.endsWith('.worldmonitor.app')
+      ? 'https://www.worldmonitor.app'
+      : '';
+    const referenceLinksHtml = DASHBOARD_REFERENCE_LINKS.map(({ label, path }) => {
+      const href = `${referenceOrigin}${path}`;
+      return `<a href="${href}" target="_blank" rel="noopener">${label}</a>`;
+    }).join('');
 
     markLcpDebug('wm:layout:render-start');
     document.documentElement.classList.add('wm-layout-hydrated');
@@ -721,18 +1052,16 @@ export class PanelLayoutManager implements AppModule {
       ${this.ctx.isDesktopApp ? '<div class="tauri-titlebar" data-tauri-drag-region></div>' : ''}
       <a href="#main" class="skip-link">Skip to main content</a>
       <div id="proBannerSlot" class="pro-banner-slot" aria-live="polite"></div>
-      <div class="header">
+      <div class="header" role="banner">
         <div class="header-left">
-          <button class="hamburger-btn" id="hamburgerBtn" aria-label="Menu">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
-          </button>
           <div class="variant-switcher">${(() => {
         const local = this.ctx.isDesktopApp || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
         const inIframe = window.self !== window.top;
-        const vHref = (v: string, prod: string) => local || SITE_VARIANT === v ? '#' : prod;
+        const vHref = (v: keyof typeof VARIANT_SWITCHER_DASHBOARD_URLS) =>
+          variantSwitcherHref(v, SITE_VARIANT, local);
         const vTarget = (v: string) => !local && SITE_VARIANT !== v && inIframe ? 'target="_blank" rel="noopener"' : '';
         return `
-            <a href="${vHref('full', 'https://worldmonitor.app/dashboard')}"
+            <a href="${vHref('full')}"
                class="variant-option ${SITE_VARIANT === 'full' ? 'active' : ''}"
                data-variant="full"
                ${vTarget('full')}
@@ -741,7 +1070,7 @@ export class PanelLayoutManager implements AppModule {
               <span class="variant-label">${t('header.world')}</span>
             </a>
             <span class="variant-divider"></span>
-            <a href="${vHref('tech', 'https://tech.worldmonitor.app')}"
+            <a href="${vHref('tech')}"
                class="variant-option ${SITE_VARIANT === 'tech' ? 'active' : ''}"
                data-variant="tech"
                ${vTarget('tech')}
@@ -750,7 +1079,7 @@ export class PanelLayoutManager implements AppModule {
               <span class="variant-label">${t('header.tech')}</span>
             </a>
             <span class="variant-divider"></span>
-            <a href="${vHref('finance', 'https://finance.worldmonitor.app')}"
+            <a href="${vHref('finance')}"
                class="variant-option ${SITE_VARIANT === 'finance' ? 'active' : ''}"
                data-variant="finance"
                ${vTarget('finance')}
@@ -759,7 +1088,7 @@ export class PanelLayoutManager implements AppModule {
               <span class="variant-label">${t('header.finance')}</span>
             </a>
             <span class="variant-divider"></span>
-            <a href="${vHref('commodity', 'https://commodity.worldmonitor.app')}"
+            <a href="${vHref('commodity')}"
                class="variant-option ${SITE_VARIANT === 'commodity' ? 'active' : ''}"
                data-variant="commodity"
                ${vTarget('commodity')}
@@ -768,7 +1097,7 @@ export class PanelLayoutManager implements AppModule {
               <span class="variant-label">${t('header.commodity')}</span>
             </a>
             <span class="variant-divider"></span>
-            <a href="${vHref('energy', 'https://energy.worldmonitor.app')}"
+            <a href="${vHref('energy')}"
                class="variant-option ${SITE_VARIANT === 'energy' ? 'active' : ''}"
                data-variant="energy"
                ${vTarget('energy')}
@@ -777,7 +1106,7 @@ export class PanelLayoutManager implements AppModule {
               <span class="variant-label">${t('header.energy')}</span>
             </a>
             <span class="variant-divider"></span>
-            <a href="${vHref('happy', 'https://happy.worldmonitor.app')}"
+            <a href="${vHref('happy')}"
                class="variant-option ${SITE_VARIANT === 'happy' ? 'active' : ''}"
                data-variant="happy"
                ${vTarget('happy')}
@@ -791,10 +1120,10 @@ export class PanelLayoutManager implements AppModule {
             <svg class="x-logo" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
             <span class="credit-text">@eliehabib</span>
           </a>
-          <a href="https://github.com/koala73/worldmonitor" target="_blank" rel="noopener" class="github-link" title="${t('header.viewOnGitHub')}">
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+          <a href="https://github.com/koala73/worldmonitor" target="_blank" rel="noopener" class="github-link" title="${t('header.viewOnGitHub')}" aria-label="${t('header.viewOnGitHub')}">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
           </a>
-          <button class="mobile-settings-btn" id="mobileSettingsBtn" title="${t('header.settings')}">
+          <button class="mobile-settings-btn" id="mobileSettingsBtn" title="${t('header.settings')}" aria-label="${t('header.settings')}">
             <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
           </button>
           <div class="status-indicator">
@@ -822,19 +1151,25 @@ export class PanelLayoutManager implements AppModule {
           <button class="search-btn" id="searchBtn"><kbd>⌘K</kbd> ${t('header.search')}</button>
           ${this.ctx.isDesktopApp ? '' : `<button class="copy-link-btn" id="copyLinkBtn">${t('header.copyLink')}</button>`}
           ${this.ctx.isDesktopApp ? '' : `<button class="copy-link-btn embed-link-btn" id="embedLinkBtn">${t('header.embed')}</button>`}
-          ${this.ctx.isDesktopApp ? '' : `<button class="fullscreen-btn" id="fullscreenBtn" title="${t('header.fullscreen')}">⛶</button>`}
-          ${SITE_VARIANT === 'happy' ? `<button class="tv-mode-btn" id="tvModeBtn" title="TV Mode (Shift+T)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg></button>` : ''}
+          ${this.ctx.isDesktopApp ? '' : `<button class="fullscreen-btn" id="fullscreenBtn" title="${t('header.fullscreen')}" aria-label="${t('header.fullscreen')}">⛶</button>`}
+          ${SITE_VARIANT === 'happy' ? `<button class="tv-mode-btn" id="tvModeBtn" title="TV Mode (Shift+T)" aria-label="TV Mode"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg></button>` : ''}
           <span id="unifiedSettingsMount"></span>
           <span id="authWidgetMount" class="auth-widget-mount"></span>
         </div>
       </div>
       <div class="mobile-menu-overlay" id="mobileMenuOverlay"></div>
-      <nav class="mobile-menu" id="mobileMenu">
+      <nav class="mobile-menu" id="mobileMenu" aria-label="Menu">
         <div class="mobile-menu-header">
           <span class="mobile-menu-title">WORLD MONITOR</span>
           <button class="mobile-menu-close" id="mobileMenuClose" aria-label="Close menu">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
           </button>
+        </div>
+        <div class="mobile-menu-divider"></div>
+        <div class="mobile-menu-account" aria-label="Account">
+          <span class="mobile-menu-account-icon" aria-hidden="true">◯</span>
+          <div id="mobileAuthWidgetMount"></div>
+          <button class="mobile-auth-fallback" id="mobileAuthFallback" type="button">Sign In</button>
         </div>
         <div class="mobile-menu-divider"></div>
         ${(() => {
@@ -880,9 +1215,10 @@ export class PanelLayoutManager implements AppModule {
         </a>
         <div class="mobile-menu-divider"></div>
         <div class="mobile-menu-footer-links">
-          <a href="${this.ctx.isDesktopApp ? 'https://worldmonitor.app/pro' : 'https://www.worldmonitor.app/pro'}" target="_blank" rel="noopener">Pro</a>
-          <a href="${this.ctx.isDesktopApp ? 'https://worldmonitor.app/blog/' : 'https://www.worldmonitor.app/blog/'}" target="_blank" rel="noopener">Blog</a>
-          <a href="${this.ctx.isDesktopApp ? 'https://worldmonitor.app/docs' : 'https://www.worldmonitor.app/docs'}" target="_blank" rel="noopener">Docs</a>
+          ${referenceLinksHtml}
+          <a href="${referenceOrigin}/pro#pricing" target="_blank" rel="noopener">Pricing</a>
+          <a href="https://www.worldmonitor.app/blog/" target="_blank" rel="noopener">Blog</a>
+          <a href="https://www.worldmonitor.app/docs/documentation" target="_blank" rel="noopener">Docs</a>
           <a href="https://status.worldmonitor.app/" target="_blank" rel="noopener">Status</a>
         </div>
         <div class="mobile-menu-version">v${__APP_VERSION__}</div>
@@ -908,7 +1244,7 @@ export class PanelLayoutManager implements AppModule {
       ).join('')}
       </div>
       <div class="dashboard-tabs-mount" id="panelTabsMount"></div>
-      <main id="main" tabindex="-1" class="main-content${this.ctx.isDesktopApp ? ' desktop-grid' : ''}">
+      <main id="main" tabindex="-1" class="main-content${mapRightClassActive ? ' map-right' : ''}">
         <div class="map-section${mapStartsCollapsed ? ' collapsed' : ''}" id="mapSection">
           <div class="panel-header">
             <div class="panel-header-left">
@@ -920,6 +1256,9 @@ export class PanelLayoutManager implements AppModule {
                 <button class="map-dim-btn${isGlobeMode ? '' : ' active'}" data-mode="flat" title="2D Map">2D</button>
                 <button class="map-dim-btn${isGlobeMode ? ' active' : ''}" data-mode="globe" title="3D Globe">3D</button>
               </div>
+              <button class="map-pin-btn map-side-btn" id="mapSideBtn" title="Move map to the right side">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M15 3v18"/></svg>
+              </button>
               <button class="map-pin-btn" id="mapFullscreenBtn" title="Fullscreen">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
               </button>
@@ -936,9 +1275,25 @@ export class PanelLayoutManager implements AppModule {
           <div class="map-bottom-grid" id="mapBottomGrid"></div>
         </div>
         <div class="map-width-resize-handle" id="mapWidthResizeHandle"></div>
-        <div class="panels-grid" id="panelsGrid" role="tabpanel"></div>
-        <button class="search-mobile-fab" id="searchMobileFab" aria-label="Search">\u{1F50D}</button>
+        <div class="panels-grid" id="panelsGrid" role="tabpanel" aria-label="Dashboard panels"></div>
       </main>
+      <nav class="mobile-tab-bar" id="mobileTabBar" aria-label="Primary">
+        <button class="mobile-tab active" type="button" data-mobile-tab="today" aria-current="page">
+          <span class="mobile-tab-icon" aria-hidden="true">◉</span><span>Today</span>
+        </button>
+        <button class="mobile-tab" type="button" data-mobile-tab="map">
+          <span class="mobile-tab-icon" aria-hidden="true">◎</span><span>Map</span>
+        </button>
+        <button class="mobile-tab" type="button" data-mobile-tab="search">
+          <span class="mobile-tab-icon" aria-hidden="true">⌕</span><span>Search</span>
+        </button>
+        <button class="mobile-tab" type="button" data-mobile-tab="alerts">
+          <span class="mobile-tab-icon" aria-hidden="true">△</span><span>Alerts</span>
+        </button>
+        <button class="mobile-tab" type="button" data-mobile-tab="more">
+          <span class="mobile-tab-icon" aria-hidden="true">•••</span><span>More</span>
+        </button>
+      </nav>
       <footer class="site-footer">
         <div class="site-footer-brand">
           <img src="/favico/android-chrome-96x96.png" alt="" width="28" height="28" loading="lazy" decoding="async" class="site-footer-icon" />
@@ -947,10 +1302,11 @@ export class PanelLayoutManager implements AppModule {
             <span class="site-footer-sub">v${__APP_VERSION__} &middot; <a href="https://x.com/eliehabib" target="_blank" rel="noopener" class="site-footer-credit">@eliehabib</a></span>
           </div>
         </div>
-        <nav>
-          <a href="${this.ctx.isDesktopApp ? 'https://worldmonitor.app/pro' : 'https://www.worldmonitor.app/pro'}" target="_blank" rel="noopener">Pro</a>
-          <a href="${this.ctx.isDesktopApp ? 'https://worldmonitor.app/blog/' : 'https://www.worldmonitor.app/blog/'}" target="_blank" rel="noopener">Blog</a>
-          <a href="${this.ctx.isDesktopApp ? 'https://worldmonitor.app/docs' : 'https://www.worldmonitor.app/docs'}" target="_blank" rel="noopener">Docs</a>
+        <nav aria-label="World Monitor references">
+          ${referenceLinksHtml}
+          <a href="${referenceOrigin}/pro#pricing" target="_blank" rel="noopener">Pricing</a>
+          <a href="https://www.worldmonitor.app/blog/" target="_blank" rel="noopener">Blog</a>
+          <a href="https://www.worldmonitor.app/docs/documentation" target="_blank" rel="noopener">Docs</a>
           <a href="https://status.worldmonitor.app/" target="_blank" rel="noopener">Status</a>
           <a href="https://github.com/koala73/worldmonitor" target="_blank" rel="noopener">GitHub</a>
           <a href="https://discord.gg/re63kWKxaz" target="_blank" rel="noopener">Discord</a>
@@ -994,6 +1350,13 @@ export class PanelLayoutManager implements AppModule {
   // Dashboard tabs — named, persistent panel workspaces
   // ============================================
 
+  /** Dashboard workspaces always include at least one tab. */
+  public getDashboardTabCount(): number {
+    if (this.tabsState) return Math.max(1, this.tabsState.tabs.length);
+    const stored = loadTabsState();
+    return stored?.tabs.length ?? 1;
+  }
+
   private initPanelTabs(): void {
     const mount = document.getElementById('panelTabsMount');
     if (!mount) return;
@@ -1009,23 +1372,14 @@ export class PanelLayoutManager implements AppModule {
       };
       state = { activeTabId: initial.id, tabs: [initial] };
       saveTabsState(state);
-    } else {
-      // Clamp stored snapshots to the current free-tier cap so a workspace
-      // saved while Pro (or persisted before the cap existed) can't re-enable
-      // an over-cap layout when the user later switches to it. applyTabPanelState
-      // re-clamps on apply too; this keeps the persisted store self-healing.
-      const pro = isProUser();
-      let healedSnapshots = false;
-      for (const tab of state.tabs) {
-        const clamped = enforceFreePanelLimit(tab.panelSettings, pro);
-        if (this.panelSettingsEnabledStateChanged(tab.panelSettings, clamped)) {
-          healedSnapshots = true;
-        }
-        tab.panelSettings = clamped;
-      }
-      if (healedSnapshots) saveTabsState(state);
     }
     this.tabsState = state;
+    // Clamp stored snapshots to the current free-tier cap so a workspace saved
+    // while Pro (or persisted before the cap existed) can't re-enable an
+    // over-cap layout when the user later switches to it. Skips itself while
+    // the tier is unresolved; the App-owned fallback counts as a settled free
+    // answer and also re-runs this method for tabs not yet opened.
+    this.healStoredTabSnapshots();
 
     this.panelTabBar = new PanelTabBar(() => this.tabsState!, {
       onSelect: (id) => this.switchToTab(id),
@@ -1034,17 +1388,541 @@ export class PanelLayoutManager implements AppModule {
       onDelete: (id) => this.deleteTab(id),
     });
     mount.appendChild(this.panelTabBar.getElement());
+    this.updateTabCapLock();
+  }
+
+  /**
+   * Apply a WebMCP dashboard-tab action through the same persistence and
+   * panel-snapshot paths as the visible tab bar.
+   */
+  public applyWebMcpTabAction(action: DashboardTabAction): DashboardTabActionResult {
+    if (!this.tabsState) {
+      return { ...DASHBOARD_TAB_UNAVAILABLE_RESULT, actionType: action.type };
+    }
+
+    const cap = this.updateTabCapLock();
+    switch (action.type) {
+      case 'list':
+        return describeDashboardTabs(this.tabsState, cap);
+      case 'select': {
+        const resolved = resolveSelectDashboardTab(this.tabsState, action.tabId);
+        if (!resolved.ok) {
+          return mutationDenied('select', resolved.reason, resolved.message);
+        }
+        const persist = resolved.unchanged
+          ? { persisted: true }
+          : this.switchToTab(resolved.tab.id);
+        return this.tabMutationResult(
+          'select',
+          resolved.unchanged ? 'Dashboard tab already selected.' : 'Selected dashboard tab.',
+          resolved.tab,
+          resolved.unchanged,
+          persist,
+        );
+      }
+      case 'create': {
+        const resolved = resolveCreateDashboardTab(this.tabsState, cap, action.name);
+        if (!resolved.ok) {
+          if (resolved.reason === 'tab_cap') trackGateHit('dashboard-tab');
+          return mutationDenied('create', resolved.reason, resolved.message, {
+            ...(resolved.lockReason ? { lockReason: resolved.lockReason } : {}),
+            cap: cap.cap,
+            canCreate: cap.allowed,
+            tabCount: this.tabsState.tabs.length,
+          });
+        }
+        if ('alreadyExisted' in resolved) {
+          const switched = resolved.tab.id !== this.tabsState.activeTabId;
+          const persist = switched ? this.switchToTab(resolved.tab.id) : { persisted: true };
+          return this.tabMutationResult(
+            'create',
+            'Dashboard tab already exists.',
+            resolved.tab,
+            !switched,
+            { alreadyExisted: true, ...persist },
+          );
+        }
+        const created = this.createAndActivateTab(
+          resolved.name || t('dashboardTabs.newTabName'),
+        );
+        showToast(t('dashboardTabs.newTabCreated'));
+        return this.tabMutationResult(
+          'create',
+          'Created dashboard tab.',
+          created.tab,
+          false,
+          created,
+        );
+      }
+      case 'rename': {
+        const resolved = resolveRenameDashboardTab(this.tabsState, action.tabId, action.name);
+        if (!resolved.ok) {
+          return mutationDenied('rename', resolved.reason, resolved.message);
+        }
+        const persist = resolved.unchanged
+          ? { persisted: true }
+          : this.renameTab(resolved.tab.id, resolved.name);
+        const tab = this.tabsState.tabs.find((candidate) => candidate.id === resolved.tab.id)
+          ?? resolved.tab;
+        return this.tabMutationResult(
+          'rename',
+          resolved.unchanged ? 'Dashboard tab already has that name.' : 'Renamed dashboard tab.',
+          tab,
+          resolved.unchanged,
+          persist,
+        );
+      }
+      case 'delete': {
+        const resolved = resolveDeleteDashboardTab(this.tabsState, action.tabId, action.confirm);
+        if (!resolved.ok) {
+          return mutationDenied('delete', resolved.reason, resolved.message, {
+            tabCount: this.tabsState.tabs.length,
+            canCreate: cap.allowed,
+            cap: cap.cap,
+          });
+        }
+        const removedName = resolved.tab.name;
+        const persist = this.deleteTab(resolved.tab.id);
+        const nextCap = this.updateTabCapLock();
+        return applyPersistReceipt(persist, mutationApplied('delete', {
+          message: `Deleted dashboard tab "${removedName}".`,
+          tabId: resolved.tab.id,
+          name: removedName,
+          activeTabId: this.tabsState.activeTabId,
+          unchanged: false,
+          tabCount: this.tabsState.tabs.length,
+          canCreate: nextCap.allowed,
+          cap: nextCap.cap,
+        }));
+      }
+    }
+  }
+
+  /** Read the effective panel layout without inspecting the DOM from the agent. */
+  public getPanelLayoutSnapshot(): PanelLayoutSnapshot {
+    const entries = this.collectPanelLayoutEntries();
+    if (!entries) {
+      return describePanelLayout([], false);
+    }
+    return describePanelLayout(entries.panels, entries.bottomAvailable);
+  }
+
+  public applyWebMcpSetPanelCollapsed(
+    panelId: unknown,
+    collapsed: unknown,
+  ): PanelLayoutMutationResult {
+    const entries = this.collectPanelLayoutEntries();
+    if (!entries) {
+      return { ...PANEL_LAYOUT_UNAVAILABLE_RESULT, actionType: 'set_collapsed' };
+    }
+    const resolved = resolveSetPanelCollapsed(entries.panels, panelId, collapsed);
+    if (!resolved.ok) {
+      return layoutMutationDenied('set_collapsed', resolved.reason, resolved.message, {
+        panelId: resolved.panelId,
+        requestedCollapsed: collapsed === true,
+        effectiveCollapsed: false,
+        changed: false,
+      });
+    }
+    if (resolved.unchanged) {
+      return layoutMutationApplied('set_collapsed', {
+        message: resolved.requestedCollapsed ? 'Panel already collapsed.' : 'Panel already expanded.',
+        panelId: resolved.panelId,
+        requestedCollapsed: resolved.requestedCollapsed,
+        effectiveCollapsed: resolved.effectiveCollapsed,
+        changed: false,
+        unchanged: true,
+        persisted: true,
+      });
+    }
+    const panel = this.ctx.panels[resolved.panelId];
+    if (!panel?.supportsCollapse()) {
+      return layoutMutationDenied(
+        'set_collapsed',
+        'collapse_unsupported',
+        'That panel does not expose a collapse control.',
+        {
+          panelId: resolved.panelId,
+          requestedCollapsed: resolved.requestedCollapsed,
+          effectiveCollapsed: panel?.isCollapsed() === true,
+          changed: false,
+        },
+      );
+    }
+    const applied = panel.setCollapsed(resolved.requestedCollapsed);
+    if (!applied.ok && applied.persisted === false) {
+      return layoutMutationDenied(
+        'set_collapsed',
+        'persist_failed',
+        PANEL_LAYOUT_PERSIST_FAILED_MESSAGE,
+        {
+          panelId: resolved.panelId,
+          requestedCollapsed: resolved.requestedCollapsed,
+          effectiveCollapsed: panel.isCollapsed(),
+          changed: false,
+          persisted: false,
+        },
+      );
+    }
+    if (!applied.ok) {
+      return layoutMutationDenied(
+        'set_collapsed',
+        'collapse_unsupported',
+        'That panel does not expose a collapse control.',
+        {
+          panelId: resolved.panelId,
+          requestedCollapsed: resolved.requestedCollapsed,
+          effectiveCollapsed: panel.isCollapsed() === true,
+          changed: false,
+        },
+      );
+    }
+    return layoutMutationApplied('set_collapsed', {
+      message: resolved.requestedCollapsed ? 'Panel collapsed.' : 'Panel expanded.',
+      panelId: resolved.panelId,
+      requestedCollapsed: resolved.requestedCollapsed,
+      effectiveCollapsed: panel.isCollapsed(),
+      changed: true,
+      unchanged: false,
+      persisted: true,
+    });
+  }
+
+  public applyWebMcpSetPanelFullscreen(
+    panelId: unknown,
+    fullscreen: unknown,
+  ): PanelLayoutMutationResult {
+    const entries = this.collectPanelLayoutEntries();
+    if (!entries) {
+      return { ...PANEL_LAYOUT_UNAVAILABLE_RESULT, actionType: 'set_fullscreen' };
+    }
+    const resolved = resolveSetPanelFullscreen(entries.panels, panelId, fullscreen);
+    if (!resolved.ok) {
+      return layoutMutationDenied('set_fullscreen', resolved.reason, resolved.message, {
+        panelId: resolved.panelId,
+        requestedFullscreen: fullscreen === true,
+        effectiveFullscreen: false,
+        changed: false,
+      });
+    }
+    if (resolved.unchanged) {
+      return layoutMutationApplied('set_fullscreen', {
+        message: resolved.requestedFullscreen
+          ? 'Panel already fullscreen.'
+          : 'Panel already exited fullscreen.',
+        panelId: resolved.panelId,
+        requestedFullscreen: resolved.requestedFullscreen,
+        effectiveFullscreen: resolved.effectiveFullscreen,
+        changed: false,
+        unchanged: true,
+      });
+    }
+    const panel = this.ctx.panels[resolved.panelId];
+    if (!panel?.supportsFullscreen()) {
+      return layoutMutationDenied(
+        'set_fullscreen',
+        'fullscreen_unsupported',
+        'That panel does not expose a fullscreen control.',
+        {
+          panelId: resolved.panelId,
+          requestedFullscreen: resolved.requestedFullscreen,
+          effectiveFullscreen: panel?.isFullscreenActive() === true,
+          changed: false,
+        },
+      );
+    }
+    if (resolved.requestedFullscreen) {
+      const { entered } = applyExclusiveFullscreenEnter(
+        entries.panels,
+        (id) => this.ctx.panels[id],
+        resolved.panelId,
+      );
+      if (!entered) {
+        return layoutMutationDenied(
+          'set_fullscreen',
+          'fullscreen_unsupported',
+          'That panel does not expose a fullscreen control.',
+          {
+            panelId: resolved.panelId,
+            requestedFullscreen: true,
+            effectiveFullscreen: panel.isFullscreenActive(),
+            changed: false,
+          },
+        );
+      }
+    } else if (!panel.setFullscreen(false)) {
+      return layoutMutationDenied(
+        'set_fullscreen',
+        'fullscreen_unsupported',
+        'That panel does not expose a fullscreen control.',
+        {
+          panelId: resolved.panelId,
+          requestedFullscreen: false,
+          effectiveFullscreen: panel.isFullscreenActive(),
+          changed: false,
+        },
+      );
+    }
+    return layoutMutationApplied('set_fullscreen', {
+      message: resolved.requestedFullscreen ? 'Panel entered fullscreen.' : 'Panel exited fullscreen.',
+      panelId: resolved.panelId,
+      requestedFullscreen: resolved.requestedFullscreen,
+      effectiveFullscreen: panel.isFullscreenActive(),
+      changed: true,
+      unchanged: false,
+    });
+  }
+
+  public applyWebMcpMovePanel(
+    panelId: unknown,
+    region: unknown,
+    index: unknown,
+  ): PanelLayoutMutationResult {
+    const entries = this.collectPanelLayoutEntries();
+    if (!entries) {
+      return { ...PANEL_LAYOUT_UNAVAILABLE_RESULT, actionType: 'move' };
+    }
+    const resolved = resolveMovePanel({
+      panels: entries.panels,
+      panelId,
+      region,
+      index,
+      bottomAvailable: entries.bottomAvailable,
+    });
+    if (!resolved.ok) {
+      return layoutMutationDenied('move', resolved.reason, resolved.message, {
+        panelId: resolved.panelId,
+        region: resolved.region,
+        index: resolved.index,
+        changed: false,
+      });
+    }
+    if (resolved.unchanged) {
+      return layoutMutationApplied('move', {
+        message: 'Panel already at that layout position.',
+        panelId: resolved.panelId,
+        region: resolved.region,
+        index: resolved.index,
+        changed: false,
+        unchanged: true,
+        persisted: true,
+      });
+    }
+
+    const moved = this.movePanelToRegionIndex(resolved.panelId, resolved.region, resolved.index);
+    if (!moved.ok) {
+      return layoutMutationDenied('move', moved.reason, moved.message, {
+        panelId: resolved.panelId,
+        region: resolved.region,
+        index: resolved.index,
+        changed: false,
+      });
+    }
+    return applyLayoutPersistReceipt(this.savePanelOrder(), layoutMutationApplied('move', {
+      message: 'Moved panel.',
+      panelId: resolved.panelId,
+      region: resolved.region,
+      index: resolved.index,
+      changed: true,
+      unchanged: false,
+      persisted: true,
+    }));
+  }
+
+  private collectPanelLayoutEntries(): {
+    panels: PanelLayoutEntry[];
+    bottomAvailable: boolean;
+  } | null {
+    const sidebarGrid = document.getElementById('panelsGrid');
+    const bottomGrid = document.getElementById('mapBottomGrid');
+    if (!sidebarGrid || !bottomGrid) return null;
+
+    const bottomAvailable = this.getEffectiveUltraWide();
+    const panels: PanelLayoutEntry[] = [];
+
+    const collectFromGrid = (grid: HTMLElement, region: PanelLayoutRegion): void => {
+      let index = 0;
+      for (const child of Array.from(grid.children)) {
+        if (!(child instanceof HTMLElement) || !child.classList.contains('panel')) continue;
+        const id = child.dataset.panel;
+        if (!id) continue;
+        const instance = this.ctx.panels[id];
+        panels.push({
+          id,
+          region,
+          index,
+          collapsed: instance?.isCollapsed() === true
+            || child.classList.contains('panel-collapsed'),
+          fullscreen: instance?.isFullscreenActive() === true
+            || child.classList.contains('live-news-fullscreen'),
+          collapsible: instance?.supportsCollapse() === true,
+          fullscreenCapable: instance?.supportsFullscreen() === true,
+          fixed: false,
+        });
+        index += 1;
+      }
+    };
+
+    collectFromGrid(sidebarGrid, 'sidebar');
+    if (bottomAvailable) collectFromGrid(bottomGrid, 'bottom');
+    return { panels, bottomAvailable };
+  }
+
+  private movePanelToRegionIndex(
+    panelId: string,
+    region: PanelLayoutRegion,
+    index: number,
+  ): { ok: true } | { ok: false; reason: NonNullable<PanelLayoutMutationResult['reason']>; message: string } {
+    const sidebarGrid = document.getElementById('panelsGrid');
+    const bottomGrid = document.getElementById('mapBottomGrid');
+    if (!sidebarGrid || !bottomGrid) {
+      return {
+        ok: false,
+        reason: 'layout_unavailable',
+        message: 'Dashboard panel layout is not available.',
+      };
+    }
+
+    const panelEl = this.getPanelElementForOrdering(panelId);
+    if (!panelEl || !panelEl.classList.contains('panel')) {
+      return {
+        ok: false,
+        reason: 'panel_not_mounted',
+        message: 'That panel is not mounted in the current layout.',
+      };
+    }
+
+    const targetGrid = region === 'bottom' ? bottomGrid : sidebarGrid;
+    const peers = Array.from(targetGrid.children).filter(
+      (child): child is HTMLElement =>
+        child instanceof HTMLElement
+        && child.classList.contains('panel')
+        && child.dataset.panel !== panelId,
+    );
+
+    const reference = peers[index] ?? (
+      region === 'sidebar' ? sidebarGrid.querySelector('.add-panel-block') : null
+    );
+    targetGrid.insertBefore(panelEl, reference);
+
+    if (region === 'bottom') this.bottomSetMemory.add(panelId);
+    else this.bottomSetMemory.delete(panelId);
+
+    return { ok: true };
+  }
+
+  private tabMutationResult(
+    actionType: 'select' | 'create' | 'rename',
+    message: string,
+    tab: PanelTab,
+    unchanged: boolean,
+    extra: { alreadyExisted?: boolean; persisted?: boolean } = {},
+  ): DashboardTabActionResult {
+    const cap = this.updateTabCapLock();
+    const persist = { persisted: extra.persisted !== false };
+    return applyPersistReceipt(persist, mutationApplied(actionType, {
+      message,
+      tabId: tab.id,
+      name: tab.name,
+      activeTabId: this.tabsState?.activeTabId ?? tab.id,
+      unchanged,
+      ...(extra.alreadyExisted ? { alreadyExisted: true } : {}),
+      tabCount: this.tabsState?.tabs.length ?? 0,
+      canCreate: cap.allowed,
+      cap: cap.cap,
+    }));
+  }
+
+  private createAndActivateTab(name: string): { tab: PanelTab; persisted: boolean } {
+    if (!this.tabsState) {
+      throw new Error('Dashboard tabs are not available.');
+    }
+    this.snapshotActiveTab();
+    const defaults = buildDefaultTabPanels(this.ctx.panelSettings);
+    const tab: PanelTab = {
+      id: generateTabId(),
+      name,
+      // Same unresolved-tier caveat as applyTabPanelState: clamping a new tab
+      // before the entitlement is known bakes a free-tier layout into a Pro
+      // user's workspace before its ownership marker can be safely reconciled.
+      // The variant default set can also exceed FREE_MAX_PANELS.
+      panelSettings: this.isProTierResolvedOrFallback()
+        ? enforceFreePanelLimit(defaults.panelSettings, isProUser())
+        : defaults.panelSettings,
+      panelOrder: defaults.panelOrder,
+      bottomSet: [],
+    };
+    this.tabsState.tabs.push(tab);
+    this.tabsState.activeTabId = tab.id;
+    const persist = saveTabsState(this.tabsState);
+    this.applyTabPanelState(tab.panelSettings, tab.panelOrder, tab.bottomSet);
+    this.panelTabBar?.refresh();
+    this.updateTabCapLock();
+    return { tab, persisted: persist.persisted };
+  }
+
+  /**
+   * Reconcile every stored tab snapshot against the current entitlement.
+   *
+   * Persisting a free-tier clamp while the tier is still unknown is the same
+   * bug App.enforceFreeTierLimits defers around: a Pro user's custom widgets
+   * would be written out of their saved workspaces on every load. Bail out
+   * until the answer is real or the bounded free fallback fires; App calls
+   * this again from the auth and entitlement callbacks, and
+   * applyTabPanelState re-clamps on switch.
+   */
+  public healStoredTabSnapshots(): void {
+    const state = this.tabsState;
+    if (!state || !this.isProTierResolvedOrFallback()) return;
+
+    const pro = isProUser();
+    let healedSnapshots = pro ? this.restoreLegacyCustomWidgetTabs(state) : false;
+    for (const tab of state.tabs) {
+      const clamped = enforceFreePanelLimit(tab.panelSettings, pro);
+      if (this.panelSettingsEnabledStateChanged(tab.panelSettings, clamped)) {
+        healedSnapshots = true;
+      }
+      tab.panelSettings = clamped;
+    }
+    if (healedSnapshots) saveTabsState(state);
+  }
+
+  private isProTierResolvedOrFallback(): boolean {
+    return isProTierResolved() || this.callbacks.isFreeTierFallbackActive?.() === true;
+  }
+
+  /**
+   * Repair pre-`proGated` widget damage in saved tabs once per browser.
+   *
+   * App's global recovery can run before panel tabs initialize, so tabs own a
+   * separate marker. The same ambiguity applies here: markerless disabled
+   * widgets may be deliberate hides, which is why this sweep is bounded to one
+   * migration pass rather than being re-run on every entitlement refresh.
+   */
+  private restoreLegacyCustomWidgetTabs(state: TabsState): boolean {
+    try {
+      if (localStorage.getItem(CW_PRO_GATE_TAB_RECOVERY_KEY)) return false;
+
+      const ownedWidgetIds = new Set(loadWidgets().map((widget) => widget.id));
+      let changed = false;
+      for (const tab of state.tabs) {
+        const restored = sweepLegacyDisabledCustomWidgets(tab.panelSettings, ownedWidgetIds);
+        if (panelGateStateChanged(tab.panelSettings, restored)) changed = true;
+        tab.panelSettings = restored;
+      }
+      localStorage.setItem(CW_PRO_GATE_TAB_RECOVERY_KEY, 'done');
+      return changed;
+    } catch {
+      // Persistence-only migration; blocked storage leaves the tab usable.
+      return false;
+    }
   }
 
   private panelSettingsEnabledStateChanged(
     before: Record<string, PanelConfig>,
     after: Record<string, PanelConfig>,
   ): boolean {
-    const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
-    for (const key of keys) {
-      if (before[key]?.enabled !== after[key]?.enabled) return true;
-    }
-    return false;
+    return panelGateStateChanged(before, after);
   }
 
   /** Capture the live panel state (settings + order) for a tab snapshot. */
@@ -1066,69 +1944,98 @@ export class PanelLayoutManager implements AppModule {
     Object.assign(active, this.captureCurrentTabState());
   }
 
-  private switchToTab(tabId: string): void {
-    if (!this.tabsState || tabId === this.tabsState.activeTabId) return;
+  private switchToTab(tabId: string): TabsPersistReceipt {
+    if (!this.tabsState || tabId === this.tabsState.activeTabId) return { persisted: true };
     const target = this.tabsState.tabs.find((t) => t.id === tabId);
-    if (!target) return;
+    if (!target) return { persisted: true };
 
     this.snapshotActiveTab();
     this.tabsState.activeTabId = tabId;
-    saveTabsState(this.tabsState);
+    const persist = saveTabsState(this.tabsState);
 
     this.applyTabPanelState(target.panelSettings, target.panelOrder, target.bottomSet);
     this.panelTabBar?.refresh();
+    return persist;
+  }
+
+  /**
+   * Tab-cap state for the CURRENT tab count (plan 2026-07-25-001, KTD8).
+   * Pushes the locked/unlocked state into the tab bar and returns the verdict
+   * so `addTab` can enforce it without resolving twice.
+   *
+   * CREATION-ONLY: nothing here removes a tab. A user sitting above their cap
+   * (downgrade, lowered allowance, tabs created during a null-snapshot window)
+   * keeps every tab they have — only the "+" locks.
+   */
+  private updateTabCapLock(): TabCapVerdict {
+    const verdict = evaluateTabCap(getAuthState(), this.tabsState?.tabs.length ?? 0);
+    if (verdict.allowed) {
+      // Only a would-be-capped user pays for the catalog probe; the cap stays
+      // inactive until Pro Business is provably purchasable, so the limit and
+      // the tier flip together (R10). Single-flight and shared with U5.
+      if (verdict.pendingActivation) {
+        void primeExportGateActivation().then((active) => {
+          if (active && !this.ctx.isDestroyed) this.updateTabCapLock();
+        });
+      }
+      this.panelTabBar?.setAddLock(null);
+      return verdict;
+    }
+    const reason = exportLockToGateReason(verdict.reason);
+    this.panelTabBar?.setAddLock({
+      copy: tabCapGateCopy(reason, verdict.cap),
+      onAction: resolveGateAction(reason, { openAuthModal: () => this.ctx.authModal?.open() }),
+    });
+    return verdict;
   }
 
   private addTab(): void {
     if (!this.tabsState) return;
-    this.snapshotActiveTab();
 
-    const defaults = buildDefaultTabPanels(this.ctx.panelSettings);
-    // The variant default set can exceed FREE_MAX_PANELS (e.g. 81 panels in the
-    // full variant); clamp it to the free-tier cap so a new tab can't bypass
-    // the limit that settings/search/boot all enforce.
-    const tab: PanelTab = {
-      id: generateTabId(),
-      name: t('dashboardTabs.newTabName'),
-      panelSettings: enforceFreePanelLimit(defaults.panelSettings, isProUser()),
-      panelOrder: defaults.panelOrder,
-      bottomSet: [],
-    };
-    this.tabsState.tabs.push(tab);
-    this.tabsState.activeTabId = tab.id;
-    saveTabsState(this.tabsState);
+    const verdict = this.updateTabCapLock();
+    if (!verdict.allowed) {
+      // The metric fires on a blocked CLICK, never on render — a control
+      // nobody reached for is not a gate hit.
+      trackGateHit('dashboard-tab');
+      this.panelTabBar?.showAddLockNotice();
+      return;
+    }
 
-    this.applyTabPanelState(tab.panelSettings, tab.panelOrder, tab.bottomSet);
-    this.panelTabBar?.refresh();
+    this.createAndActivateTab(t('dashboardTabs.newTabName'));
     showToast(t('dashboardTabs.newTabCreated'));
   }
 
-  private renameTab(tabId: string, name: string): void {
-    if (!this.tabsState) return;
+  private renameTab(tabId: string, name: string): TabsPersistReceipt {
+    if (!this.tabsState) return { persisted: true };
     const tab = this.tabsState.tabs.find((t) => t.id === tabId);
-    if (!tab) return;
+    if (!tab) return { persisted: true };
     tab.name = name;
-    saveTabsState(this.tabsState);
+    const persist = saveTabsState(this.tabsState);
     this.panelTabBar?.refresh();
+    return persist;
   }
 
-  private deleteTab(tabId: string): void {
-    if (!this.tabsState || this.tabsState.tabs.length <= 1) return;
+  private deleteTab(tabId: string): TabsPersistReceipt {
+    if (!this.tabsState || this.tabsState.tabs.length <= 1) return { persisted: true };
     const idx = this.tabsState.tabs.findIndex((t) => t.id === tabId);
-    if (idx === -1) return;
+    if (idx === -1) return { persisted: true };
     const wasActive = this.tabsState.activeTabId === tabId;
     const [removed] = this.tabsState.tabs.splice(idx, 1);
 
+    let persist: TabsPersistReceipt;
     if (wasActive) {
       const fallback = this.tabsState.tabs[Math.max(0, idx - 1)]!;
       this.tabsState.activeTabId = fallback.id;
-      saveTabsState(this.tabsState);
+      persist = saveTabsState(this.tabsState);
       this.applyTabPanelState(fallback.panelSettings, fallback.panelOrder, fallback.bottomSet);
     } else {
-      saveTabsState(this.tabsState);
+      persist = saveTabsState(this.tabsState);
     }
     this.panelTabBar?.refresh();
+    // Deleting frees a slot: a capped user drops back under the limit.
+    this.updateTabCapLock();
     showToast(t('dashboardTabs.tabDeleted', { name: removed!.name }));
+    return persist;
   }
 
   /**
@@ -1167,7 +2074,16 @@ export class PanelLayoutManager implements AppModule {
     // panel selection into STORAGE_KEYS.panels, so clamping here means no tab
     // operation (add / switch / delete-fallback) can ever persist an over-cap
     // workspace, regardless of how the snapshot was produced.
-    const capped = enforceFreePanelLimit(next, isProUser());
+    //
+    // Unless the tier isn't known yet and the bounded fallback has not fired —
+    // a tab click can land inside the same unresolved-session window the boot
+    // clamp defers around. Skipping the clamp leaves an over-cap workspace
+    // live for at most that window; App re-runs enforcement (and
+    // healStoredTabSnapshots) when the entitlement resolves or the fallback
+    // settles the account as free.
+    const capped = this.isProTierResolvedOrFallback()
+      ? enforceFreePanelLimit(next, isProUser())
+      : next;
 
     this.ctx.panelSettings = capped;
     saveToStorage(STORAGE_KEYS.panels, capped);
@@ -1277,7 +2193,7 @@ export class PanelLayoutManager implements AppModule {
         ${top.strikeCapable ? '<span class="banner-strike">STRIKE CAPABLE</span>' : ''}
       </div>
       <button class="banner-view" data-lat="${top.centerLat}" data-lon="${top.centerLon}">View Region</button>
-      <button class="banner-dismiss">×</button>
+      <button class="banner-dismiss" aria-label="${t('common.dismiss')}">×</button>
     `, "legacy direct innerHTML migration"));
 
     this.criticalBannerEl.querySelector('.banner-view')?.addEventListener('click', () => {
@@ -1329,6 +2245,8 @@ export class PanelLayoutManager implements AppModule {
         deferred.placeholder.classList.toggle('hidden', !config.enabled);
       }
       const panel = this.ctx.panels[key];
+      if (deferred?.placeholder?.isConnected) applyPanelFontScale(deferred.placeholder, config.fontScale);
+      if (panel) applyPanelFontScale(panel.getElement(), config.fontScale);
       const liveMediaPanel = panel as { stopLiveMediaForClose?: () => void; resumeLiveMediaForShow?: () => void } | undefined;
       if (!config.enabled) {
         liveMediaPanel?.stopLiveMediaForClose?.();
@@ -1341,6 +2259,7 @@ export class PanelLayoutManager implements AppModule {
       }
     });
     this.mobilePanelNav?.refresh();
+    this.syncAllMissionPreviews();
   }
 
   /**
@@ -1384,11 +2303,12 @@ export class PanelLayoutManager implements AppModule {
   }
 
   private shouldCreatePanel(key: string): boolean {
-    return Object.prototype.hasOwnProperty.call(this.ctx.panelSettings, key);
+    return hasPanelSettingEntry(this.ctx.panelSettings, key);
   }
 
   private static readonly NEWS_PANEL_TOOLTIPS: Record<string, string> = {
     centralbanks: t('components.centralBankWatch.infoTooltip'),
+    'nq-news': NQ_PULSE_DISCLOSURE,
   };
 
   private createNewsPanel(key: string, labelKey: string): void {
@@ -1402,15 +2322,28 @@ export class PanelLayoutManager implements AppModule {
     categoryKey = panelKey,
   ): void {
     if (!this.shouldCreatePanel(panelKey)) return;
-    this.lazyImportedPanel(panelKey, () => import('@/components/NewsPanel'), 'NewsPanel', (NewsPanel) => {
+    // Record the category→panel-key mapping ONLY when the lazy registration
+    // actually took `panelKey`. A key already claimed by a non-news panel
+    // (CommoditiesPanel, SupplyChainPanel, LiveNewsPanel …) makes lazyPanel a
+    // no-op, and the category must then stay out of the registry so the data
+    // layer never resolves it as a news category — there is no NewsPanel to
+    // render into and every feed it fetches is waste (#5376).
+    const registered = this.lazyImportedPanel(panelKey, () => import('@/components/NewsPanel'), 'NewsPanel', (NewsPanel) => {
       const panel = new NewsPanel(panelKey, label, tooltip);
       this.attachRelatedAssetHandlers(panel);
       panel.setRiskScoreGetter(PanelLayoutManager.computeEventRisk);
       this.ctx.newsPanels[categoryKey] = panel;
+      // Backfill on PRESENCE, not length. A category that resolved to `[]` is a
+      // routine outcome — the digest simply carried no bucket for it — and this is
+      // the only chance a late-mounting panel gets to clear the skeleton its
+      // constructor installed. Skipping a cached `[]` used to be harmless because
+      // the second news load re-rendered every category; now that the load runs
+      // once per work-list that second chance is gone and the panel spins until the
+      // 20-minute refresh (#5376). `renderNews([])` is what shows the empty state.
       const existingItems = this.ctx.newsByCategory[categoryKey];
-      if (existingItems?.length) {
+      if (existingItems) {
         const filteredItems = this.filterItemsByTimeRange(existingItems);
-        if (filteredItems.length === 0) {
+        if (filteredItems.length === 0 && existingItems.length > 0) {
           panel.renderFilteredEmpty(`No items in ${this.getTimeRangeLabel()}`);
         } else {
           panel.renderNews(filteredItems);
@@ -1418,6 +2351,7 @@ export class PanelLayoutManager implements AppModule {
       }
       return panel;
     });
+    if (registered) this.ctx.newsCategoryPanelKeys.set(categoryKey, panelKey);
   }
 
   // 0-100 event risk score: 0.40×severity + 0.30×geoConvergence + 0.30×CII
@@ -1480,9 +2414,40 @@ export class PanelLayoutManager implements AppModule {
     }
   }
 
+  private missionPreviews = new Map<string, ProPreviewSection>();
+
+  /**
+   * Keep each mounted panel's Pro preview in sync with the ACTIVE mission
+   * (plan U5). The registry is the only authority: a preview exists exactly
+   * when the active mission's entry targets this panel, so a mission switch,
+   * a reset, or a registry rollback all converge through this one seam.
+   * Attached as a sibling AFTER the panel's content, so the panel's own
+   * content re-renders never touch it.
+   */
+  private syncMissionPreview(key: string, panel: Panel, activeMissionId?: string | null): void {
+    const missionId = activeMissionId !== undefined ? activeMissionId : (loadStoredMissionPreset()?.id ?? null);
+    syncPanelPreview(
+      this.missionPreviews,
+      key,
+      panel.getElement(),
+      missionId,
+      (spec) => new ProPreviewSection(spec),
+    );
+  }
+
+  private syncAllMissionPreviews(): void {
+    // One preset read for the whole board — this runs on every
+    // applyPanelSettings call, mission or not (hot-path rule).
+    const missionId = loadStoredMissionPreset()?.id ?? null;
+    for (const [key, panel] of Object.entries(this.ctx.panels)) {
+      if (panel) this.syncMissionPreview(key, panel, missionId);
+    }
+  }
+
   private mountPanelElement(grid: HTMLElement, key: string, panel: Panel, placeholder?: HTMLElement | null): boolean {
     const el = panel.getElement();
     if (el.parentElement) return false;
+    applyPanelFontScale(el, this.ctx.panelSettings[key]?.fontScale);
     this.makeDraggable(el, key);
     if (placeholder?.parentNode) {
       if (import.meta.env.DEV) warnOnDeferredFootprintDrift(key, placeholder, el);
@@ -1492,6 +2457,7 @@ export class PanelLayoutManager implements AppModule {
     }
     this.mobilePanelNav?.applyToNewPanel(el);
     panel.notifyConnected();
+    this.syncMissionPreview(key, panel);
     return true;
   }
 
@@ -1511,6 +2477,7 @@ export class PanelLayoutManager implements AppModule {
       ? createDeferredPanelShell(key, this.ctx.panelSettings[key]?.name ?? key, this.getDeferredPanelShellFootprint(key))
       : null;
     if (placeholder && grid) {
+      applyPanelFontScale(placeholder, this.ctx.panelSettings[key]?.fontScale);
       this.insertByOrder(grid, placeholder, key);
       reconcileDeferredPanelShellColSpan(placeholder);
       this.mobilePanelNav?.applyToNewPanel(placeholder);
@@ -1680,11 +2647,21 @@ export class PanelLayoutManager implements AppModule {
   }
 
   private afterPanelMounted(key: string, panel: Panel): void {
+    const domain = CORRELATION_DOMAINS.find(domain => key === `${domain}-correlation`);
+    const engine = this.ctx.correlationEngine;
+    if (domain && engine) {
+      (panel as CorrelationPanel).setAssessmentHandler(cards => engine.assessCards(domain, cards));
+    }
     const config = this.ctx.panelSettings[key];
     if (config) panel.toggle(config.enabled);
     this.observePanelForHydration(panel);
     if (config?.enabled) {
       this.scheduleHydrationForPanelElement(panel.getElement(), 'near');
+      // Deferred App-owned panels (Stablecoins, ETF flows, Gulf economies,
+      // etc.) are absent when the scroll frame first scans state. Hand off
+      // again after mounting so their panel-specific loader can run without a
+      // second user scroll. App gates this callback until slow-tier readiness.
+      this.callbacks.primeVisiblePanelData();
     }
   }
 
@@ -1810,6 +2787,23 @@ export class PanelLayoutManager implements AppModule {
       this.ctx.map?.setSupplyChainPanel(supplyChainPanel);
       return supplyChainPanel;
     });
+    this.lazyImportedPanel('china-corridors', () => import('@/components/ChinaCorridorPanel'), 'ChinaCorridorPanel', (ChinaCorridorPanel) => {
+      const panel = new ChinaCorridorPanel();
+      panel.setOnCorridorSelect((corridor) => {
+        const rendererSupportsOverlay = this.ctx.map?.setChinaCorridorSelection(corridor);
+        if (this.ctx.isMobile) this.revealMobileMap();
+        return rendererSupportsOverlay;
+      });
+      this.ctx.map?.setOnChinaCorridorRendererCapabilityChange((supported) => {
+        panel.setRendererSupportsOverlay(supported);
+      });
+      return panel;
+    });
+    this.lazyDefaultPanel(
+      'china-activity-nowcast',
+      () => import('@/components/ChinaActivityNowcastPanel'),
+      'ChinaActivityNowcastPanel',
+    );
 
     this.createNewsPanel('africa', 'panels.africa');
     this.createNewsPanel('latam', 'panels.latam');
@@ -1819,29 +2813,28 @@ export class PanelLayoutManager implements AppModule {
     // Iterate CANONICAL_FEEDS (union of all variants), not just the active
     // variant's FEEDS preset — so a news panel the user customized in from
     // another variant (e.g. Finance `forex` added to a `full` session) still
-    // gets a NewsPanel created. The panelSettings gate below ensures only
-    // panels the user actually enabled are instantiated.
+    // gets a NewsPanel created. The panelSettings gate inside
+    // newsPanelKeyForCategory ensures only panels the user actually has an entry
+    // for are instantiated.
+    //
+    // Every registration above has already run, so `isPanelKeyClaimed` is the
+    // live answer to "does a data panel already own this feed-category key?" —
+    // the fact the collision remap is derived from, instead of the hardcoded
+    // `markets`/`crypto`/`economic` set that silently omitted `commodities`
+    // (#5871). See src/app/news-panel-keys.ts.
+    const newsPanelKeyLookups = newsPanelKeyLookupsFor({
+      canonicalFeeds: CANONICAL_FEEDS,
+      panels: this.ctx.panels,
+      lazyPanelRegistrations: this.lazyPanelRegistrations,
+      newsCategoryPanelKeys: this.ctx.newsCategoryPanelKeys,
+      panelSettings: this.ctx.panelSettings,
+      lateRegisteredPanelKeys: LATE_REGISTERED_PANEL_KEYS,
+    });
     for (const key of Object.keys(CANONICAL_FEEDS)) {
-      if (this.ctx.newsPanels[key]) continue;
-      if (!Array.isArray((CANONICAL_FEEDS as Record<string, unknown>)[key])) continue;
-      // 'live-news' is the dedicated LiveNewsPanel (24/7 video) key, registered
-      // lazily below — NOT a generic RSS feed panel. CANONICAL_FEEDS['live-news']
-      // exists only to feed the energy variant's headlines; if we let it spawn a
-      // NewsPanel here it registers first and lazyPanel()'s dedup guard then
-      // blocks the real video panel (regression #4382 → "LIVE NEWS / No items in
-      // the last 7 days" on the live dashboard). Skip it so the video panel owns
-      // the key on every variant (happy has no 'live-news' panel at all).
-      if (key === 'live-news') continue;
-      const panelKey = COLLIDING_NEWS_PANEL_KEYS.has(key) && !this.ctx.newsPanels[key] ? `${key}-news` : key;
-      if (this.ctx.panels[panelKey]) continue;
-      // Gate on panelKey, NOT key. When `key` collided with a non-news data
-      // panel (panelKey became `${key}-news` — e.g. `markets`/`crypto`/`economic`
-      // in the full variant), that data panel's own settings entry must NOT
-      // spawn a phantom news panel: the remapped key has to be explicitly
-      // enabled. When there's no collision, panelKey === key so this is unchanged.
+      const panelKey = newsPanelKeyForCategory(key, newsPanelKeyLookups);
+      if (!panelKey) continue;
       const panelConfig = this.ctx.panelSettings[panelKey];
-      if (!panelConfig) continue;
-      const label = panelConfig.name ?? key.charAt(0).toUpperCase() + key.slice(1);
+      const label = panelConfig?.name ?? key.charAt(0).toUpperCase() + key.slice(1);
       const tooltip = PanelLayoutManager.NEWS_PANEL_TOOLTIPS[panelKey] ?? PanelLayoutManager.NEWS_PANEL_TOOLTIPS[key];
       this.createNewsPanelWithLabel(panelKey, label, tooltip, key);
     }
@@ -1880,6 +2873,7 @@ export class PanelLayoutManager implements AppModule {
     this.lazyDefaultPanel('satellite-fires', () => import('@/components/SatelliteFiresPanel'), 'SatelliteFiresPanel');
 
     this.lazyDefaultPanel('defense-patents', () => import('@/components/DefensePatentsPanel'), 'DefensePatentsPanel');
+    this.lazyDefaultPanel('toronto-safety', () => import('@/components/TorontoSafetyPanel'), 'TorontoSafetyPanel');
 
     // Correlation engine panels
     this.lazyImportedPanel('military-correlation', () => import('@/components/MilitaryCorrelationPanel'), 'MilitaryCorrelationPanel', (MilitaryCorrelationPanel) => {
@@ -1983,6 +2977,9 @@ export class PanelLayoutManager implements AppModule {
             getPanelConfig: (panelId) => getEffectivePanelConfig(panelId, SITE_VARIANT),
             isPanelAllowed: (panelId, config) => isPanelEntitled(panelId, config, hasPremiumAccess(getAuthState())),
             hasPremiumAccess: () => hasPremiumAccess(getAuthState()),
+            applyViewChange: (viewAction) => {
+              if (viewAction.view) trackMapViewChange(viewAction.view);
+            },
             applyLayerChange: this.callbacks.applyMapLayerChange,
           }));
         })
@@ -2016,6 +3013,14 @@ export class PanelLayoutManager implements AppModule {
       _lockPanels ? [t('premium.features.telegramIntel1'), t('premium.features.telegramIntel2')] : undefined,
     );
 
+    this.lazyDefaultPanel(
+      'x-intel',
+      () => import('@/components/XIntelPanel'),
+      'XIntelPanel',
+      undefined,
+      _lockPanels ? [t('premium.features.xIntel1'), t('premium.features.xIntel2')] : undefined,
+    );
+
     this.lazyPanel('gcc-investments', async () => {
       const { focusInvestmentOnMap } = await import('@/services/investments-focus');
       return this.importPanel('gcc-investments', () => import('@/components/InvestmentsPanel'), 'InvestmentsPanel', (InvestmentsPanel) =>
@@ -2047,6 +3052,9 @@ export class PanelLayoutManager implements AppModule {
     );
     this.lazyPanel('bigmac', () =>
       this.importPanel('bigmac', () => import('@/components/BigMacPanel'), 'BigMacPanel', (BigMacPanel) => new BigMacPanel()),
+    );
+    this.lazyPanel('fx', () =>
+      this.importPanel('fx', () => import('@/components/FxPanel'), 'FxPanel', (FxPanel) => new FxPanel()),
     );
     this.lazyPanel('fuel-prices', () =>
       this.importPanel('fuel-prices', () => import('@/components/FuelPricesPanel'), 'FuelPricesPanel', (FuelPricesPanel) => new FuelPricesPanel()),
@@ -2099,15 +3107,29 @@ export class PanelLayoutManager implements AppModule {
 
     this.lazyDefaultPanel('cross-source-signals', () => import('@/components/CrossSourceSignalsPanel'), 'CrossSourceSignalsPanel');
 
+    // Hub panels pull retained clusters at mount rather than going through
+    // callPanel()/replayPendingCalls(). That queue would have to be fed the
+    // computed activities on every clustering pass, and computing tech activities
+    // requires the tech-activity → tech-hub-index → ~62KB tech-geo chain — which
+    // applyTechHubActivities() deliberately loads only when the panel is already
+    // mounted (#4404). Pulling on mount keeps that chunk off the critical path.
     this.lazyImportedPanel('geo-hubs', () => import('@/components/GeoHubsPanel'), 'GeoHubsPanel', (GeoHubsPanel) => {
       const p = new GeoHubsPanel();
       p.setOnHubClick((hub) => { this.ctx.map?.setCenter(hub.lat, hub.lon, 4); });
+      hydrateGeoHubPanelFromClusters(p, this.ctx.latestClusters, {
+        allowEmpty: this.ctx.clustersSettled,
+      });
       return p;
     });
 
     this.lazyImportedPanel('tech-hubs', () => import('@/components/TechHubsPanel'), 'TechHubsPanel', (TechHubsPanel) => {
       const p = new TechHubsPanel();
       p.setOnHubClick((hub) => { this.ctx.map?.setCenter(hub.lat, hub.lon, 4); });
+      void hydrateTechHubPanelFromClusters(p, this.ctx.latestClusters, {
+        allowEmpty: this.ctx.clustersSettled,
+      }).catch((err) => {
+        console.error('[panel] failed to lazy-load "tech-hubs" activity data', err);
+      });
       return p;
     });
 
@@ -2119,8 +3141,11 @@ export class PanelLayoutManager implements AppModule {
     this.lazyDefaultPanel('fear-greed', () => import('@/components/FearGreedPanel'), 'FearGreedPanel');
     this.lazyDefaultPanel('aaii-sentiment', () => import('@/components/AAIISentimentPanel'), 'AAIISentimentPanel');
     this.lazyDefaultPanel('market-breadth', () => import('@/components/MarketBreadthPanel'), 'MarketBreadthPanel');
+    this.lazyDefaultPanel('news-market-correlation', () => import('@/components/NewsMarketCorrelationPanel'), 'NewsMarketCorrelationPanel');
     this.lazyDefaultPanel('macro-tiles', () => import('@/components/MacroTilesPanel'), 'MacroTilesPanel');
     this.lazyDefaultPanel('fsi', () => import('@/components/FSIPanel'), 'FSIPanel');
+    this.lazyDefaultPanel('nq-pulse', () => import('@/components/NqPulsePanel'), 'NqPulsePanel');
+    this.lazyDefaultPanel('nq-catalysts', () => import('@/components/NqCatalystsPanel'), 'NqCatalystsPanel');
     this.lazyDefaultPanel('yield-curve', () => import('@/components/YieldCurvePanel'), 'YieldCurvePanel');
     this.lazyDefaultPanel('earnings-calendar', () => import('@/components/EarningsCalendarPanel'), 'EarningsCalendarPanel');
     this.lazyDefaultPanel('economic-calendar', () => import('@/components/EconomicCalendarPanel'), 'EconomicCalendarPanel');
@@ -2439,7 +3464,9 @@ export class PanelLayoutManager implements AppModule {
       view: this.ctx.isMobile ? this.ctx.resolvedLocation : 'global',
       layers: this.ctx.mapLayers,
       timeRange: '7d',
-    }, preferGlobe);
+    }, preferGlobe, {
+      isFreeTierFallbackActive: this.callbacks.isFreeTierFallbackActive,
+    });
 
     const eagerSupplyChainPanel = this.ctx.panels['supply-chain'] as SupplyChainPanel | undefined;
     if (eagerSupplyChainPanel) {
@@ -2589,8 +3616,19 @@ export class PanelLayoutManager implements AppModule {
       if (normalized.resilienceScore && !this.ctx.map.isDeckGLActive?.()) {
         normalized = { ...normalized, resilienceScore: false };
       }
+      // MapContainer also sanitizes at the renderer boundary, but update the
+      // URL-derived context with the effective display state first. A shared
+      // link is not a user preference, so it must never overwrite the saved
+      // (and cloud-synced) map-layer selection.
+      if (shouldSanitizeLockedLayers(
+        hasPremiumAccess(getAuthState()),
+        isProTierResolved(),
+        this.callbacks.isFreeTierFallbackActive?.() === true,
+      )) {
+        normalized = sanitizeLockedLayers(normalized, false);
+      }
+      this.ctx.initialUrlState.layers = normalized;
       this.ctx.mapLayers = normalized;
-      saveToStorage(STORAGE_KEYS.mapLayers, normalized);
       this.ctx.map.setLayers(normalized);
     }
 
@@ -2715,10 +3753,10 @@ export class PanelLayoutManager implements AppModule {
     });
   }
 
-  savePanelOrder(): void {
+  savePanelOrder(): { persisted: boolean } {
     const grid = document.getElementById('panelsGrid');
     const bottomGrid = document.getElementById('mapBottomGrid');
-    if (!grid || !bottomGrid) return;
+    if (!grid || !bottomGrid) return { persisted: false };
 
     const sidebarIds = Array.from(grid.children)
       .map((el) => (el as HTMLElement).dataset.panel)
@@ -2730,8 +3768,9 @@ export class PanelLayoutManager implements AppModule {
 
     const allOrder = this.buildUnifiedOrder(sidebarIds, bottomIds);
     this.resolvedPanelOrder = allOrder;
-    saveToStorage(this.ctx.PANEL_ORDER_KEY, allOrder);
-    saveToStorage(this.ctx.PANEL_ORDER_KEY + '-bottom-set', Array.from(this.bottomSetMemory));
+    const orderPersisted = saveToStorage(this.ctx.PANEL_ORDER_KEY, allOrder);
+    const bottomPersisted = saveToStorage(this.ctx.PANEL_ORDER_KEY + '-bottom-set', Array.from(this.bottomSetMemory));
+    return { persisted: orderPersisted && bottomPersisted };
   }
 
   private buildUnifiedOrder(sidebarIds: string[], bottomIds: string[]): string[] {
@@ -2841,7 +3880,7 @@ export class PanelLayoutManager implements AppModule {
   }
 
   private getUltraWideMinWidth(): number {
-    return this.ctx.isDesktopApp ? 900 : 1600;
+    return SPLIT_LAYOUT_MIN_WIDTH;
   }
 
   private getEffectiveUltraWide(): boolean {
@@ -2969,8 +4008,8 @@ export class PanelLayoutManager implements AppModule {
     createPanel: (PanelClass: PanelExport<M, K>, module: M) => ImportedPanel<M, K> | null,
     setup?: (panel: ImportedPanel<M, K>) => void,
     lockedFeatures?: string[],
-  ): void {
-    this.lazyPanel(
+  ): boolean {
+    return this.lazyPanel(
       key,
       () => this.importPanel(key, importer, exportName, createPanel),
       setup,
@@ -2984,18 +4023,27 @@ export class PanelLayoutManager implements AppModule {
     exportName: K,
     setup?: (panel: ImportedPanel<M, K>) => void,
     lockedFeatures?: string[],
-  ): void {
-    this.lazyImportedPanel(key, importer, exportName, (PanelClass) => new PanelClass() as ImportedPanel<M, K>, setup, lockedFeatures);
+  ): boolean {
+    return this.lazyImportedPanel(key, importer, exportName, (PanelClass) => new PanelClass() as ImportedPanel<M, K>, setup, lockedFeatures);
   }
 
+  /**
+   * Register a lazily-loaded panel under `key`.
+   *
+   * Returns whether THIS call claimed the key: `false` means the key is unknown
+   * to `panelSettings`, or some earlier registration (often a non-news data
+   * panel) already owns it and this registration is a no-op. Callers that index
+   * a panel by something other than its panel key rely on that signal — see
+   * `createNewsPanelWithLabel`.
+   */
   private lazyPanel<T extends Panel>(
     key: string,
     loader: () => Promise<T | null>,
     setup?: (panel: T) => void,
     lockedFeatures?: string[],
-  ): void {
-    if (!this.shouldCreatePanel(key)) return;
-    if (this.ctx.panels[key] || this.lazyPanelRegistrations.has(key)) return;
+  ): boolean {
+    if (!this.shouldCreatePanel(key)) return false;
+    if (this.ctx.panels[key] || this.lazyPanelRegistrations.has(key)) return false;
     this.lazyPanelRegistrations.set(key, {
       loading: null,
       load: async () => {
@@ -3023,6 +4071,7 @@ export class PanelLayoutManager implements AppModule {
         return basePanel;
       },
     });
+    return true;
   }
 
   private async loadRegisteredPanel(key: string): Promise<Panel | null> {
@@ -3414,6 +4463,72 @@ export class PanelLayoutManager implements AppModule {
     document.addEventListener('mousemove', onMouseMove);
     document.addEventListener('mouseup', onMouseUp);
 
+    // Keyboard path for reordering: the mouse drag above has no keyboard
+    // equivalent, so layout customization was impossible without a pointer.
+    // A visually-hidden-until-focused button in the header moves the panel
+    // one slot per arrow press and persists through the same savePanelOrder()
+    // path as a completed drag. Page Up/Page Down move between the sidebar
+    // and below-map grids when both zones are active on an ultra-wide layout.
+    const header = el.querySelector<HTMLElement>('.panel-header');
+    if (header && !header.querySelector('.panel-move-btn')) {
+      const moveBtn = document.createElement('button');
+      moveBtn.type = 'button';
+      moveBtn.className = 'panel-move-btn';
+      const panelTitle = el.querySelector('.panel-title')?.textContent?.trim() || key;
+      moveBtn.setAttribute(
+        'aria-label',
+        `Move ${panelTitle} panel; arrow keys reorder, Page Up moves to sidebar, Page Down moves below map`,
+      );
+      moveBtn.setAttribute(
+        'aria-keyshortcuts',
+        'ArrowLeft ArrowRight ArrowUp ArrowDown PageUp PageDown',
+      );
+      moveBtn.textContent = '⇅';
+      moveBtn.addEventListener('keydown', (e: KeyboardEvent) => {
+        const targetZone = e.key === 'PageUp'
+          ? 'sidebar'
+          : e.key === 'PageDown'
+            ? 'bottom'
+            : null;
+        if (targetZone) {
+          if (!this.getEffectiveUltraWide()) return;
+          e.preventDefault();
+          e.stopPropagation();
+          const sidebarGrid = document.getElementById('panelsGrid');
+          const bottomGrid = document.getElementById('mapBottomGrid');
+          if (!sidebarGrid || !bottomGrid) return;
+          const moved = movePanelToKeyboardZone({
+            panel: el,
+            panelKey: key,
+            targetZone,
+            sidebarGrid,
+            bottomGrid,
+            bottomSet: this.bottomSetMemory,
+          });
+          if (moved) this.savePanelOrder();
+          moveBtn.focus();
+          return;
+        }
+
+        const back = e.key === 'ArrowLeft' || e.key === 'ArrowUp';
+        const fwd = e.key === 'ArrowRight' || e.key === 'ArrowDown';
+        if (!back && !fwd) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const parent = el.parentElement;
+        if (!parent) return;
+        const sibling = back ? el.previousElementSibling : el.nextElementSibling;
+        if (!(sibling instanceof HTMLElement) || !sibling.classList.contains('panel')) return;
+        if (back) parent.insertBefore(el, sibling);
+        else parent.insertBefore(el, sibling.nextElementSibling);
+        this.savePanelOrder();
+        // The button travels with the panel; keep focus on it so repeated
+        // presses keep moving the same panel.
+        moveBtn.focus();
+      });
+      header.prepend(moveBtn);
+    }
+
     this.panelDragCleanupHandlers.push(() => {
       el.removeEventListener('mousedown', onMouseDown);
       document.removeEventListener('mousemove', onMouseMove);
@@ -3446,13 +4561,4 @@ export class PanelLayoutManager implements AppModule {
     return localized === lookup ? fallback : localized;
   }
 
-  getAllSourceNames(): string[] {
-    const sources = new Set<string>();
-    // Preset feeds + sources from any custom news panels the user added, so
-    // the source manager stays in sync with what loadNews() actually fetches.
-    const categories = resolveNewsCategories(FEEDS, CANONICAL_FEEDS, enabledNewsCategoryKeys(this.ctx.newsPanels, this.ctx.panels, this.ctx.panelSettings, Object.keys(CANONICAL_FEEDS)));
-    categories.forEach(({ feeds }) => feeds.forEach(f => sources.add(f.name)));
-    INTEL_SOURCES.forEach(f => sources.add(f.name));
-    return Array.from(sources).sort((a, b) => a.localeCompare(b));
-  }
 }

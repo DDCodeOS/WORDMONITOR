@@ -4,9 +4,9 @@ description: "A practical blueprint for monitoring chokepoints, port activity, e
 metaTitle: "Supply Chain Early Warning Dashboard | WorldMonitor API"
 keywords: "supply chain early warning dashboard, supply chain risk API, chokepoint monitoring API, geopolitical supply chain risk, port disruption monitoring"
 audience: "Supply chain teams, logistics analysts, procurement leaders, data engineers"
-heroImage: "/blog/og/supply-chain-early-warning-dashboard-worldmonitor-api.png"
+heroImage: "/blog/images/blog/supply-chain-early-warning-dashboard-worldmonitor-api.jpg"
 pubDate: "2026-06-10"
-modifiedDate: "2026-06-13"
+modifiedDate: "2026-09-10"
 ---
 
 A supply chain early warning dashboard should answer one question before the weekly operations meeting: which routes, commodities, suppliers, or countries need attention now?
@@ -51,7 +51,7 @@ This turns WorldMonitor's broad data surface into a dashboard that matches your 
 
 ### 1. Chokepoint status
 
-Use chokepoint data for direct route stress. WorldMonitor tracks major corridors such as Hormuz, Suez, Malacca, Bab-el-Mandeb, Panama, and others.
+Use chokepoint data for direct route stress. WorldMonitor tracks major corridors such as [Hormuz](https://www.worldmonitor.app/chokepoints/strait-of-hormuz/), [Suez](https://www.worldmonitor.app/chokepoints/suez-canal/), [Malacca](https://www.worldmonitor.app/chokepoints/strait-of-malacca/), [Bab-el-Mandeb](https://www.worldmonitor.app/chokepoints/bab-el-mandeb/), [Panama](https://www.worldmonitor.app/chokepoints/panama-canal/), and others.
 
 MCP path:
 
@@ -70,7 +70,7 @@ REST path: start from the [API reference](https://www.worldmonitor.app/docs/api-
 
 Country risk is the context layer. A port can be open while the surrounding political, sanctions, or conflict environment worsens.
 
-For each country in your watchlist, pull:
+For the transit-country examples in this watchlist, inspect the [Egypt](https://www.worldmonitor.app/countries/egypt/) and [Singapore](https://www.worldmonitor.app/countries/singapore/) profiles before choosing alert thresholds. For each country in your watchlist, pull:
 
 - Country Instability Index score and band
 - Component breakdown
@@ -175,6 +175,10 @@ Before shipping the dashboard internally, check:
 - Route, country, and commodity thresholds are configurable.
 - There is a weekly review of false positives and missed events.
 
+## Primary Supply-Chain Sources
+
+Corroborate trade and route signals with primary datasets such as [UN Comtrade](https://comtradeplus.un.org/) and the EIA's [World Oil Transit Chokepoints](https://www.eia.gov/international/content/analysis/special_topics/World_Oil_Transit_Chokepoints/) analysis. Preserve the reporting date because both trade data and route baselines can be revised.
+
 ## Frequently Asked Questions
 
 **What is a supply chain early warning dashboard?**
@@ -191,4 +195,4 @@ Alert on combined signals: route stress plus country risk, energy pressure, comm
 
 ---
 
-**Build the first version with one route, five chokepoints, and ten countries. A small reliable dashboard beats a large noisy one.**
+**Build the first version with one route and a focused set of chokepoints and countries. A small reliable dashboard beats a large noisy one.**

@@ -27,6 +27,7 @@ interface SeederPayload {
   iso2?: string | null;
   ports?: SeederPort[] | null;
   fetchedAt?: string | null;
+  cacheWrittenAt?: number | null;
 }
 
 const EMPTY: CountryPortActivityResponse = {
@@ -35,21 +36,49 @@ const EMPTY: CountryPortActivityResponse = {
   fetchedAt: '',
 };
 
+// Keep the consumer's hard-expiry boundary aligned with the PortWatch seeder.
+// The scheduler can retain an expired payload under its Redis key solely to
+// preserve the durable refresh cursor while the last-good canonical pointer is
+// held. That state must never become consumer-visible again.
+export const PORTWATCH_PORT_ACTIVITY_MAX_CACHE_AGE_MS = 7 * 86_400_000;
+
+export function isCurrentPortActivityPayload(
+  payload: unknown,
+  now = Date.now(),
+  maxCacheAgeMs = PORTWATCH_PORT_ACTIVITY_MAX_CACHE_AGE_MS,
+): payload is SeederPayload {
+  if (!payload || typeof payload !== 'object') return false;
+  const cacheWrittenAt = (payload as SeederPayload).cacheWrittenAt;
+  return typeof cacheWrittenAt === 'number'
+    && Number.isFinite(cacheWrittenAt)
+    && (now - cacheWrittenAt) < maxCacheAgeMs;
+}
+
 export async function getCountryPortActivity(
   _ctx: ServerContext,
   req: GetCountryPortActivityRequest,
 ): Promise<CountryPortActivityResponse> {
+  // ISO 3166-1 alpha-2 shape, not merely "two code units". The payload read below
+  // now runs concurrently with the allowlist read, so this guard — not the
+  // allowlist — is what bounds the key space a caller can reach (676, not ~1.1M).
+  // The gateway applies no field validation to this request (the sibling
+  // GetCountryRiskRequest carries stringPattern ^[A-Z]{2}$), so it must be here.
   const code = req.countryCode?.trim().toUpperCase() ?? '';
-  if (!code || code.length !== 2) return EMPTY;
+  if (!/^[A-Z]{2}$/.test(code)) return EMPTY;
 
-  const countriesResult = await getCachedJson(PORTWATCH_PORT_ACTIVITY_COUNTRIES_KEY, true).catch(() => null);
+  // PERF: allowlist + payload reads run concurrently; the gate is applied on
+  // the combined result. Valid codes save a serial RTT; invalid ones cost one
+  // extra small read instead of one extra RTT on every valid request.
+  const [countriesResult, data] = await Promise.all([
+    getCachedJson(PORTWATCH_PORT_ACTIVITY_COUNTRIES_KEY, true).catch(() => null),
+    getCachedJson(`${PORTWATCH_PORT_ACTIVITY_KEY_PREFIX}${code}`, true).catch(() => null),
+  ]);
   const countries = Array.isArray(countriesResult) ? (countriesResult as string[]) : [];
   if (!countries.includes(code)) return EMPTY;
-
-  const data = await getCachedJson(`${PORTWATCH_PORT_ACTIVITY_KEY_PREFIX}${code}`, true).catch(() => null);
   if (!data) return EMPTY;
 
   const payload = data as SeederPayload;
+  if (!isCurrentPortActivityPayload(payload)) return EMPTY;
   const rawPorts = Array.isArray(payload.ports) ? payload.ports : [];
   const topPorts = rawPorts.slice(0, 25);
 

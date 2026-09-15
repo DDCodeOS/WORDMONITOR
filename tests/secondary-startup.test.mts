@@ -12,7 +12,9 @@ const root = resolve(__dirname, '..');
 const indexHtml = readFileSync(resolve(root, 'index.html'), 'utf8');
 const vercelConfig = JSON.parse(readFileSync(resolve(root, 'vercel.json'), 'utf8'));
 const dashboardCsp = vercelConfig.headers
-  .find((entry: { source: string }) => entry.source === '/((?!docs|embed|embed\\.html).*)')
+  .find((entry: { headers?: Array<{ key: string; value: string }> }) => entry.headers?.some(
+    (header) => header.key === 'X-Frame-Options' && header.value === 'SAMEORIGIN',
+  ))
   ?.headers
   ?.find((header: { key: string }) => header.key === 'Content-Security-Policy')
   ?.value ?? '';
@@ -159,6 +161,7 @@ describe('deferred Umami loader', () => {
       const analytics = await import('../src/services/analytics.ts');
       analytics.track('search-open', { source: 'desktop' });
       analytics.identifyUser('user_1', 'free', null, null);
+      analytics.identifyUser('user_1', 'pro', null, null);
       await analytics.initAnalytics();
 
       assert.equal(appendedScripts.length, 1);
@@ -169,7 +172,7 @@ describe('deferred Umami loader', () => {
       // www MUST stay listed (#4931): the apex 301s to www in production and
       // the tracker's data-domains check is an exact hostname match — without
       // www, analytics on the canonical host are silently disabled.
-      assert.equal(firstScript.dataset.domains, 'worldmonitor.app,www.worldmonitor.app,happy.worldmonitor.app');
+      assert.equal(firstScript.dataset.domains, 'worldmonitor.app,www.worldmonitor.app,happy.worldmonitor.app,finance.worldmonitor.app');
       assert.deepEqual(calls, []);
       firstScript.listeners.get('error')?.();
       assert.equal(firstScript.removed, true);
@@ -186,7 +189,7 @@ describe('deferred Umami loader', () => {
 
       assert.deepEqual(calls, [
         { kind: 'track', name: 'search-open', data: { source: 'desktop' } },
-        { kind: 'identify', data: { userId: 'user_1', plan: 'free' } },
+        { kind: 'identify', data: { userId: 'user_1', plan: 'pro' } },
       ]);
     } finally {
       delete (globalThis as { window?: unknown }).window;

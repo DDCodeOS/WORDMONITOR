@@ -6,8 +6,8 @@
  * global inflation view. That contract spans three files:
  *   - commands.ts        — a `panel:consumer-prices@world` command exists and
  *                          carries enough inflation keywords to match queries.
- *   - search-manager.ts  — the panel handler parses the `@<tab>` suffix and
- *                          dispatches the panel's open-tab event.
+ *   - search-selection-dispatcher.ts — the panel handler parses the `@<tab>`
+ *                          suffix and dispatches the panel's open-tab event.
  *   - ConsumerPricesPanel — listens for that event and has a `world` tab.
  *
  * These are source-text assertions (same style as
@@ -24,7 +24,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const read = (p) => readFileSync(resolve(__dirname, p), 'utf-8');
 const commandsSrc = read('../src/config/commands.ts');
 const searchModalSrc = read('../src/components/SearchModal.ts');
-const searchManagerSrc = read('../src/app/search-manager.ts');
+const searchScopeSrc = read('../src/components/search-scope.ts');
+const searchSelectionDispatcherSrc = read('../src/app/search-selection-dispatcher.ts');
 const panelSrc = read('../src/components/ConsumerPricesPanel.ts');
 
 describe('Consumer Prices World tab — CMD+K discoverability', () => {
@@ -52,8 +53,15 @@ describe('Consumer Prices World tab — CMD+K discoverability', () => {
   });
 
   it('SearchModal gates suffixed panel commands by their base panel id', () => {
-    assert.match(searchModalSrc, /function\s+panelCommandTargetId/, 'missing panel command id normalizer');
-    assert.match(searchModalSrc, /split\('@'\)\[0\]/, 'panel command normalizer must strip @tab suffix');
+    // Normalizer lives in search-scope (shared pure helper); SearchModal must
+    // import and use it so @tab deep-links still resolve to the base panel id.
+    assert.match(
+      searchScopeSrc,
+      /export\s+function\s+panelCommandTargetId/,
+      'missing panel command id normalizer in search-scope.ts',
+    );
+    assert.match(searchScopeSrc, /split\('@'\)\[0\]/, 'panel command normalizer must strip @tab suffix');
+    assert.match(searchModalSrc, /panelCommandTargetId/, 'SearchModal must use the panel command id normalizer');
     assert.match(searchModalSrc, /action\.includes\('@'\)[\s\S]*\?\s*fallback/, 'suffixed panel commands should keep their explicit deep-link label');
     assert.match(searchModalSrc, /isPanelCommandVisible\(panelId\)/, 'search results must gate by normalized panel id');
     assert.match(searchModalSrc, /isAddablePanel\(cmd: Command\)/, 'addable affordance must route through normalized panel id');
@@ -71,13 +79,17 @@ describe('Consumer Prices World tab — CMD+K discoverability', () => {
     );
   });
 
-  it('search-manager parses the @<tab> suffix and dispatches the open-tab event', () => {
-    assert.match(searchManagerSrc, /action\.split\('@'\)/, 'panel handler no longer splits on @');
-    assert.match(searchManagerSrc, /dispatchPanelTab\(/, 'panel handler no longer deep-links to a tab');
+  it('the selection dispatcher parses the @<tab> suffix and dispatches the open-tab event', () => {
+    assert.match(searchSelectionDispatcherSrc, /action\.split\('@'\)/, 'panel handler no longer splits on @');
     assert.match(
-      searchManagerSrc,
+      searchSelectionDispatcherSrc,
+      /dispatchPanelTabAfterPresentation\(/,
+      'panel handler no longer deep-links to a tab after presentation',
+    );
+    assert.match(
+      searchSelectionDispatcherSrc,
       /wm-consumer-prices-open-tab/,
-      'search-manager no longer dispatches the consumer-prices open-tab event',
+      'selection dispatcher no longer dispatches the consumer-prices open-tab event',
     );
   });
 

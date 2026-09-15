@@ -60,6 +60,23 @@ describe('USNI fleet parser helpers', () => {
     assert.equal(usniParseLeadingInt('no count'), undefined);
   });
 
+  it('decodes exactly one entity level and never double-decodes escaped markup', () => {
+    // A fleet report line whose literal text is `&lt;DDG-111&gt;` escapes to
+    // `&amp;lt;DDG-111&amp;gt;`. Decoding `&amp;` before `&lt;` yields `<DDG-111>`.
+    assert.equal(
+      usniStripHtml('USS Spruance &amp;lt;DDG-111&amp;gt;'),
+      'USS Spruance &lt;DDG-111&gt;',
+    );
+    assert.equal(usniStripHtml('Crew &amp;#8217;s morale'), 'Crew &#8217;s morale');
+    assert.equal(usniStripHtml('Fish &amp;amp; Chips'), 'Fish &amp; Chips');
+
+    // Legitimately encoded text still decodes exactly once.
+    assert.equal(usniStripHtml('Fish &amp; Chips'), 'Fish & Chips');
+    assert.equal(usniStripHtml('range 5 &lt; x &gt; 2'), 'range 5 < x > 2');
+    assert.equal(usniStripHtml('Admiral&#8217;s &#8220;quote&#8221; &#8211; page'), 'Admiral\'s "quote" \u2013 page');
+    assert.equal(usniStripHtml('USS&nbsp;Ford'), 'USS Ford');
+  });
+
   it('classifies hull types, deployment status, and region coordinates', () => {
     assert.equal(usniHullToType('CVN-72'), 'carrier');
     assert.equal(usniHullToType('T-AO-205'), 'auxiliary');
@@ -76,6 +93,40 @@ describe('USNI fleet parser helpers', () => {
     assert.deepEqual(usniGetRegionCoords('Eastern Mediterranean Sea'), { lat: 34.5, lon: 33 });
     assert.deepEqual(usniGetRegionCoords('Gulf of Oman / Arabian Sea'), { lat: 24.5, lon: 58.5 });
     assert.equal(usniGetRegionCoords('Not A Real Theater'), null);
+  });
+
+  it('resolves the headings reported unmapped in #7548', () => {
+    // Bare theater names that only existed with a "Sea" suffix.
+    assert.deepEqual(usniGetRegionCoords('In the Caribbean'), { lat: 15, lon: -73 });
+    assert.deepEqual(usniGetRegionCoords('In the Mediterranean'), { lat: 35, lon: 18 });
+    // Straits and features from the July 2026 Valiant Shield issue.
+    assert.deepEqual(usniGetRegionCoords('In the English Channel'), { lat: 50, lon: -1.5 });
+    assert.deepEqual(usniGetRegionCoords('In the Miyako Strait'), { lat: 25, lon: 125.5 });
+    assert.deepEqual(usniGetRegionCoords('Near Scarborough Shoal'), { lat: 15.15, lon: 117.75 });
+    // Operating areas and countries.
+    assert.deepEqual(usniGetRegionCoords('In the Hawaiian Operating Areas'), { lat: 21, lon: -158.5 });
+    assert.deepEqual(usniGetRegionCoords('In Norway'), { lat: 60.39, lon: 5.32 });
+  });
+
+  it('resolves "City, Country" headings to the city, then the country', () => {
+    assert.deepEqual(usniGetRegionCoords('In Manila, Philippines'), { lat: 14.6, lon: 120.97 });
+    assert.deepEqual(usniGetRegionCoords('In Kiel, Germany'), { lat: 54.32, lon: 10.14 });
+    // The city wins over the country even though both are keys.
+    assert.deepEqual(usniGetRegionCoords('In Sasebo, Japan'), { lat: 33.16, lon: 129.72 });
+    assert.deepEqual(usniGetRegionCoords('In Okinawa, Japan'), { lat: 26.35, lon: 127.77 });
+    // ...including when the country is the longer key.
+    assert.deepEqual(usniGetRegionCoords('In Kure, Japan'), { lat: 34.24, lon: 132.56 });
+    assert.deepEqual(usniGetRegionCoords('In Wellington, New Zealand'), { lat: -41.29, lon: 174.78 });
+    // An unknown city still lands on its known country.
+    assert.deepEqual(usniGetRegionCoords('In Bergen, Norway'), { lat: 60.39, lon: 5.32 });
+    // Portsmouth, England must not resolve to Portsmouth Naval Shipyard (Maine).
+    assert.deepEqual(usniGetRegionCoords('In Portsmouth, England'), { lat: 50.8, lon: -1.09 });
+    // A key spanning the comma still beats the first segment when the heading is not an exact key.
+    assert.deepEqual(usniGetRegionCoords('Near Portsmouth, England'), { lat: 50.8, lon: -1.09 });
+    assert.deepEqual(usniGetRegionCoords('In Portsmouth'), { lat: 43.07, lon: -70.76 });
+    // A compound transit heading resolves to one of its named straits.
+    assert.deepEqual(usniGetRegionCoords('From the Tsushima Strait to Miyako Strait'), { lat: 34.3, lon: 129.3 });
+    assert.equal(usniGetRegionCoords('In Nowhere, Atlantis'), null);
   });
 
   it('extracts battle force summary counts from the first table', () => {

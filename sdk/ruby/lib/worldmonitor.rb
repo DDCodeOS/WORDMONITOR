@@ -5,10 +5,12 @@
 # Stdlib-only (Net::HTTP), MCP-first — the same design as the `worldmonitor`
 # npm CLI this mirrors (`cli/` in the main repository). The MCP server
 # (https://worldmonitor.app/mcp) is the live, documented agent surface:
-# `tools/list` is public, and `tools/call` (used by the curated helpers)
-# authenticates with a user API key. A small REST escape hatch
-# (`get`/`health`) rounds it out for host-relative and self-hosted use.
+# `tools/list` is public. `get_sources` is the only data tool that can be
+# called without a key; the other `tools/call` operations authenticate with a
+# user API key. A small REST escape hatch (`get`/`health`) rounds it out for
+# host-relative and self-hosted use.
 #
+#   WorldMonitor::Client.new(env: {}).call_tool("get_sources", view: "summary")
 #   client = WorldMonitor::Client.new(api_key: "wm_...")
 #   client.country_risk("IR")
 #   client.call_tool("get_market_data", asset_class: "crypto")
@@ -83,7 +85,10 @@ module WorldMonitor
     def initialize(api_key: nil, base_url: nil, mcp_url: nil,
                    timeout: DEFAULT_TIMEOUT, transport: nil, env: ENV)
       @api_key = api_key || env["WORLDMONITOR_API_KEY"] || env["WM_API_KEY"]
-      @base_url = (base_url || env["WORLDMONITOR_BASE_URL"] || DEFAULT_BASE_URL).sub(%r{/+\z}, "")
+      @base_url = base_url || env["WORLDMONITOR_BASE_URL"] || DEFAULT_BASE_URL
+      end_index = @base_url.bytesize
+      end_index -= 1 while end_index.positive? && @base_url.getbyte(end_index - 1) == 47
+      @base_url = @base_url.byteslice(0, end_index)
       @mcp_url = mcp_url || env["WORLDMONITOR_MCP_URL"] || DEFAULT_MCP_URL
       @timeout = timeout
       @transport = transport || method(:http_transport)

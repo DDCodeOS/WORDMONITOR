@@ -1,102 +1,220 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import { latestValidGithubStarsSnapshot } from '../scripts/github-stars-snapshot.mjs';
+import { guardProBuiltOutput, shouldSkipProBuiltOutput } from './_lib/pro-built-output.mjs';
 
-const welcomeHtml = () => readFileSync(new URL('../public/pro/welcome.html', import.meta.url), 'utf8');
-const prerenderSrc = () => readFileSync(new URL('../pro-test/prerender.mjs', import.meta.url), 'utf8');
+let cachedWelcomeHtml;
+const welcomeHtml = () =>
+  (cachedWelcomeHtml ??= readFileSync(new URL('../public/pro/welcome.html', import.meta.url), 'utf8'));
 const enLocale = () =>
   JSON.parse(readFileSync(new URL('../pro-test/src/locales/en.json', import.meta.url), 'utf8'));
+const WELCOME_FAQ_COUNT = 11;
+const CANONICAL_ORIGIN = 'https://www.worldmonitor.app/';
 
-// Pull the body of `const <name> = ` ... `` out of prerender.mjs source text.
-// The SEO templates are plain HTML with no nested backticks, so the first
-// backtick after the declaration opens and the next one closes the literal.
-function extractTemplate(src, name) {
-  const marker = `const ${name} = \``;
-  const start = src.indexOf(marker);
-  assert.ok(start !== -1, `${name} template literal not found in prerender.mjs`);
-  const bodyStart = start + marker.length;
-  const bodyEnd = src.indexOf('`', bodyStart);
-  assert.ok(bodyEnd !== -1, `${name} template literal is unterminated`);
-  return src.slice(bodyStart, bodyEnd);
-}
+let cachedJsonLdBlocks;
+const welcomeJsonLdBlocks = () =>
+  (cachedJsonLdBlocks ??= [
+    ...welcomeHtml().matchAll(/<script type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/g),
+  ].map((match) => JSON.parse(match[1])));
 
-// Isolate the crawler-visible <div id="seo-prerender">…</div> (no nested <div>s).
-function seoBlock(html) {
-  const start = html.indexOf('<div id="seo-prerender"');
-  assert.ok(start !== -1, 'welcome.html should contain the #seo-prerender block');
-  const end = html.indexOf('</div>', start);
-  assert.ok(end !== -1, '#seo-prerender block should be closed');
-  return html.slice(start, end + '</div>'.length);
-}
+// Every assertion here reads the prerendered public/pro/welcome.html, which is
+// built by `npm run build:pro` rather than committed (#6898). Skip when the
+// checkout has not built it; fail when WM_EXPECT_BUILT_OUTPUT=1 says CI did.
+const skip = shouldSkipProBuiltOutput();
+guardProBuiltOutput();
 
-// Drift guard: public/pro/welcome.html is a generated artifact injected verbatim
-// from prerender.mjs (`html.replace('<div id="root"></div>', beforeRoot + …)`),
-// but nothing re-runs the build in CI. Without this, editing the SEO copy in
-// prerender.mjs and forgetting `npm run build:pro` silently ships stale HTML to
-// crawlers. Assert every substantial static line of the source template — and
-// every locale string it interpolates — is present in the committed output.
-test('welcome.html #seo-prerender stays in sync with prerender.mjs (run npm run build:pro after edits)', () => {
-  const html = welcomeHtml();
-  const template = extractTemplate(prerenderSrc(), 'welcomeSeoPrerender');
-
-  // Static chunks: drop ${…} interpolations, keep meaningful literal fragments.
-  const staticChunks = template
-    .replace(/\$\{[^}]*\}/g, '\n')
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.length >= 24);
-  assert.ok(staticChunks.length > 40, 'expected the SEO template to yield many static chunks');
-  const missing = staticChunks.filter((chunk) => !html.includes(chunk));
-  assert.deepEqual(
-    missing,
-    [],
-    `welcome.html is stale — rebuild with \`npm run build:pro\`. Missing source chunks: ${JSON.stringify(missing.slice(0, 3))}`,
-  );
-
-  // Interpolated prose + FAQ come from en.json and are injected raw (unescaped).
-  const en = enLocale();
-  for (const value of [en.welcome.hero.sub, en.welcome.moments.sub]) {
-    assert.ok(html.includes(value), `welcome.html missing interpolated locale prose — rebuild: ${JSON.stringify(value.slice(0, 48))}`);
-  }
-  for (let n = 1; n <= 9; n += 1) {
-    for (const key of [`q${n}`, `a${n}`]) {
-      assert.ok(html.includes(en.welcome.faq[key]), `welcome.html missing FAQ ${key} — rebuild via npm run build:pro`);
-    }
-  }
-});
-
-// Guardrail for the residual SEO risk: the block is crawler-visible but hidden
-// for JS users (off-screen + aria-hidden + inert). That hidden-text pattern is a
-// deliberate AEO decision, but its cloaking-penalty risk scales with size, so
-// cap it. Bump this budget only when a rescan confirms density still helps —
-// don't let the block grow unbounded by accident.
-test('welcome.html #seo-prerender stays within its size budget', () => {
-  const MAX_BYTES = 32 * 1024;
-  const bytes = Buffer.byteLength(seoBlock(welcomeHtml()), 'utf8');
-  assert.ok(
-    bytes <= MAX_BYTES,
-    `#seo-prerender is ${bytes} bytes (budget ${MAX_BYTES}). Large hidden text blocks risk cloaking penalties — trim or deliberately raise MAX_BYTES.`,
-  );
-});
-
-test('built welcome page ships the real hero in #root before JavaScript', () => {
-  const html = readFileSync(new URL('../public/pro/welcome.html', import.meta.url), 'utf8');
-  const rootMatch = html.match(/<div id="root"(?<attrs>[^>]*)>(?<content>[\s\S]*?)<\/body>/);
+const welcomeRoot = () => {
+  const rootMatch = welcomeHtml().match(/<div id="root"(?<attrs>[^>]*)>(?<content>[\s\S]*?)<\/body>/);
   assert.ok(rootMatch?.groups, 'welcome page should contain #root before body close');
+  return {
+    attrs: rootMatch.groups.attrs,
+    content: rootMatch.groups.content.split('<noscript>')[0],
+  };
+};
 
-  const { attrs, content } = rootMatch.groups;
-  const rootContent = content.split('<noscript>')[0];
+test('welcome FAQPage JSON-LD matches every visible FAQ entry', { skip }, () => {
+  const en = enLocale();
+  const faqPage = welcomeJsonLdBlocks().find((block) => block['@type'] === 'FAQPage');
+
+  assert.ok(faqPage, 'welcome.html should include FAQPage JSON-LD');
+  assert.equal(faqPage.mainEntity.length, WELCOME_FAQ_COUNT);
+  for (let n = 1; n <= WELCOME_FAQ_COUNT; n += 1) {
+    const entry = faqPage.mainEntity[n - 1];
+    assert.equal(entry.name, en.welcome.faq[`q${n}`]);
+    assert.equal(entry.acceptedAnswer?.text, en.welcome.faq[`a${n}`]);
+  }
+  // The structured answer to the Liveuamap question must carry the compare
+  // destination itself, not only the DOM anchor derived from it (#7746).
+  assert.match(faqPage.mainEntity[4].acceptedAnswer.text, /worldmonitor\.app\/compare\/liveuamap-alternatives/);
+});
+
+test('welcome JSON-LD connects the page, website, application, and publisher', { skip }, () => {
+  const html = welcomeHtml();
+  const blocks = welcomeJsonLdBlocks();
+  const webPage = blocks.find((block) => block['@type'] === 'WebPage');
+  const webSite = blocks.find((block) => block['@type'] === 'WebSite');
+  const organization = blocks.find((block) => block['@type'] === 'Organization');
+  const application = blocks.find((block) => block['@type'] === 'SoftwareApplication');
+  const metaDescription = html.match(/<meta name="description" content="([^"]+)"/u)?.[1];
+
+  assert.ok(webPage, 'welcome.html should include WebPage JSON-LD');
+  assert.ok(webSite, 'welcome.html should include WebSite JSON-LD');
+  assert.ok(organization, 'welcome.html should include Organization JSON-LD');
+  assert.ok(application, 'welcome.html should include SoftwareApplication JSON-LD');
+  assert.equal(webPage['@id'], `${CANONICAL_ORIGIN}#webpage`);
+  assert.equal(webPage.url, CANONICAL_ORIGIN);
+  assert.equal(webPage.description, metaDescription);
+  assert.deepEqual(webPage.isPartOf, { '@id': `${CANONICAL_ORIGIN}#website` });
+  assert.deepEqual(webPage.mainEntity, { '@id': `${CANONICAL_ORIGIN}#software` });
+  assert.equal(webSite['@id'], `${CANONICAL_ORIGIN}#website`);
+  assert.equal(webSite.url, CANONICAL_ORIGIN);
+  assert.deepEqual(webSite.publisher, { '@id': `${CANONICAL_ORIGIN}#organization` });
+  assert.equal(organization['@id'], `${CANONICAL_ORIGIN}#organization`);
+  assert.equal(organization.url, CANONICAL_ORIGIN);
+  assert.equal(application['@id'], `${CANONICAL_ORIGIN}#software`);
+  assert.equal(application.url, CANONICAL_ORIGIN);
+  assert.deepEqual(application.publisher, { '@id': `${CANONICAL_ORIGIN}#organization` });
+});
+
+test('built welcome page ships the real hero in #root before JavaScript', { skip }, () => {
+  const { attrs, content: rootContent } = welcomeRoot();
   assert.match(attrs, /data-wm-prerendered="welcome"/);
   assert.match(attrs, /data-wm-prerender-lang="en"/);
   assert.doesNotMatch(rootContent, /id="seo-prerender"/);
+  assert.equal([...rootContent.matchAll(/<h1\b/g)].length, 1);
   assert.match(rootContent, /<nav[\s>]/);
   assert.match(rootContent, /By the time it&#x27;s news,[\s\S]*you already knew\./);
   assert.match(rootContent, /Launch the dashboard/);
   assert.match(rootContent, /Open source · AGPL-3\.0/);
-  assert.match(rootContent, /Map layers/);
+  assert.match(rootContent, /href="\/blog\/posts\/worldmonitor-is-not-palantir\/"/);
+  assert.match(rootContent, /WorldMonitor is not an open-source Palantir/);
+  assert.match(rootContent, /Which World Monitor license do I need\?/);
+  assert.match(rootContent, /API Business lets that organization embed World Monitor data/);
+  assert.match(rootContent, /href="\/docs\/terms"[^>]*>worldmonitor\.app\/docs\/terms<\/a>/);
+  // The Liveuamap FAQ is the homepage's one link into the /compare/ family;
+  // it has to survive prerender so non-JS crawlers see it (#7746).
+  const faqStart = rootContent.indexOf('id="faq"');
+  assert.ok(faqStart >= 0, 'the FAQ section must be prerendered');
+  const faqContent = rootContent.slice(faqStart);
+  assert.match(faqContent, /href="\/compare\/liveuamap-alternatives\/"[^>]*>worldmonitor\.app\/compare\/liveuamap-alternatives<\/a>/);
+  assert.match(rootContent, /href="\/sources\/\?utm_source=welcome-hero"/);
+  assert.match(rootContent, /href="\/sources\/\?utm_source=welcome-depth"/);
+  assert.match(rootContent, /href="\/sources\/\?utm_source=welcome-footer"[^>]*>Sources<\/a>/);
+  assert.match(rootContent, /Map layer types/);
+  const navContent = rootContent.slice(
+    rootContent.indexOf('<nav'),
+    rootContent.indexOf('</nav>') + '</nav>'.length,
+  );
+  assert.match(navContent, /href="\/blog\/"/);
+  assert.match(navContent, />Blog<\/a>/);
+  assert.match(navContent, /href="\/sources\/\?utm_source=welcome-nav"[^>]*>Attributed providers<\/a>/);
+  assert.match(navContent, /id="welcome-tablet-navigation"/);
+  assert.match(navContent, />Menu</);
   const headlineIndex = rootContent.indexOf('By the time it&#x27;s news,');
   assert.ok(headlineIndex > 0, 'welcome headline should be in the prerendered root');
   const heroSection = rootContent.slice(0, rootContent.indexOf('<section class="py-16'));
   assert.doesNotMatch(heroSection, /opacity:0/);
   assert.match(rootContent, /<img[^>]+src="\/pro\/assets\/worldmonitor-7-mar-2026-[^"]+\.jpg"[^>]+fetchPriority="high"/);
+});
+
+test('built welcome page prerenders task routes and agent discovery links', { skip }, () => {
+  const { content: rootContent } = welcomeRoot();
+  const heroIndex = rootContent.indexOf('By the time it&#x27;s news,');
+  const taskIndex = rootContent.indexOf('What are you trying to find out?');
+  // Keep in sync with welcome.live.title in pro-test/src/locales/en.json (#7381).
+  const liveIndex = rootContent.indexOf('What live data is this page showing right now?');
+  assert.ok(heroIndex >= 0, 'hero should remain in the prerendered root');
+  assert.ok(taskIndex > heroIndex, 'task routes should follow the hero');
+  assert.ok(liveIndex > taskIndex, 'live proof should follow the task routes');
+
+  const taskLinks = [
+    ['crises', 'task-verify', 'welcome-task-verify'],
+    ['chokepoints', 'task-chokepoint', 'welcome-task-chokepoint'],
+    ['countries', 'task-country-risk', 'welcome-task-country-risk'],
+  ];
+  for (const [route, content, target] of taskLinks) {
+    assert.match(
+      rootContent,
+      new RegExp(`href="/${route}/\\?utm_source=welcome&amp;utm_content=${content}"[^>]*data-umami-event="welcome-cta"[^>]*data-umami-event-target="${target}"`),
+    );
+  }
+  assert.doesNotMatch(rootContent, /href="\/(?:crises|chokepoints|countries)\/\?[^"#]*(?:ref|wm_referral)=/);
+
+  const navContent = rootContent.slice(
+    rootContent.indexOf('<nav'),
+    rootContent.indexOf('</nav>') + '</nav>'.length,
+  );
+  assert.match(navContent, /href="#agents"[^>]*>For AI agents<\/a>/);
+
+  const agentSection = rootContent.slice(rootContent.indexOf('<section id="agents"'));
+  const agentLinks = [
+    /href="\/llms\.txt"[^>]*data-umami-event="welcome-cta"[^>]*data-umami-event-target="welcome-agent-briefing"/,
+    /href="https:\/\/worldmonitor\.app\/mcp"[^>]*data-umami-event="welcome-cta"[^>]*data-umami-event-target="welcome-agent-mcp"/,
+    /href="https:\/\/api\.worldmonitor\.app"[^>]*data-umami-event="welcome-cta"[^>]*data-umami-event-target="welcome-agent-api"/,
+    /href="\/\?mode=agent"[^>]*data-umami-event="welcome-cta"[^>]*data-umami-event-target="welcome-agent-view"/,
+  ];
+  for (const linkPattern of agentLinks) {
+    assert.match(agentSection, linkPattern);
+  }
+});
+
+test('built welcome SoftwareApplication carries the snapshot star InteractionCounter', { skip }, () => {
+  const snapshot = latestValidGithubStarsSnapshot();
+  const application = welcomeJsonLdBlocks().find((block) => block['@type'] === 'SoftwareApplication');
+  assert.ok(application, 'welcome.html should include SoftwareApplication JSON-LD');
+  assert.deepEqual(application.interactionStatistic, {
+    '@type': 'InteractionCounter',
+    interactionType: 'https://schema.org/LikeAction',
+    name: 'GitHub stars',
+    userInteractionCount: snapshot.stargazers_count,
+  });
+  assert.doesNotMatch(welcomeHtml(), /%GITHUB_STARS_INTERACTION%/);
+});
+
+test('hero proof rail renders measured numerals with extractable labels', { skip }, () => {
+  const facts = JSON.parse(readFileSync(new URL('../shared/product-facts.generated.json', import.meta.url), 'utf8'));
+  const { content } = welcomeRoot();
+  for (const [value, label] of [
+    [String(facts.heroProofStats.mapLayers), 'Map layer types'],
+    [String(facts.heroProofStats.feeds), 'News &amp; OSINT feeds'],
+    [String(facts.heroProofStats.providers), 'Attributed providers'],
+    [String(facts.heroProofStats.alertOrigins), 'Independent alert origins'],
+  ]) {
+    assert.ok(content.includes(`>${value}</div>`), `hero rail must render the numeral ${value}`);
+    assert.ok(content.includes(label), `hero rail must label the numeral ${label}`);
+  }
+  const railStart = content.indexOf('sm:max-w-3xl grid-cols-2');
+  assert.ok(railStart > 0, 'hero proof rail markup must be present');
+  const rail = content.slice(railStart, content.indexOf('mt-8 flex', railStart));
+  assert.doesNotMatch(rail, />(Shared|Curated|Attributed)</, 'hero numeral slots must not render adjectives');
+});
+
+test('homepage answers "What is World Monitor?" and carries page date metadata', { skip }, () => {
+  const html = welcomeHtml();
+  const heading = html.match(/<h2[^>]*>What is World Monitor\?<\/h2>\s*<p[^>]*>([\s\S]*?)<\/p>/);
+  assert.ok(heading, 'homepage must define World Monitor under an answer-style H2');
+  const words = heading[1].replace(/<[^>]+>/g, '').trim().split(/\s+/).length;
+  assert.ok(words >= 40 && words <= 60, `definition must be 40-60 words, got ${words}`);
+  assert.match(html, /<meta name="lastmod" content="\d{4}-\d{2}-\d{2}"\s*\/>/);
+});
+
+test('built welcome teaser strip badges the snapshot as a published pulse (#7654)', { skip }, () => {
+  // The prerender bakes the fallback rows, which are a frozen capture of real
+  // published data (#7608) — a crawler must read them as an attributable
+  // snapshot, never a sample.
+  const { content: rootContent } = welcomeRoot();
+  assert.match(rootContent, /data-live-updated/, 'strip badges must carry the corpus live-updated marker');
+  assert.match(rootContent, /Published pulse \w{3} \d{1,2}, \d{4}/, 'strip badges must name the freeze date');
+  assert.match(rootContent, /Enable JavaScript to refresh/, 'strip must carry the corpus refresh affordance');
+  assert.doesNotMatch(rootContent, />Sample</, 'no card may badge real snapshot rows as a sample');
+});
+
+test('built welcome lastmod tracks the teaser strip snapshot (#7654)', { skip }, () => {
+  const teasers = JSON.parse(readFileSync(new URL('../pro-test/src/generated/teasers.json', import.meta.url), 'utf8'));
+  assert.match(
+    welcomeHtml(),
+    new RegExp(`<meta name="lastmod" content="${teasers.capturedAt}"`),
+    'served homepage lastmod must be the snapshot capture date behind the strip',
+  );
 });

@@ -7,12 +7,34 @@ import {
   acquireLockSafely,
   releaseLock,
   extendExistingTtl,
+  extendExistingTtlDetailed,
   logSeedResult,
   readSeedSnapshot,
   resolveProxyForConnect,
   httpsProxyFetchRaw,
 } from './_seed-utils.mjs';
 import { createCountryResolvers } from './_country-resolver.mjs';
+import {
+  buildPortActivityMetaPayload,
+  contentClockFor,
+  isCriticalContentRefreshDue,
+  orderColdFetchQueue,
+  PORTWATCH_CONTENT_FRESHNESS_ACTIVATION_KEY,
+  PORTWATCH_CONTENT_FRESHNESS_CADENCE_MINUTES,
+  PORTWATCH_DECISION_CRITICAL_COUNTRIES,
+} from './_portwatch-content-freshness.mjs';
+
+export {
+  buildContentFreshnessReport,
+  buildPortActivityMetaPayload,
+  contentClockFor,
+  isCriticalContentRefreshDue,
+  orderColdFetchQueue,
+  PORTWATCH_CONTENT_FRESHNESS_ACTIVATION_KEY,
+  PORTWATCH_CONTENT_FRESHNESS_BUDGET_MINUTES,
+  PORTWATCH_DECISION_CRITICAL_COUNTRIES,
+  PORTWATCH_MAX_REPORTED_STALE_COUNTRIES,
+} from './_portwatch-content-freshness.mjs';
 
 loadEnvFile(import.meta.url);
 
@@ -22,51 +44,12 @@ const META_KEY = 'seed-meta:supply_chain:portwatch-ports';
 const LOCK_DOMAIN = 'supply_chain:portwatch-ports';
 // 60 min — covers the widest realistic run of this standalone service.
 const LOCK_TTL_MS = 60 * 60 * 1000;
-const TTL = 259_200; // 3 days — 6× the 12h cron interval
+const TTL = 259_200; // 3 days — 24× the 3h cron interval
 // PortWatch currently has 174 ISO2-mapped countries with port references.
 // This is the issue #3613 health target. Runs below this count must stay
-// non-green in /api/health and /api/seed-health, but they still need to
-// advance seed-meta/canonical when they meet the recovery publish floor below
-// so fetchedAt does not freeze and incremental coverage gains reach consumers.
+// non-green in /api/health and /api/seed-health. Only a complete validated
+// run may advance the canonical list and last-success metadata.
 export const PORTWATCH_PORT_ACTIVITY_TARGET_COUNTRIES = 174;
-// Coverage gate for per-country WRITES. Lowered to 5 on 2026-05-18 (was
-// 50 → 25 → 20) so partial-success runs (6-10/30) can persist their fresh
-// per-country payloads to Redis. Below this floor, NOTHING is written.
-//
-// PAIRED with MIN_CANONICAL_PUBLISH below: this gate lets per-country
-// writes through (so the cache-fresh rotation accumulates), but a
-// SEPARATE higher threshold gates the CANONICAL list + seed-meta advance.
-// This decoupling addresses Greptile PR #3760 P1: lowering this gate
-// alone would have let a 5-country run REPLACE the prior canonical snapshot,
-// exposing consumers to a 3% coverage canonical published as fresh. Now the
-// canonical stays at the prior version until coverage reaches the recovery
-// publish floor (see MIN_CANONICAL_PUBLISH).
-//
-// Floor at 5 matches MIN_FRESH_FETCH_FOR_CAP_BYPASS (the silent-loss
-// safety): cap-mode bypass still requires 5 fresh upstream contacts,
-// so zero-fresh "everything-stale" runs still trip the 80% guard.
-//
-// Revert path: bump to 20 when success rate consistently exceeds ~70%,
-// then 30 / 50 as upstream stabilises. Target review: 2026-05-25.
-const MIN_VALID_COUNTRIES = 5;
-// Minimum total countryData.size required to ADVANCE the canonical list
-// + seed-meta (the operator-facing freshness signal). Below this, the
-// per-country fresh writes still go through (cache rotation accumulates),
-// but CANONICAL_KEY + META_KEY are extendExistingTtl-only — keeping the
-// prior canonical list and prior fetchedAt visible to consumers.
-//
-// Greptile PR #3760 P1: addresses the failure mode where a 5-country
-// fresh-fetched run with no usable stale-served cache could pass
-// validateFn, earn the cap-mode bypass, advance seed-meta with a
-// 5-entry canonical list (3% coverage published as fresh). With
-// this gate, the canonical only advances when coverage is meaningful.
-//
-// Keep this below the 174-country health target. /api/health and
-// /api/seed-health use PORTWATCH_PORT_ACTIVITY_TARGET_COUNTRIES to report
-// partial recovery as non-green; this lower publish floor keeps cap-mode
-// recovery from freezing seed-meta fetchedAt or hiding incremental canonical
-// coverage improvements while still blocking tiny 5-country publishes.
-const MIN_CANONICAL_PUBLISH = 50;
 
 const EP3_BASE =
   'https://services9.arcgis.com/weJ1QsnbMYJlCHdG/arcgis/rest/services/Daily_Ports_Data/FeatureServer/0/query';
@@ -148,30 +131,6 @@ const PREFLIGHT_FETCH_TIMEOUT = 5_000;
 // works), with the proviso that any caller re-enabling capture should
 // re-derive the budget against the FETCH_TIMEOUT in effect at that time.
 const ERROR_BODY_CAPTURE_EXTRA_MS = 40_000;
-// After this many "Invalid query parameters" errors in a single process,
-// stop retrying on them — that's a degradation signal, not a transient
-// flake. The historical comment on fetchWithRetryOnInvalidParams notes
-// "a single retry with a short back-off clears it in practice", which
-// was true for the 2026-04-20 BRA/IDN/NGA transient. NOT true during the
-// 2026-05-15 degradation episode where every cold-fetch hit the same
-// 400 and the retry burned another full FETCH_TIMEOUT for nothing
-// (30 cold × 2 attempts × 45s = blown 540s container budget). Counter
-// is module-local and resets at process start (next cron tick).
-const INVALID_PARAMS_RETRY_THRESHOLD = 5;
-// Minimum FRESH upstream successes (cache-fresh OR fetched-fresh) required
-// for cap-mode to bypass the 80% degradation guard. Pre-fix the bypass was
-// unconditional, which meant a run with `servedStale=27, freshSuccess=0,
-// dropped=117` could pass `countryData.size >= MIN_VALID_COUNTRIES` (all
-// stale-served entries) AND bypass the degradation guard (capTriggered),
-// shrinking the canonical list from ~174 → 27 stale-only entries and
-// advancing seed-meta — hiding the upstream outage.
-//
-// Floor at 5 fresh successes: meaningful upstream contact this run.
-// Below that, cap-mode is NOT a rotational steady-state — it's an
-// ArcGIS-completely-down scenario, and the 80% guard should fire (which
-// extendExistingTtl-only on prior payloads, preserves canonical list,
-// keeps WARNING visible to the operator).
-const MIN_FRESH_FETCH_FOR_CAP_BYPASS = 5;
 // Two aggregation windows, hardcoded in fetchCountryAccum:
 //   last30 = days  0-30 → tankerCalls30d, avg30d, import/export sums
 //   prev30 = days 30-60 → trendDelta baseline
@@ -198,26 +157,31 @@ const CONCURRENCY = 6;
 // run — negligible against the 570s bundle budget.
 const BATCH_BACKOFF_MS = 5_000;
 const BATCH_LOG_EVERY = 5;
-// Cache hygiene: force a full refetch if the cached payload is older than 7 days
+const RATE_LIMIT_RETRY_DELAY_MS = 2_000;
+const MAX_RATE_LIMIT_RETRIES = 1;
+// Hard publication expiry: reject cached payloads at seven days. Queue a full
+// refetch earlier so the bounded rotation can finish before this deadline,
 // even when upstream maxDate is unchanged. Protects against window-shift drift
 // (cached aggregates were computed against a window that's now 7+ days offset
 // from today's last30/prev30 cutoffs) and serves as a belt-and-braces refresh
 // if the maxDate check ever silently short-circuits.
-const MAX_CACHE_AGE_MS = 7 * 86_400_000;
+export const MAX_CACHE_AGE_MS = 7 * 86_400_000;
 // Cap how many countries can be cold-fetched in a single run. When upstream
 // advances its data (asof mismatch on a sync'd cache), all 174 countries
 // become "cache miss" at once. Cold-fetching 174 against ArcGIS exceeds the
 // 570s bundle budget (observed 2026-05-13: preflight alone took 360s, batch 1
 // of 15 hit 12 errors in 45s before container died at the budget cap).
 //
-// With this cap, a "everything stale" run refreshes a random subset and
-// serves the remainder from prior cache (marked staleAsof=true so downstream
-// can see they're a window behind). A full rotation completes in ~6 runs
-// = ~3 days at the 12h cron cadence, well within the 7-day MAX_CACHE_AGE_MS.
+// With this cap, an "everything stale" run refreshes the 30 countries with
+// the oldest persisted attempt timestamps and serves the remainder from prior
+// cache (marked staleAsof=true so downstream can see they're a window behind).
+// A full attempt sweep completes in 6 runs = 3 days at the 12h cron cadence,
+// well within the 7-day MAX_CACHE_AGE_MS.
 //
 // 30 is sized so the cold-fetch path (30 × ~3-5s/country with concurrency
-// 12 ≈ 12-15s) easily fits the 570s budget even when ArcGIS is slow.
-const MAX_COLD_FETCH_PER_RUN = 30;
+// 6 ≈ 15-25s, plus 20s of backoff) easily fits the 570s budget even when
+// ArcGIS is slow.
+export const MAX_COLD_FETCH_PER_RUN = 30;
 // Concurrency for the cheap per-country maxDate preflight. These are tiny
 // outStatistics queries (returns 1 row), so we can push harder than the
 // expensive fetch concurrency without tripping ArcGIS 429s in practice.
@@ -227,6 +191,20 @@ function epochToTimestamp(epochMs) {
   const d = new Date(epochMs);
   const p = (n) => String(n).padStart(2, '0');
   return `timestamp '${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}'`;
+}
+
+export function createArcgisProxyError(reason, errInfo) {
+  const error = new Error(`ArcGIS error (via proxy after ${reason}): ${errInfo}`);
+  error.refreshFailureCode = refreshFailureCode(errInfo);
+  return error;
+}
+
+// ArcGIS error envelopes are inconsistent: usually `message`, sometimes only
+// `code` (see PR #3681), and in principle neither. One ladder shared by all
+// three parsers — direct, proxy, and diagnostic capture — so they cannot
+// drift apart.
+function arcgisErrorInfo(err) {
+  return err?.message ?? err?.code ?? JSON.stringify(err);
 }
 
 // Retry an ArcGIS request through the Decodo proxy. Used as the fallback
@@ -245,17 +223,26 @@ async function arcgisProxyRetry(url, reason, { signal } = {}) {
   console.warn(`  [portwatch] ${reason} — retrying via proxy: ${url.slice(0, 80)}`);
   const { buffer } = await httpsProxyFetchRaw(url, proxyAuth, { accept: 'application/json', timeoutMs: PROXY_FETCH_TIMEOUT, signal });
   const proxied = JSON.parse(buffer.toString('utf8'));
-  if (proxied.error) {
+  if (proxied?.error) {
     // Greptile PR #3681 review P2: ArcGIS can return `{"error":{"code":400}}`
     // with no message field. Fall back to code, then JSON.stringify so the
     // thrown error message stays informative on unexpected error shapes.
-    const errInfo = proxied.error.message ?? proxied.error.code ?? JSON.stringify(proxied.error);
-    throw new Error(`ArcGIS error (via proxy after ${reason}): ${errInfo}`);
+    const errInfo = arcgisErrorInfo(proxied.error);
+    throw createArcgisProxyError(reason, errInfo);
   }
   return proxied;
 }
 
-async function fetchWithTimeout(url, { signal, timeoutMs = FETCH_TIMEOUT, noProxyFallback = false } = {}) {
+const defaultFetch = (...args) => globalThis.fetch(...args);
+
+async function fetchWithTimeout(url, {
+  signal,
+  timeoutMs = FETCH_TIMEOUT,
+  noProxyFallback = false,
+  forceProxy = false,
+  fetchFn = defaultFetch,
+  proxyRetryFn = arcgisProxyRetry,
+} = {}) {
   // Combine the per-call timeoutMs with the upstream caller signal so an
   // abort propagates into the in-flight fetch AND future pagination iterations.
   //
@@ -266,12 +253,20 @@ async function fetchWithTimeout(url, { signal, timeoutMs = FETCH_TIMEOUT, noProx
   //                       arcgisProxyRetry. Used by preflight so a degraded
   //                       upstream can't burn the container budget on
   //                       best-effort cache-invalidation probes (PR #3711 P1).
+  //   forceProxy       — skip the direct leg for the one bounded recovery
+  //                       after an unverified empty country response.
+  //   fetchFn          — optional direct transport seam for boundary tests.
+  //   proxyRetryFn     — optional proxy transport seam for boundary tests.
+  if (forceProxy) {
+    if (noProxyFallback) throw new Error('ArcGIS forceProxy conflicts with noProxyFallback');
+    return await proxyRetryFn(url, 'unverified empty activity', { signal });
+  }
   const combined = signal
     ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
     : AbortSignal.timeout(timeoutMs);
   let resp;
   try {
-    resp = await fetch(url, {
+    resp = await fetchFn(url, {
       headers: { 'User-Agent': CHROME_UA, Accept: 'application/json' },
       signal: combined,
     });
@@ -310,7 +305,7 @@ async function fetchWithTimeout(url, { signal, timeoutMs = FETCH_TIMEOUT, noProx
     // degradation mode returns HTTP 200 with a 400 error body after
     // 30-56s; in the original (FETCH_TIMEOUT=45s) configuration the
     // direct timeout fired before the body landed, so the upstream
-    // circuit-breaker (fetchWithRetryOnInvalidParams) never saw the
+    // country circuit-breaker never saw the
     // real message. If THIS re-fetch lands a body with `body.error`,
     // surface its message so the circuit-breaker can fire on the
     // upstream-degradation signal.
@@ -320,7 +315,7 @@ async function fetchWithTimeout(url, { signal, timeoutMs = FETCH_TIMEOUT, noProx
     // PROXY_FETCH_TIMEOUT=70s) make this path redundant: the proxy leg
     // has enough budget to receive ArcGIS's 51-56s slow response
     // directly, including the 400 error body, which arcgisProxyRetry
-    // throws as a message that fetchWithRetryOnInvalidParams matches.
+    // throws as a message that the country circuit-breaker matches.
     // The gate code stays in place (and the once-per-run semantics) so
     // bumping the attempt cap re-enables the path for any future
     // scenario where direct-fetch lands close enough to a body to be
@@ -331,10 +326,10 @@ async function fetchWithTimeout(url, { signal, timeoutMs = FETCH_TIMEOUT, noProx
     if (_bodyCaptureSuccessCount < MAX_BODY_CAPTURE_SUCCESSES
         && _bodyCaptureAttemptCount < MAX_BODY_CAPTURE_ATTEMPTS) {
       _bodyCaptureAttemptCount += 1;
-      const captured = await _captureErrorBodyAfterTimeout(url, signal);
+      const captured = await _captureErrorBodyAfterTimeout(url, signal, fetchFn);
       if (captured?.error) {
         _bodyCaptureSuccessCount += 1;
-        throw new Error(`ArcGIS error: ${captured.error.message ?? captured.error.code ?? JSON.stringify(captured.error)}`);
+        throw new Error(`ArcGIS error: ${arcgisErrorInfo(captured.error)}`);
       }
       if (captured?.body) {
         _bodyCaptureSuccessCount += 1;
@@ -344,17 +339,28 @@ async function fetchWithTimeout(url, { signal, timeoutMs = FETCH_TIMEOUT, noProx
       // success — fall through to proxy retry, leaving attempts budget
       // for the next timing-out country in case that one settles faster.
     }
-    return await arcgisProxyRetry(url, `direct ${errName || 'timeout'}`, { signal });
+    return await proxyRetryFn(url, `direct ${errName || 'timeout'}`, { signal });
   }
   if (resp.status === 429) {
     // Preflight (noProxyFallback) treats 429 as a soft failure: throw and
     // let the caller fall through to the expensive per-country path.
     if (noProxyFallback) throw new Error(`ArcGIS HTTP 429 (preflight, no proxy fallback)`);
-    return await arcgisProxyRetry(url, 'HTTP 429 rate-limited', { signal });
+    return await proxyRetryFn(url, 'HTTP 429 rate-limited', { signal });
   }
   if (!resp.ok) throw new Error(`ArcGIS HTTP ${resp.status} for ${url.slice(0, 80)}`);
   const body = await resp.json();
-  if (body.error) throw new Error(`ArcGIS error: ${body.error.message}`);
+  // A raw `body.error.message` interpolation threw "ArcGIS error: undefined"
+  // for a message-less envelope — unusable in logs, and invisible to both
+  // the rate-limit classifier and the invalid-params circuit breaker, which
+  // read this message.
+  if (body?.error) {
+    const errInfo = arcgisErrorInfo(body.error);
+    const error = new Error(`ArcGIS error: ${errInfo}`);
+    if (!noProxyFallback && refreshFailureCode(error) === 'rate_limited') {
+      return await proxyRetryFn(url, 'HTTP 200 rate-limited', { signal });
+    }
+    throw error;
+  }
   return body;
 }
 
@@ -376,7 +382,7 @@ const MAX_BODY_CAPTURE_SUCCESSES = 1;
 // retry now has enough budget (70s) to catch ArcGIS's 51-56s response
 // directly, and arcgisProxyRetry already throws the parsed
 // `body.error.message` as an `ArcGIS error (via proxy after ...)` Error.
-// fetchWithRetryOnInvalidParams's regex matches that, so the threshold
+// The country circuit-breaker's regex matches that, so the threshold
 // circuit-breaker (PR #3701) fires on proxy-returned errors without
 // needing a separate diagnostic capture re-fetch. Setting attempts=0
 // keeps the code path intact (and the once-per-run gate code) for any
@@ -385,26 +391,19 @@ const MAX_BODY_CAPTURE_SUCCESSES = 1;
 // during the current Railway-throttled-direct + proxy-works mode.
 const MAX_BODY_CAPTURE_ATTEMPTS = 0;
 
-// Test-only helper: resets the capture counters so unit tests can
-// re-exercise the capture path with different mocked responses.
-export function _resetBodyCapturedFlag() {
-  _bodyCaptureSuccessCount = 0;
-  _bodyCaptureAttemptCount = 0;
-}
-
 // Best-effort body capture when the initial fetch times out at
 // FETCH_TIMEOUT. Used to surface the actual ArcGIS error body during
 // degradation episodes (see ERROR_BODY_CAPTURE_EXTRA_MS comment).
 // Returns `{error}` if the response body contains an ArcGIS error,
 // `{body}` if it contains a normal response, or null if the re-fetch
 // itself failed (caller falls through to proxy retry as before).
-async function _captureErrorBodyAfterTimeout(url, signal) {
+async function _captureErrorBodyAfterTimeout(url, signal, fetchFn) {
   if (signal?.aborted) return null;
   const captureSignal = signal
     ? AbortSignal.any([signal, AbortSignal.timeout(ERROR_BODY_CAPTURE_EXTRA_MS)])
     : AbortSignal.timeout(ERROR_BODY_CAPTURE_EXTRA_MS);
   try {
-    const resp = await fetch(url, {
+    const resp = await fetchFn(url, {
       headers: { 'User-Agent': CHROME_UA, Accept: 'application/json' },
       signal: captureSignal,
     });
@@ -420,79 +419,14 @@ async function _captureErrorBodyAfterTimeout(url, signal) {
   }
 }
 
-// ArcGIS's Daily_Ports_Data FeatureServer intermittently returns "Cannot
-// perform query. Invalid query parameters." for otherwise-valid queries —
-// observed in prod 2026-04-20 for BRA/IDN/NGA on per-country WHERE, and
-// also for the global WHERE after the PR #3225 rollout. A single retry with
-// a short back-off clears it in practice for transient single-call flakes,
-// but NOT during upstream degradation episodes where every call returns
-// the same 400 (WM 2026-05-15: ArcGIS Daily_Ports_Data flapped, 30 cold
-// fetches all hit the 400, retry burned ~22 minutes of container budget
-// for zero recoveries).
-//
-// Strategy: keep the one-shot retry for transient flakes, but cap total
-// retries-on-this-error per process at INVALID_PARAMS_RETRY_THRESHOLD.
-// Beyond that, bail-don't-retry — caller treats the country as failed
-// for this run, and cap-mode + stale-serve + multi-tick rotation cover
-// the gap until upstream recovers.
-//
-// IMPORTANT: a 100%-batch-rejected version of this error is NOT a flake —
-// it's an upstream schema-rename or policy change. The 2026-04-29 IMF
-// reserved-keyword sweep flapped `date` → `date_` → `date` within ~9h,
-// which would silently break any seeder using a hardcoded literal twice
-// in the same incident. resolveArcgisDateField introspects the schema at
-// run start to survive the flap; the threshold below catches other
-// global-regression classes (renamed table, removed field, policy
-// change, server-side degradation) so we don't burn the container
-// budget on doomed retries.
-let _invalidParamsErrorCount = 0;
-async function fetchWithRetryOnInvalidParams(url, { signal } = {}) {
-  try {
-    return await fetchWithTimeout(url, { signal });
-  } catch (err) {
-    const msg = err?.message || '';
-    if (!/Invalid query parameters/i.test(msg)) throw err;
-    _invalidParamsErrorCount += 1;
-    // PR #3701 P1 round 3: threshold check MUST come before the
-    // proxy-confirmed short-circuit. Pre-fix the short-circuit ran first,
-    // so a degraded incident where every error arrives via proxy would
-    // never surface the clean "ArcGIS degraded — N errors" message — the
-    // counter incremented forever but the threshold path was unreachable.
-    // Right order: count → threshold (emits the degraded message) → proxy
-    // short-circuit (skip retry only when below threshold).
-    if (_invalidParamsErrorCount > INVALID_PARAMS_RETRY_THRESHOLD) {
-      // Degradation signal — caller sees a clear "no retry, run will be
-      // partial" message instead of doubling time-on-task for nothing.
-      throw new Error(`ArcGIS degraded — ${_invalidParamsErrorCount} 'Invalid query parameters' errors in this run, no retry (threshold ${INVALID_PARAMS_RETRY_THRESHOLD})`);
-    }
-    // Greptile PR #3760 round 2 P2: removed-then-restored proxy short-circuit.
-    // The 2026-05-18 removal was based on a laptop probe showing proxy
-    // retries DO recover from non-deterministic upstream errors. But that
-    // probe ran standalone — inside the seeder's 90s per-country wrap,
-    // by the time we hit this catch we've already used direct(30s) +
-    // proxy(50s) = ~80s. The 500ms backoff + another direct+proxy
-    // (max 80s) won't fit — wrap aborts the retry after ~10s remaining.
-    // Reverted: keep the short-circuit so proxy-returned semantic 400
-    // bodies don't burn the leftover 10s on a retry that mostly gets
-    // cancelled. The counter still ticks (and trips the threshold for
-    // global bail), so degradation visibility isn't lost.
-    if (/via proxy after/i.test(msg)) throw err;
-    await new Promise((r) => setTimeout(r, 500));
-    if (signal?.aborted) throw signal.reason ?? err;
-    console.warn(`  [port-activity] retrying after "${msg}" (${_invalidParamsErrorCount}/${INVALID_PARAMS_RETRY_THRESHOLD}): ${url.slice(0, 80)}`);
-    return await fetchWithTimeout(url, { signal });
-  }
-}
-
-// Test-only helper: clears the module-level counter so unit tests can
-// re-exercise the threshold path with different inputs.
-export function _resetInvalidParamsErrorCount() {
-  _invalidParamsErrorCount = 0;
-}
-
 // Fetch ALL ports globally in one paginated pass, grouped by ISO3.
 // ArcGIS server-cap: advance by actual features.length, never PAGE_SIZE.
-async function fetchAllPortRefs({ signal } = {}) {
+export async function fetchAllPortRefs({
+  signal,
+  fetchFn,
+  proxyRetryFn,
+  sleepFn = waitForRetry,
+} = {}) {
   const byIso3 = new Map();
   let offset = 0;
   let body;
@@ -510,15 +444,26 @@ async function fetchAllPortRefs({ signal } = {}) {
       outSR: '4326',
       f: 'json',
     });
-    body = await fetchWithRetryOnInvalidParams(`${EP4_BASE}?${params}`, { signal });
-    const features = body.features ?? [];
+    const url = `${EP4_BASE}?${params}`;
+    body = await retryRateLimited(
+      (attemptSignal) => fetchWithTimeout(url, {
+        signal: attemptSignal,
+        fetchFn,
+        proxyRetryFn,
+      }),
+      { signal, sleepFn, label: `reference page ${page}` },
+    );
+    const features = validatedPage(body, `reference page ${page}`, offset);
     for (const f of features) {
-      const a = f.attributes;
-      if (a?.portid == null || !a?.ISO3) continue;
+      const a = f?.attributes;
+      if (a?.portid == null || !/^[A-Z]{3}$/.test(a?.ISO3)) {
+        throw incompletePage(`invalid reference row on page ${page}`);
+      }
       const iso3 = String(a.ISO3);
       const portId = String(a.portid);
       let ports = byIso3.get(iso3);
       if (!ports) { ports = new Map(); byIso3.set(iso3, ports); }
+      if (ports.has(portId)) throw incompletePage(`duplicate reference port ${portId}`);
       ports.set(portId, { lat: Number(a.lat ?? 0), lon: Number(a.lon ?? 0) });
     }
     console.log(`  [port-activity]   ref page ${page}: +${features.length} ports (${byIso3.size} countries so far)`);
@@ -526,6 +471,21 @@ async function fetchAllPortRefs({ signal } = {}) {
     offset += features.length;
   } while (body.exceededTransferLimit);
   return byIso3;
+}
+
+function incompletePage(message) {
+  return Object.assign(new Error(`ArcGIS incomplete page: ${message}`), {
+    refreshFailureCode: 'incomplete_page',
+  });
+}
+
+function validatedPage(body, label, offset = 0) {
+  if (!Array.isArray(body?.features)
+    || (body.exceededTransferLimit !== undefined && typeof body.exceededTransferLimit !== 'boolean')
+    || ((body.exceededTransferLimit === true || offset > 0) && body.features.length === 0)) {
+    throw incompletePage(label);
+  }
+  return body.features;
 }
 
 // Resolve the queryable date-column name on Daily_Ports_Data. ArcGIS treats
@@ -590,11 +550,19 @@ export function _resetArcgisDateFieldCache() {
 // twice per country — once for each aggregation window (last30, prev30) —
 // in parallel so heavy countries no longer have to serialise through both
 // windows inside a single 90s cap.
-async function paginateWindowInto(portAccumMap, _iso3, where, windowKind, { signal, dateField } = {}) {
+async function paginateWindowInto(portAccumMap, _iso3, where, windowKind, {
+  signal,
+  dateField,
+  forceProxy = false,
+  fetchFn,
+  proxyRetryFn,
+} = {}) {
   // Defensive: callers should always thread dateField through, but if a
   // future caller forgets, fall back to the resolver (idempotent + cached).
   const df = dateField || (await resolveArcgisDateField({ signal }));
   let offset = 0;
+  let acceptedRowCount = 0;
+  const seenRows = new Set();
   let body;
   do {
     if (signal?.aborted) throw signal.reason ?? new Error('aborted');
@@ -628,15 +596,29 @@ async function paginateWindowInto(portAccumMap, _iso3, where, windowKind, { sign
       outSR: '4326',
       f: 'json',
     });
-    body = await fetchWithRetryOnInvalidParams(`${EP3_BASE}?${params}`, { signal });
-    const features = body.features ?? [];
+    body = await fetchWithTimeout(`${EP3_BASE}?${params}`, {
+      signal,
+      forceProxy,
+      fetchFn,
+      proxyRetryFn,
+    });
+    const features = validatedPage(body, `${_iso3} ${windowKind} offset ${offset}`, offset);
     for (const f of features) {
-      const a = f.attributes;
-      if (!a || a.portid == null || a[df] == null) continue;
+      const a = f?.attributes;
+      if (!a || a.portid == null || a[df] == null || !Number.isFinite(new Date(a[df]).getTime())) {
+        throw incompletePage(`invalid activity row for ${_iso3}`);
+      }
+      const rowId = `${a.portid}:${a[df]}`;
+      if (seenRows.has(rowId)) throw incompletePage(`duplicate activity row for ${_iso3}`);
+      seenRows.add(rowId);
+      acceptedRowCount += 1;
       const portId = String(a.portid);
       const calls = Number(a.portcalls_tanker ?? 0);
       const imports = Number(a.import_tanker ?? 0);
       const exports_ = Number(a.export_tanker ?? 0);
+      if (![calls, imports, exports_].every((value) => Number.isFinite(value) && value >= 0)) {
+        throw incompletePage(`invalid activity metrics for ${_iso3}`);
+      }
 
       // JS is single-threaded; two concurrent paginateWindowInto calls never
       // hit the `get`/`set` pair here in interleaved fashion because there's
@@ -663,6 +645,8 @@ async function paginateWindowInto(portAccumMap, _iso3, where, windowKind, { sign
     if (features.length === 0) break;
     offset += features.length;
   } while (body.exceededTransferLimit);
+
+  return acceptedRowCount;
 }
 
 // Parse a "YYYY-MM-DD" string (from ArcGIS outStatistics max(date)) into an
@@ -670,6 +654,43 @@ async function paginateWindowInto(portAccumMap, _iso3, where, windowKind, { sign
 // END of the day (23:59:59.999 UTC) so rows dated exactly maxDate still
 // satisfy `date <= anchor`. Returns null on parse failure; callers fall
 // back to `Date.now()` when anchor is null.
+// Where the dataset actually ends this run: the newest preflight that answered.
+// Free — these are calls the preflight already made — and it is the anchor a
+// country whose own preflight errored should inherit.
+//
+// The alternative, Date.now(), silently asserts upstream is current, and that
+// assertion is the failure mode this exists to stop. ArcGIS's max(date) lags
+// real-time by ~10 days even when healthy, and on 2026-08-21 the feed stopped
+// entirely: 1,481 rows/day through the 21st, then 0/day. A now-anchored 30-day
+// window still catches the 21st today, so the bug is invisible — but once the
+// stall passes 30 days every now-anchored country returns zero rows, scores
+// `empty_activity`, stops refreshing, and drops out at the 7-day cache wall: a
+// fleet-wide collapse to 0/174 caused by our own fallback, not by upstream.
+// Anchored on the real max date the same countries keep serving indefinitely,
+// which is what the anchor was introduced for (#3299).
+export function deriveRunAnchorMs(maxDateStrings) {
+  const list = Array.isArray(maxDateStrings) ? maxDateStrings : [];
+  let newest = null;
+  for (const value of list) {
+    const parsed = parseMaxDateToAnchor(value);
+    if (parsed === null) continue;
+    if (newest === null || parsed > newest) newest = parsed;
+  }
+  return newest;
+}
+
+// A country's own observed max date wins. On a failed preflight, its last known
+// max date wins over the run anchor because country maxima can publish at
+// different times. undefined (not null) is returned when nothing is known, so
+// fetchCountryAccum's `?? Date.now()` still applies when no preflight answered.
+export function resolveCountryAnchorMs(upstreamMaxDate, runAnchorMs, priorAsof) {
+  const own = parseMaxDateToAnchor(upstreamMaxDate);
+  if (own !== null) return own;
+  const prior = parseMaxDateToAnchor(priorAsof);
+  if (prior !== null) return prior;
+  return Number.isFinite(runAnchorMs) ? runAnchorMs : undefined;
+}
+
 function parseMaxDateToAnchor(maxDateStr) {
   if (!maxDateStr || typeof maxDateStr !== 'string') return null;
   const ts = Date.parse(maxDateStr + 'T23:59:59.999Z');
@@ -694,8 +715,14 @@ function parseMaxDateToAnchor(maxDateStr) {
 // ~10 days behind real-time, so the last-7-day window was always empty and
 // anomalySignal always false. Not a feature regression — it was already dead.
 //
-// Returns Map<portId, PortAccum>. Memory per country is O(unique ports) ≈ <200.
-async function fetchCountryAccum(iso3, { signal, anchorEpochMs, dateField } = {}) {
+export async function fetchCountryAccum(iso3, {
+  signal,
+  anchorEpochMs,
+  dateField,
+  forceProxy = false,
+  fetchFn,
+  proxyRetryFn,
+} = {}) {
   const anchor = anchorEpochMs ?? Date.now();
   const cutoff30 = anchor - 30 * 86400000;
   const cutoff60 = anchor - 60 * 86400000;
@@ -707,31 +734,127 @@ async function fetchCountryAccum(iso3, { signal, anchorEpochMs, dateField } = {}
   // start via resolveArcgisDateField. The `timestamp 'YYYY-MM-DD HH:MM:SS'`
   // literal works on both the esriFieldTypeDateOnly and esriFieldTypeDate
   // shapes ArcGIS may serve.
-  await Promise.all([
+  const [currentWindowRowCount] = await Promise.all([
     paginateWindowInto(
       portAccumMap,
       iso3,
       `ISO3='${iso3}' AND ${df} > ${epochToTimestamp(cutoff30)}`,
       'last30',
-      { signal, dateField: df },
+      { signal, dateField: df, forceProxy, fetchFn, proxyRetryFn },
     ),
     paginateWindowInto(
       portAccumMap,
       iso3,
       `ISO3='${iso3}' AND ${df} > ${epochToTimestamp(cutoff60)} AND ${df} <= ${epochToTimestamp(cutoff30)}`,
       'prev30',
-      { signal, dateField: df },
+      { signal, dateField: df, forceProxy, fetchFn, proxyRetryFn },
     ),
   ]);
 
-  return portAccumMap;
+  return { portAccumMap, currentWindowRowCount };
+}
+
+// A direct empty feature set is not proof that a country has no activity.
+// ArcGIS returned empty sets for active countries during the 2026-09-02
+// rate-limit incident. Only an explicit null max-date observation with current
+// EP4 references can publish zero. Every other empty gets one proxy-only retry
+// inside the caller's existing per-country timeout.
+export async function fetchCountryActivityWithRecovery(iso3, {
+  signal,
+  anchorEpochMs,
+  dateField,
+  preflightObservation,
+  refMap,
+  fetchAccumFn = fetchCountryAccum,
+  sleepFn = waitForRetry,
+} = {}) {
+  const currentWindowExpected = preflightObservation?.status === 'observed'
+    && preflightObservation.maxDate !== null;
+  const isUsableActivity = (result) => result?.portAccumMap instanceof Map
+    && result.portAccumMap.size > 0
+    && (!currentWindowExpected || result.currentWindowRowCount > 0);
+
+  const directResult = await retryRateLimited(
+    (attemptSignal) => fetchAccumFn(iso3, {
+      signal: attemptSignal,
+      anchorEpochMs,
+      dateField,
+      forceProxy: false,
+    }),
+    { signal, sleepFn, label: iso3 },
+  );
+  if (isUsableActivity(directResult)) {
+    return { portAccumMap: directResult.portAccumMap, verifiedZero: false };
+  }
+
+  const verifiedZero = directResult?.portAccumMap instanceof Map
+    && directResult.portAccumMap.size === 0
+    && preflightObservation?.status === 'observed'
+    && preflightObservation.maxDate === null
+    && refMap instanceof Map
+    && refMap.size > 0;
+  if (verifiedZero) {
+    return { portAccumMap: new Map(), verifiedZero: true };
+  }
+
+  console.warn(`  [port-activity] ${iso3}: unverified empty activity — retrying via proxy`);
+  const proxiedResult = await retryRateLimited(
+    (attemptSignal) => fetchAccumFn(iso3, {
+      signal: attemptSignal,
+      anchorEpochMs,
+      dateField,
+      forceProxy: true,
+    }),
+    {
+      signal,
+      maxRetries: 0,
+      sleepFn,
+      label: `${iso3} proxy empty recovery`,
+    },
+  );
+  if (isUsableActivity(proxiedResult)) {
+    return { portAccumMap: proxiedResult.portAccumMap, verifiedZero: false };
+  }
+
+  throw Object.assign(new Error('unverified empty activity after proxy retry'), {
+    refreshFailureCode: 'invalid_empty',
+  });
 }
 
 // Cheap preflight: single outStatistics query returning max(date) for one
 // country. Used to skip the expensive fetch when upstream data hasn't
 // advanced since the last cached run. ~1-2s per call at ArcGIS's current
-// steady-state. Returns ISO date string "YYYY-MM-DD" or null on any error
-// (we then fall through to the expensive path, which has its own retry).
+// steady-state. Keeps an explicit null max date separate from a failed or
+// malformed observation so the publication path cannot turn failure into zero.
+export function parseMaxDateObservation(body) {
+  const attrs = body?.features?.[0]?.attributes;
+  if (!attrs || !Object.prototype.hasOwnProperty.call(attrs, 'max_date')) {
+    return { status: 'failed', maxDate: null };
+  }
+  const raw = attrs.max_date;
+  if (raw === null) return { status: 'observed', maxDate: null };
+
+  let maxDate;
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    const d = new Date(raw);
+    if (!Number.isNaN(d.getTime())) {
+      maxDate = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+    }
+  } else if (typeof raw === 'string') {
+    const candidate = raw.slice(0, 10);
+    const parsedCandidate = Date.parse(`${candidate}T00:00:00Z`);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(candidate)
+        && Number.isFinite(parsedCandidate)
+        && new Date(parsedCandidate).toISOString().slice(0, 10) === candidate) {
+      maxDate = candidate;
+    }
+  }
+
+  return maxDate
+    ? { status: 'observed', maxDate }
+    : { status: 'failed', maxDate: null };
+}
+
 async function fetchMaxDate(iso3, { signal, dateField } = {}) {
   const df = dateField || (await resolveArcgisDateField({ signal }));
   const outStats = JSON.stringify([{
@@ -753,27 +876,15 @@ async function fetchMaxDate(iso3, { signal, dateField } = {}) {
     // 174-country preflight phase can't blow the 570s container budget
     // under ArcGIS degradation (Greptile PR #3711 P1). Failures fall
     // through to the expensive per-country activity path which has the
-    // full direct+proxy budget. Also skips fetchWithRetryOnInvalidParams's
-    // 500ms backoff retry — preflight is best-effort cache invalidation,
-    // a retry just doubles wall-clock without changing the outcome.
+    // full direct+proxy budget. Preflight is best-effort cache invalidation.
     const body = await fetchWithTimeout(`${EP3_BASE}?${params}`, {
       signal,
       timeoutMs: PREFLIGHT_FETCH_TIMEOUT,
       noProxyFallback: true,
     });
-    const attrs = body.features?.[0]?.attributes;
-    if (!attrs) return null;
-    const raw = attrs.max_date;
-    if (raw == null) return null;
-    // ArcGIS may return max(date) as epoch ms OR ISO string depending on field type
-    // (esriFieldTypeDate vs esriFieldTypeDateOnly). Normalize to YYYY-MM-DD.
-    if (typeof raw === 'number') {
-      const d = new Date(raw);
-      return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
-    }
-    return String(raw).slice(0, 10);
+    return parseMaxDateObservation(body);
   } catch {
-    return null;
+    return { status: 'failed', maxDate: null };
   }
 }
 
@@ -842,21 +953,99 @@ async function redisPipeline(commands) {
   return resp.json();
 }
 
+export async function publishPortActivitySnapshot(
+  {
+    countryData,
+    retryState = new Map(),
+    countries,
+    metaPayload,
+    canonicalAdvances,
+  },
+  {
+    fetchFn = fetch,
+    credentials = getRedisCredentials(),
+  } = {},
+) {
+  // State-only entries retain the last successful payload (or a bounded
+  // failure marker for a never-cached country) without adding that country to
+  // the published canonical list. Published data wins if a key appears in
+  // both maps.
+  const stateByCountry = new Map(retryState);
+  for (const entry of countryData) stateByCountry.set(...entry);
+
+  const commands = [...stateByCountry.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([iso2, payload]) => [
+      'SET',
+      `${KEY_PREFIX}${iso2}`,
+      JSON.stringify(payload),
+      'EX',
+      TTL,
+    ]);
+  if (canonicalAdvances) {
+    commands.push(['SET', CANONICAL_KEY, JSON.stringify(countries), 'EX', TTL]);
+  }
+  if (metaPayload) commands.push(['SET', META_KEY, JSON.stringify(metaPayload), 'EX', TTL]);
+  if (canonicalAdvances) {
+    // No EX: "this producer can publish content freshness" must survive the
+    // 3-day payload TTL, otherwise health would silently re-enter its
+    // pending-activation grace every time a run is skipped.
+    commands.push(['SET', PORTWATCH_CONTENT_FRESHNESS_ACTIVATION_KEY, '1']);
+  }
+  if (commands.length === 0) return [];
+
+  // Upstash /pipeline preserves command order but is explicitly non-atomic.
+  // The canonical list and seed-meta are the publication pointers, so they
+  // must commit in the same transaction as the per-country state they name.
+  const resp = await fetchFn(`${credentials.url}/multi-exec`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${credentials.token}`,
+      'Content-Type': 'application/json',
+      'User-Agent': CHROME_UA,
+    },
+    body: JSON.stringify(commands),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    throw new Error(`Redis transaction failed: HTTP ${resp.status} — ${text.slice(0, 200)}`);
+  }
+  const results = await resp.json();
+  if (!Array.isArray(results) || results.length !== commands.length) {
+    throw new Error(`Redis transaction failed: ${results?.error || 'invalid response'}`);
+  }
+  const failures = results.filter((result) => result?.error || result?.result === 'ERR');
+  if (failures.length > 0) {
+    throw new Error(`Redis transaction: ${failures.length}/${commands.length} commands failed`);
+  }
+  return results;
+}
+
+const CORRUPT_COUNTRY_CACHE = Symbol('corrupt country cache');
+
 // MGET-style batch read via the Upstash REST /pipeline endpoint. Returns an
 // array aligned with `keys` where each element is either the parsed JSON
-// payload or null (for missing/unparseable/errored keys). Used to prime the
-// per-country cache lookup in one round-trip instead of 174 sequential GETs.
+// payload, explicit miss, or confirmed corrupt value. Transport/envelope errors
+// remain fatal: only a validated upstream replacement may overwrite corruption.
+// Primes the per-country cache lookup in one round-trip instead of 174 GETs.
 async function redisMgetJson(keys) {
   if (keys.length === 0) return [];
   const commands = keys.map((k) => ['GET', k]);
   const results = await redisPipeline(commands);
-  return results.map((r, idx) => {
-    if (r?.error) return null;
-    const raw = r?.result;
-    if (raw == null) return null;
-    try { return JSON.parse(raw); } catch {
-      console.warn(`  [port-activity] redisMget: skipping unparseable cached payload for ${keys[idx]}`);
-      return null;
+  if (!Array.isArray(results) || results.length !== keys.length) {
+    throw new Error('PortWatch cache read returned incomplete results');
+  }
+  return results.map((r) => {
+    if (r?.error || !Object.hasOwn(r ?? {}, 'result')) throw new Error('PortWatch cache read failed');
+    if (r.result === null) return null;
+    if (typeof r.result !== 'string') throw new Error('PortWatch cache read returned invalid result');
+    try {
+      const payload = JSON.parse(r.result);
+      return payload && typeof payload === 'object' && !Array.isArray(payload)
+        ? payload : CORRUPT_COUNTRY_CACHE;
+    } catch {
+      return CORRUPT_COUNTRY_CACHE;
     }
   });
 }
@@ -867,31 +1056,180 @@ async function redisMgetJson(keys) {
 // `progress` (optional) is mutated in-place so a SIGTERM handler in main()
 // can report which batch / country we died on.
 //
-// Orders the cold-fetch queue no-prior-cache-FIRST (shuffled within each group
-// for rotation fairness). Never-cached countries have no served-stale fallback,
-// so they must win cold-fetch slots ahead of cached-but-stale ones — otherwise
-// the random shuffle starves them out of the canonical (coverage frozen < 174).
-// Pure + exported for unit testing; rng is injectable for determinism. #4293.
-export function orderColdFetchQueue(needsFetch, rng = Math.random) {
-  const shuffle = (arr) => {
-    const a = [...arr];
-    for (let i = a.length - 1; i > 0; i--) {
-      const j = Math.floor(rng() * (i + 1));
-      [a[i], a[j]] = [a[j], a[i]];
+// Orders cold-fetches by the oldest ATTEMPT, using the last successful cache
+// write as the legacy fallback. This is the durable rotation cursor:
+//
+//   - never-attempted countries have no timestamp and go first;
+//   - a successful fetch updates cacheWrittenAt + refreshAttemptedAt;
+//   - a failed fetch updates only refreshAttemptedAt, so it stays truthfully
+//     stale but cannot monopolise every subsequent 30-country batch.
+//
+// The previous random shuffle did not encode progress. A deterministic
+// reproduction that supplied the same RNG selected the same 30 countries in
+// all six runs, and production dropped 21 seven-day-old cached countries while
+// refreshing younger misses. Oldest-attempt-first guarantees one complete
+// attempt sweep in ceil(174 / 30) = 6 runs, independent of process restarts.
+// ISO2 is the deterministic tie-breaker so equal-age cohorts do not depend on
+// ArcGIS row order. Pure + exported for unit testing.
+export function classifyDeferredPayload(
+  prevPayload,
+  now = Date.now(),
+  maxCacheAgeMs = MAX_CACHE_AGE_MS,
+) {
+  if (!prevPayload || typeof prevPayload !== 'object'
+    || !Array.isArray(prevPayload.ports)
+    || !prevPayload.ports.every((port) => port && typeof port.portId === 'string' && port.portId.length > 0)
+    || (prevPayload.ports.length === 0 && prevPayload.zeroActivity !== true)
+    || !Number.isFinite(prevPayload.cacheWrittenAt)
+    || prevPayload.cacheWrittenAt > now) {
+    return { status: 'missing', payload: null };
+  }
+  if ((now - prevPayload.cacheWrittenAt) >= maxCacheAgeMs) {
+    return { status: 'expired', payload: null };
+  }
+  return { status: 'stale', payload: { ...prevPayload, staleAsof: true } };
+}
+
+function refreshFailureCode(reason) {
+  if (reason?.refreshFailureCode) return reason.refreshFailureCode;
+  const text = `${reason?.code || ''} ${reason?.message || reason || ''}`;
+  if (/invalid query parameters/i.test(text)) return 'invalid_query';
+  if (/\b429\b|rate.?limit|too many requests/i.test(text)) return 'rate_limited';
+  if (/timeout|timed out|abort/i.test(text)) return 'timeout';
+  return 'fetch_error';
+}
+
+function waitForRetry(delayMs, signal) {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, delayMs));
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason ?? new Error('aborted'));
+      return;
     }
-    return a;
+    let timer;
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      reject(signal.reason ?? new Error('aborted'));
+    };
+    const done = () => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    };
+    timer = setTimeout(done, delayMs);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+// Retry only the rate-limit failure class. Other ArcGIS errors (invalid query,
+// timeout, empty result) must retain their existing failure semantics so a
+// global upstream regression still reaches the circuit-breaker and coverage
+// gates without being hidden by a generic retry loop.
+export async function retryRateLimited(
+  operation,
+  {
+    signal,
+    delayMs = RATE_LIMIT_RETRY_DELAY_MS,
+    maxRetries = MAX_RATE_LIMIT_RETRIES,
+    sleepFn = waitForRetry,
+    label = 'country',
+  } = {},
+) {
+  let retries = 0;
+  while (true) {
+    const attemptController = new AbortController();
+    const attemptSignal = signal
+      ? AbortSignal.any([signal, attemptController.signal])
+      : attemptController.signal;
+    try {
+      return await operation(attemptSignal);
+    } catch (reason) {
+      // fetchCountryAccum runs its two windows in parallel. Abort the sibling
+      // window before retrying so one fast 429 cannot overlap a second full
+      // country attempt and amplify the upstream rate limit.
+      attemptController.abort(reason);
+      if (
+        retries >= maxRetries
+        || refreshFailureCode(reason) !== 'rate_limited'
+        || signal?.aborted
+      ) {
+        throw reason;
+      }
+      retries += 1;
+      console.warn(
+        `  [port-activity] ${label}: rate-limited — retrying ` +
+        `after ${delayMs}ms (${retries}/${maxRetries})`,
+      );
+      await sleepFn(delayMs, signal);
+    }
+  }
+}
+
+export function buildRefreshFailureState(item, reason, attemptedAt = Date.now()) {
+  const prev = item?.prevPayload && typeof item.prevPayload === 'object'
+    ? item.prevPayload
+    : { iso2: item?.iso2 };
+  const previousFailures = Number(prev.refreshFailure?.consecutiveFailures);
+  return {
+    ...prev,
+    iso2: item?.iso2 || prev.iso2,
+    refreshAttemptedAt: attemptedAt,
+    refreshFailure: {
+      code: refreshFailureCode(reason),
+      consecutiveFailures: Number.isFinite(previousFailures) ? previousFailures + 1 : 1,
+      lastAttemptAt: attemptedAt,
+    },
   };
-  const hasCache = (it) => Boolean(it && it.prevPayload && typeof it.prevPayload === 'object');
-  const noCache = needsFetch.filter((it) => !hasCache(it));
-  const cached = needsFetch.filter(hasCache);
-  return [...shuffle(noCache), ...shuffle(cached)];
+}
+
+export function buildCoverageReport({
+  eligibleCountries,
+  expectedCountries = [],
+  countryData,
+  retryState = new Map(),
+  refreshFailures = [],
+}) {
+  const eligible = [...new Set(eligibleCountries)].sort();
+  const expected = [...new Set([...expectedCountries, ...eligible])].sort();
+  const target = Math.max(PORTWATCH_PORT_ACTIVITY_TARGET_COUNTRIES, expected.length);
+  const missingCountries = expected.filter((iso2) => !countryData.has(iso2));
+  const unidentifiedMissingCount = Math.max(0, target - expected.length);
+  const failureByCountry = new Map();
+  // Deferred failures remain actionable until that country is recovered or
+  // positively revalidated; another country's success must not hide them.
+  for (const [iso2, state] of [...countryData, ...retryState]) {
+    if (typeof state?.refreshFailure?.code === 'string') {
+      failureByCountry.set(iso2, state.refreshFailure.code);
+    }
+  }
+  for (const { iso2, code } of refreshFailures) {
+    if (typeof code === 'string') failureByCountry.set(iso2, code);
+  }
+  const failures = [...failureByCountry]
+    .map(([iso2, code]) => ({ iso2, code }))
+    .sort((a, b) => a.iso2.localeCompare(b.iso2));
+  const payloads = [...countryData.values()];
+  const retainedCountryCount = payloads.filter((payload) => payload.staleAsof === true).length;
+  const cacheTimes = payloads.map((payload) => payload.cacheWrittenAt).filter(Number.isFinite);
+  return {
+    target,
+    referenceCountryCount: eligible.length,
+    published: countryData.size,
+    currentCountryCount: countryData.size - retainedCountryCount,
+    retainedCountryCount,
+    oldestCountryCacheWrittenAt: cacheTimes.length ? Math.min(...cacheTimes) : null,
+    complete: missingCountries.length === 0 && unidentifiedMissingCount === 0,
+    missingCountries,
+    unidentifiedMissingCount,
+    refreshFailures: failures,
+  };
 }
 
 // fetchAll is the orchestrator (refs → schema → preflight → cache-partition
 // → batched fetch → finalise); splitting it would move complexity into a
 // hidden seam and obscure the linear pipeline. Each stage is short and
 // well-commented.
-export async function fetchAll(progress, { signal } = {}) {
+export async function fetchAll(progress, { signal, expectedCountries = [] } = {}) {
   const { iso3ToIso2 } = createCountryResolvers();
 
   // Resolve the queryable date-column name once per run, before any
@@ -917,7 +1255,7 @@ export async function fetchAll(progress, { signal } = {}) {
   // `cacheWrittenAt` (ms epoch). We re-use them as-is when both of the
   // following hold:
   //   1. upstream max(date) for the country is unchanged since `asof`
-  //   2. `cacheWrittenAt` is within MAX_CACHE_AGE_MS
+  //   2. `cacheWrittenAt` leaves enough time for a bounded refresh rotation
   // Either check failing → fall through to the expensive paginated fetch.
   //
   // Cold run (no cache / legacy payloads without asof) always falls through.
@@ -925,16 +1263,9 @@ export async function fetchAll(progress, { signal } = {}) {
   if (progress) progress.stage = 'cache-lookup';
   const cacheT0 = Date.now();
   const prevKeys = eligibleIso3.map((iso3) => `${KEY_PREFIX}${iso3ToIso2.get(iso3)}`);
-  // A transient Upstash outage at run-start must NOT abort the seed before
-  // any ArcGIS data is fetched — that's a regression from the previous
-  // behaviour where Redis was only required at the final write. On MGET
-  // failure, degrade to cold-path: treat every country as a cache miss
-  // and re-fetch. The write at run-end will retry its own Redis calls
-  // and fail loudly if Redis is genuinely down then too. PR #3299 review P1.
-  const prevPayloads = await redisMgetJson(prevKeys).catch((err) => {
-    console.warn(`  [port-activity] cache MGET failed (${err?.message || err}) — treating all countries as cache miss`);
-    return new Array(prevKeys.length).fill(null);
-  });
+  // An unreadable prior payload is not a cache miss: a failed refresh must
+  // never overwrite unknown last-good data with a scheduler-only marker.
+  const prevPayloads = await redisMgetJson(prevKeys);
   console.log(`  [port-activity] Loaded ${prevPayloads.filter(Boolean).length}/${prevKeys.length} cached payloads (${((Date.now() - cacheT0) / 1000).toFixed(1)}s)`);
 
   // Preflight: maxDate check for every eligible country in parallel.
@@ -942,7 +1273,7 @@ export async function fetchAll(progress, { signal } = {}) {
   // which is higher than the expensive-fetch CONCURRENCY.
   if (progress) progress.stage = 'preflight';
   const preflightT0 = Date.now();
-  const maxDates = new Array(eligibleIso3.length).fill(null);
+  const preflightObservations = new Array(eligibleIso3.length).fill(null);
   for (let i = 0; i < eligibleIso3.length; i += PREFLIGHT_CONCURRENCY) {
     if (signal?.aborted) throw signal.reason ?? new Error('aborted');
     const slice = eligibleIso3.slice(i, i + PREFLIGHT_CONCURRENCY);
@@ -951,10 +1282,21 @@ export async function fetchAll(progress, { signal } = {}) {
     );
     for (let j = 0; j < slice.length; j++) {
       const r = settled[j];
-      maxDates[i + j] = r.status === 'fulfilled' ? r.value : null;
+      preflightObservations[i + j] = r.status === 'fulfilled'
+        ? r.value
+        : { status: 'failed', maxDate: null };
     }
   }
   console.log(`  [port-activity] Preflight maxDate for ${eligibleIso3.length} countries (${((Date.now() - preflightT0) / 1000).toFixed(1)}s)`);
+
+  // See deriveRunAnchorMs for why Date.now() is not the fallback.
+  const maxDates = preflightObservations.map((observation) =>
+    observation?.status === 'observed' ? observation.maxDate : null,
+  );
+  const runAnchorFallbackMs = deriveRunAnchorMs(maxDates);
+  if (runAnchorFallbackMs === null) {
+    console.warn('  [port-activity] No preflight returned a max date — per-country windows fall back to now, which is only correct if upstream really is current.');
+  }
 
   // Partition: cache hits (reusable) vs misses (need expensive fetch).
   // For misses, capture `prevPayload` (may be null) so that if we end up
@@ -964,103 +1306,112 @@ export async function fetchAll(progress, { signal } = {}) {
   let needsFetch = [];
   let cacheHits = 0;
   const now = Date.now();
+  // Reserve a full sweep plus one missed cron before the seven-day expiry.
+  // Critical countries can consume their slots on every run. Without this
+  // lead, unchanged upstream dates keep a synchronized cohort cached until
+  // all countries expire together, when only 30 can recover per run.
+  const rotationSlots = MAX_COLD_FETCH_PER_RUN - PORTWATCH_DECISION_CRITICAL_COUNTRIES.length;
+  const refreshLeadMs = (Math.ceil(eligibleIso3.length / rotationSlots) + 1)
+    * PORTWATCH_CONTENT_FRESHNESS_CADENCE_MINUTES * 60_000;
+  const refreshAgeMs = Math.max(0, MAX_CACHE_AGE_MS - refreshLeadMs);
   for (let i = 0; i < eligibleIso3.length; i++) {
     const iso3 = eligibleIso3[i];
     const iso2 = iso3ToIso2.get(iso3);
-    const upstreamMaxDate = maxDates[i];
+    const preflightObservation = preflightObservations[i];
+    const upstreamMaxDate = preflightObservation?.status === 'observed'
+      ? preflightObservation.maxDate
+      : null;
     const prev = prevPayloads[i];
-    const cacheFresh = prev && typeof prev === 'object'
-      && prev.asof === upstreamMaxDate
-      && upstreamMaxDate != null
-      && typeof prev.cacheWrittenAt === 'number'
-      && (now - prev.cacheWrittenAt) < MAX_CACHE_AGE_MS;
+    const criticalRefreshDue = isCriticalContentRefreshDue({
+      iso2,
+      prevPayload: prev,
+      now,
+    });
+    const observationMatches = preflightObservation?.status === 'observed'
+      && (upstreamMaxDate !== null
+        ? prev?.asof === upstreamMaxDate
+        : prev?.asof === null && prev?.zeroActivity === true);
+    const cacheFresh = !criticalRefreshDue
+      && classifyDeferredPayload(prev, now).status === 'stale'
+      && now - prev.cacheWrittenAt < refreshAgeMs
+      && observationMatches;
     if (cacheFresh) {
-      countryData.set(iso2, prev);
+      const { refreshFailure: _failure, staleAsof: _stale, ...confirmed } = prev;
+      countryData.set(iso2, confirmed);
       cacheHits++;
     } else {
-      needsFetch.push({ iso3, iso2, upstreamMaxDate, prevPayload: prev });
+      needsFetch.push({
+        iso3,
+        iso2,
+        upstreamMaxDate,
+        preflightObservation,
+        prevPayload: prev,
+      });
     }
   }
   console.log(`  [port-activity] Cache: ${cacheHits} hits, ${needsFetch.length} misses`);
 
   // Cold-fetch cap (WM 2026-05-13 incident): when needsFetch exceeds the
-  // per-run cap, refresh a random subset and serve the rest from prior
-  // cache marked staleAsof=true. Prevents the catastrophic "everything
+  // per-run cap, refresh the oldest-attempt subset and serve the rest from
+  // prior cache marked staleAsof=true. Prevents the catastrophic "everything
   // stale → 174 cold-fetches → bundle SIGTERM" failure mode that produced
-  // 37h of stale data after a single upstream-advance event. A full
-  // rotation completes in ~ceil(174/30) = 6 runs ≈ 3 days at 12h cadence.
-  // Cap-mode signaling. Surfaces to the caller so main() can bypass the 80%
-  // degradation guard for an intentionally-partial publish. Greptile PR #3694
-  // round 3 P1: pre-fix, cap-mode + temp-gate=25 would clear the coverage gate
-  // (countryData.size ≥ 25) but still fail the degradation guard
-  // (countryData.size < prevCount × 0.8 ≈ 139), so seed-meta would not advance
-  // and the WARNING would persist — defeating the PR's main recovery claim.
-  let capTriggered = false;
+  // 37h of stale data after a single upstream-advance event. A nominal attempt
+  // sweep takes ceil(174/30) = 6 runs (3d); allow a seventh run when
+  // critical countries reserve repeat slots.
   let servedStaleCount = 0;
   let droppedTooOldCount = 0;
   let droppedNoCacheCount = 0;
+  // Payloads retained for scheduler state but intentionally excluded from the
+  // canonical publication (expired last-good data or a failed never-cached
+  // attempt). Writing these keeps the durable attempt cursor alive without
+  // claiming the country is covered.
+  const retryState = new Map();
+  const refreshFailures = [];
+  const retainPriorState = (iso2, payload, evaluatedAt) => {
+    const deferredState = classifyDeferredPayload(payload, evaluatedAt);
+    if (deferredState.status === 'stale') {
+      countryData.set(iso2, deferredState.payload);
+      servedStaleCount++;
+      return;
+    }
+    if (payload && typeof payload === 'object') retryState.set(iso2, payload);
+    if (deferredState.status === 'expired') droppedTooOldCount++;
+    else droppedNoCacheCount++;
+  };
   // Counts fresh upstream successes this run (fetched-fresh path, line ~904).
-  // cacheHits is counted separately and also contributes to "fresh upstream
-  // contact" — both are aggregated into the cap-mode bypass gate in main().
-  // Servet-stale entries do NOT count: they're prior-run data being held
+  // cacheHits also counts as a current upstream observation.
+  // Served-stale entries do NOT count: they're prior-run data being held
   // over, no upstream contact this run.
   let freshFetchedCount = 0;
 
   if (needsFetch.length > MAX_COLD_FETCH_PER_RUN) {
-    capTriggered = true;
-    // Order the queue no-prior-cache-FIRST, shuffled within each group for
-    // rotation fairness. Never-cached countries have no served-stale fallback:
-    // if deferred past the cap they're dropped entirely (droppedNoCache),
-    // whereas cached-but-stale countries survive the deferral via served-stale.
-    // A plain random shuffle therefore repeatedly starved the same uncached
-    // countries (MY, IE, EC, …) out of the canonical, freezing coverage below
-    // the 174 target. Prioritising them guarantees each a fetch slot every run
-    // (uncached count << cap), so they get cached and then held over. See #4293.
+    // Oldest-attempt-first provides the durable rotation state that a random
+    // shuffle cannot: successful and failed attempts both move behind work that
+    // has not received a slot in the current sweep. Never-attempted countries
+    // naturally sort first, retaining #4293's no-cache recovery property.
     const ordered = orderColdFetchQueue(needsFetch);
     const deferred = ordered.slice(MAX_COLD_FETCH_PER_RUN);
-    let servedStale = 0;
-    let droppedTooOld = 0;
-    let droppedNoCache = 0;
+    const countsBefore = {
+      servedStale: servedStaleCount,
+      droppedTooOld: droppedTooOldCount,
+      droppedNoCache: droppedNoCacheCount,
+    };
     for (const item of deferred) {
-      const prev = item.prevPayload;
-      if (!prev || typeof prev !== 'object') {
-        // No prior payload (new country, first-ever miss). Drop — same as
-        // pre-fix behavior for hard misses.
-        droppedNoCache++;
-        continue;
-      }
-      // MAX_CACHE_AGE_MS hard-drop boundary (Greptile PR #3676 review P1):
-      // the deferred-stale path MUST respect the same age gate the
-      // cacheFresh check enforces, otherwise a country deferred across
-      // enough runs while upstream was frozen ≥4 days could publish data
-      // older than the intended 7d hard-drop threshold. Without this,
-      // window-drift accumulates past MAX_CACHE_AGE_MS and the PR's claim
-      // that hard-drop behavior is unchanged would be false.
-      const cacheWrittenAt = prev.cacheWrittenAt;
-      if (typeof cacheWrittenAt !== 'number' || (now - cacheWrittenAt) >= MAX_CACHE_AGE_MS) {
-        droppedTooOld++;
-        continue;
-      }
-      // Mark as stale-asof so downstream consumers know this country is one
-      // window behind. The canonical payload structure is unchanged.
-      countryData.set(item.iso2, { ...prev, staleAsof: true });
-      servedStale++;
+      retainPriorState(item.iso2, item.prevPayload, now);
     }
+    const servedStale = servedStaleCount - countsBefore.servedStale;
+    const droppedTooOld = droppedTooOldCount - countsBefore.droppedTooOld;
+    const droppedNoCache = droppedNoCacheCount - countsBefore.droppedNoCache;
     needsFetch = ordered.slice(0, MAX_COLD_FETCH_PER_RUN);
     // Rotation arithmetic uses MAX_COLD_FETCH_PER_RUN directly rather than
     // needsFetch.length — needsFetch was just reassigned to the cap-sized
     // slice, so the two are numerically equal here, but using the constant
     // keeps the intent unambiguous if this log block is ever reordered.
     const originalMisses = MAX_COLD_FETCH_PER_RUN + servedStale + droppedTooOld + droppedNoCache;
-    // Surface the bucket counts to the outer-scope fields so main()'s
-    // degradation-guard bypass can include them in the partial-publish log.
-    servedStaleCount = servedStale;
-    droppedTooOldCount = droppedTooOld;
-    droppedNoCacheCount = droppedNoCache;
     console.warn(
       `  [port-activity] Cold-fetch capped at ${MAX_COLD_FETCH_PER_RUN}/run — ` +
-      `refreshing ${MAX_COLD_FETCH_PER_RUN} now, serving ${servedStale} on stale cache (asof behind), ` +
-      `${droppedTooOld} dropped (cache > ${MAX_CACHE_AGE_MS / 86_400_000}d old), ${droppedNoCache} dropped (no prior payload). ` +
+      `refreshing ${MAX_COLD_FETCH_PER_RUN} now, retaining ${servedStale} usable cached payloads (refresh deferred), ` +
+      `${droppedTooOld} dropped (cache >= ${MAX_CACHE_AGE_MS / 86_400_000}d old), ${droppedNoCache} dropped (no prior payload). ` +
       `Rotation: ~${Math.ceil(originalMisses / MAX_COLD_FETCH_PER_RUN)} runs to fully refresh.`,
     );
   }
@@ -1075,20 +1426,54 @@ export async function fetchAll(progress, { signal } = {}) {
 
   const errors = progress?.errors ?? [];
   const activityStart = Date.now();
+  const retainFailedAttempt = (item, reason, attemptedAt) => {
+    const state = buildRefreshFailureState(item, reason, attemptedAt);
+    refreshFailures.push({
+      iso2: item.iso2,
+      code: state.refreshFailure.code,
+    });
+    // A transient refresh failure must not discard still-usable data.
+    // refreshAttemptedAt advances rotation fairness; cacheWrittenAt remains
+    // unchanged, so the hard-expiry decision stays truthful.
+    // A corrupt stored value was read successfully but is not usable state.
+    // Keep its original bytes if repair fails; never replace it with a marker.
+    retainPriorState(item.iso2,
+      item.prevPayload === CORRUPT_COUNTRY_CACHE ? item.prevPayload : state,
+      attemptedAt);
+  };
 
+  const completedFetches = new Set();
   for (let i = 0; i < needsFetch.length; i += CONCURRENCY) {
     const batch = needsFetch.slice(i, i + CONCURRENCY);
     const batchIdx = Math.floor(i / CONCURRENCY) + 1;
+    const attemptedAt = Date.now();
     if (progress) progress.batchIdx = batchIdx;
 
-    const promises = batch.map(({ iso3, upstreamMaxDate }) => {
+    const promises = batch.map(({
+      iso3,
+      upstreamMaxDate,
+      preflightObservation,
+      prevPayload,
+    }) => {
       // Anchor the rolling windows to upstream max(date) so the aggregate
       // is stable day-over-day when upstream is frozen (required for cache
       // reuse to be semantically correct — see PR #3299 review P1).
-      // Falls back to Date.now() when preflight returned null.
-      const anchorEpochMs = parseMaxDateToAnchor(upstreamMaxDate);
+      //
+      // A failed preflight reuses the country's own cached anchor before the
+      // run anchor — see resolveCountryAnchorMs.
+      const anchorEpochMs = resolveCountryAnchorMs(
+        upstreamMaxDate,
+        runAnchorFallbackMs,
+        prevPayload?.asof,
+      );
       const p = withPerCountryTimeout(
-        (childSignal) => fetchCountryAccum(iso3, { signal: childSignal, anchorEpochMs, dateField }),
+        (childSignal) => fetchCountryActivityWithRecovery(iso3, {
+          signal: childSignal,
+          anchorEpochMs,
+          dateField,
+          preflightObservation,
+          refMap: refsByIso3.get(iso3),
+        }),
         iso3,
       );
       // Eager error flush so a SIGTERM mid-batch captures rejections that
@@ -1101,20 +1486,52 @@ export async function fetchAll(progress, { signal } = {}) {
     for (let j = 0; j < batch.length; j++) {
       const { iso3, iso2, upstreamMaxDate } = batch[j];
       const outcome = settled[j];
-      if (outcome.status === 'rejected') continue; // already recorded via .catch
-      const portAccumMap = outcome.value;
-      if (!portAccumMap || portAccumMap.size === 0) continue;
+      completedFetches.add(iso2);
+      if (outcome.status === 'rejected') {
+        retainFailedAttempt(batch[j], outcome.reason, attemptedAt);
+        continue; // diagnostic already recorded via eager .catch
+      }
+      const { portAccumMap, verifiedZero } = outcome.value ?? {};
+      if (!portAccumMap || (portAccumMap.size === 0 && !verifiedZero)) {
+        const reason = Object.assign(new Error('invalid country activity outcome'), {
+          refreshFailureCode: 'invalid_empty',
+        });
+        errors.push(`${iso3}: ${reason.message}`);
+        retainFailedAttempt(batch[j], reason, attemptedAt);
+        continue;
+      }
       const ports = finalisePortsForCountry(portAccumMap, refsByIso3.get(iso3));
-      if (!ports.length) continue;
+      if (!ports.length && !verifiedZero) {
+        const reason = Object.assign(new Error('empty final port list'), {
+          refreshFailureCode: 'empty_ports',
+        });
+        errors.push(`${iso3}: ${reason.message}`);
+        retainFailedAttempt(batch[j], reason, attemptedAt);
+        continue;
+      }
+      const refreshedAt = Date.now();
       countryData.set(iso2, {
         iso2,
         ports,
-        fetchedAt: new Date().toISOString(),
-        // Cache fields. `asof` may be null if preflight failed; that's fine —
-        // next run will always be a miss (null !== any string) so we'll
-        // re-fetch and repopulate.
+        zeroActivity: verifiedZero,
+        fetchedAt: new Date(refreshedAt).toISOString(),
+        // Content clock (#6060): advances only when upstream's own max(date)
+        // advances, so a forced refetch of FROZEN upstream data cannot reset it
+        // and green the content-freshness alarm. Seeded from the upstream
+        // observation date when no prior clock exists — stamping `refreshedAt`
+        // there would report a frozen upstream as fresh for a full budget
+        // window after rollout, since every payload predates this field.
+        // A verified zero is a successful current observation, not a failed
+        // preflight. Refresh its content clock when the seven-day cache expires.
+        contentAsOfChangedAt: verifiedZero
+          ? refreshedAt
+          : contentClockFor(batch[j].prevPayload, upstreamMaxDate, refreshedAt),
+        // Cache fields. `asof` is null for a failed preflight or a verified
+        // zero. Only the verified-zero marker can make a later explicit null
+        // observation reuse this payload.
         asof: upstreamMaxDate,
-        cacheWrittenAt: Date.now(),
+        cacheWrittenAt: refreshedAt,
+        refreshAttemptedAt: attemptedAt,
       });
       freshFetchedCount++;
     }
@@ -1122,23 +1539,23 @@ export async function fetchAll(progress, { signal } = {}) {
     if (progress) progress.seeded = countryData.size;
     if (batchIdx === 1 || batchIdx % BATCH_LOG_EVERY === 0 || batchIdx === batches) {
       const elapsed = ((Date.now() - activityStart) / 1000).toFixed(1);
-      console.log(`  [port-activity]   batch ${batchIdx}/${batches}: ${countryData.size} countries published, ${errors.length} errors (${elapsed}s)`);
+      console.log(`  [port-activity]   batch ${batchIdx}/${batches}: ${countryData.size} usable country payloads assembled; ${errors.length} refresh errors; persistence pending (${elapsed}s)`);
     }
 
     // Circuit-breaker: if batch 1 is ≥80% rejected with the SAME class of
     // error, treat it as an upstream global regression (schema rename, policy
     // change, dataset moved) — not a flake that more retries will clear.
-    // Skip the remaining batches and let the catch-path extendExistingTtl
-    // preserve prior payloads. Cuts failure cost ~30s → ~2s and keeps Sentry
-    // signal-to-noise sane during incidents like the 2026-04-29 IMF
-    // PortWatch `date` → `date_` rename.
+    // Skip the remaining batches and preserve their last-good state below.
+    // Cuts failure cost ~30s → ~2s and keeps Sentry signal-to-noise sane
+    // during incidents like the 2026-04-29 IMF PortWatch `date` → `date_`
+    // rename.
     if (batchIdx === 1 && batches > 1 && batch.length >= 5) {
       const sameClassRate = errors.filter(e => /Invalid query parameters/i.test(e)).length / batch.length;
       if (sameClassRate >= 0.8) {
         console.error(
           `  [port-activity] CIRCUIT-BREAKER: ${(sameClassRate * 100).toFixed(0)}% of batch 1 rejected with "Invalid query parameters" — ` +
           `assuming upstream schema/policy regression. Skipping remaining ${batches - 1} batches; ` +
-          `catch-path will extend TTLs on prior payloads. First error: ${errors[0]}`,
+          `unattempted countries will retain last-good state. First error: ${errors[0]}`,
         );
         break;
       }
@@ -1176,43 +1593,91 @@ export async function fetchAll(progress, { signal } = {}) {
     }
   }
 
+  const unattemptedFetches = needsFetch.filter(({ iso2 }) => !completedFetches.has(iso2));
+  if (unattemptedFetches.length > 0) {
+    const evaluatedAt = Date.now();
+    for (const item of unattemptedFetches) {
+      retainPriorState(item.iso2, item.prevPayload, evaluatedAt);
+    }
+    console.warn(
+      `  [port-activity] ${unattemptedFetches.length} queued countries were not attempted; ` +
+      'retained last-good or scheduler-only state without advancing their attempt cursor.',
+    );
+  }
+
   if (errors.length) {
     console.warn(`  [port-activity] ${errors.length} country errors: ${errors.slice(0, 5).join('; ')}${errors.length > 5 ? ' ...' : ''}`);
   }
 
-  if (countryData.size === 0) throw new Error('No country port data returned from ArcGIS');
-  return {
-    countries: [...countryData.keys()],
+  const countries = [...countryData.keys()];
+  const coverage = buildCoverageReport({
+    eligibleCountries: eligibleIso3.map((iso3) => iso3ToIso2.get(iso3)),
+    expectedCountries,
     countryData,
+    retryState,
+    refreshFailures,
+  });
+  if (!coverage.complete) {
+    const failureCodes = coverage.refreshFailures.length > 0
+      ? ` Refresh failures: ${coverage.refreshFailures.map(({ iso2, code }) => `${iso2}:${code}`).join(', ')}.`
+      : '';
+    console.error(
+      `  [port-activity] COVERAGE GAPS: ${coverage.published}/${coverage.target} usable; ` +
+      `countries without usable payloads: ${coverage.missingCountries.join(', ') || 'none'}; ` +
+      `unidentified shortfall: ${coverage.unidentifiedMissingCount}.${failureCodes}`,
+    );
+  }
+  return {
+    countries,
+    countryData,
+    retryState,
+    coverage,
     fetchedAt: new Date().toISOString(),
-    // Cap-mode signaling — see capTriggered declaration. main() reads these
-    // to bypass the 80% degradation guard for an intentionally-partial
-    // publish AND to emit a "PARTIAL PUBLISH" log noting the fresh/stale split.
-    capTriggered,
     servedStaleCount,
     droppedTooOldCount,
     droppedNoCacheCount,
-    // Fresh upstream contact this run. Surfaced so main() can gate the
-    // cap-mode bypass on a minimum-fresh-success floor — see
-    // MIN_FRESH_FETCH_FOR_CAP_BYPASS. Without this, a run with all-stale
-    // served entries (freshFetched=0, cacheHits=0, servedStale≥25) could
-    // bypass the degradation guard and publish a shrunken canonical list
-    // as healthy, hiding the upstream outage.
+    // Report current observations separately from usable retained coverage.
     freshFetchedCount,
     cacheHitCount: cacheHits,
   };
 }
 
-export function validateFn(data) {
-  return !!(data && Array.isArray(data.countries) && data.countries.length >= MIN_VALID_COUNTRIES);
+export function shouldAdvanceCanonicalForRun({
+  countryCount,
+  referenceCountryCount,
+  upstreamContactCount,
+  coverage,
+}) {
+  return referenceCountryCount >= PORTWATCH_PORT_ACTIVITY_TARGET_COUNTRIES
+    && coverage?.complete === true
+    && coverage.refreshFailures.length === 0
+    && countryCount === coverage.target
+    // Daily source advances must not invalidate a completed rolling sweep.
+    // Every country must remain usable, and this run must do useful upstream
+    // work. Per-country timestamps and content clocks remain unchanged on reuse.
+    && upstreamContactCount > 0;
 }
 
-export function shouldAdvanceCanonical(countryCount, floor = MIN_CANONICAL_PUBLISH) {
-  const count = Number(countryCount);
-  return Number.isFinite(count) && count >= floor;
+export function buildPortActivityFailureMeta(previousMeta, {
+  coverage,
+  reason,
+  now = Date.now(),
+} = {}) {
+  return {
+    ...previousMeta,
+    sourceState: 'error',
+    errorCode: `PORTWATCH_${(reason ? refreshFailureCode(reason) : 'coverage_partial').toUpperCase()}`,
+    lastAttemptAt: now,
+    coverage: {
+      ...coverage,
+      complete: false,
+      status: coverage ? 'partial' : 'degraded',
+      completionRatio: coverage ? coverage.published / coverage.target : null,
+    },
+  };
 }
 
-async function main() {
+export async function main() {
   const startedAt = Date.now();
   const runId = `portwatch-ports:${startedAt}`;
 
@@ -1229,7 +1694,9 @@ async function main() {
 
   // Hoist so the catch block can extend TTLs even when the error occurs before these are resolved.
   let prevCountryKeys = [];
-  let prevCount = 0;
+  let previousMeta;
+  let previousRead = false;
+  let failureRecorded = false;
 
   // Shared progress object so the SIGTERM handler can report which batch /
   // stage we died in and what per-country errors have fired so far.
@@ -1254,6 +1721,11 @@ async function main() {
     console.error('  [port-activity] Releasing lock + extending TTLs');
     try {
       await extendExistingTtl([CANONICAL_KEY, META_KEY, ...prevCountryKeys], TTL);
+      if (previousRead) await publishPortActivitySnapshot({
+        countryData: new Map(),
+        canonicalAdvances: false,
+        metaPayload: buildPortActivityFailureMeta(previousMeta, { reason: new Error('SIGTERM') }),
+      });
     } catch {}
     try { await releaseLock(LOCK_DOMAIN, runId); } catch {}
     process.exit(1);
@@ -1262,128 +1734,82 @@ async function main() {
   process.on('SIGINT', onSigterm);
 
   try {
-    const prevIso2List = await readSeedSnapshot(CANONICAL_KEY).catch(() => null);
+    const prevIso2List = await readSeedSnapshot(CANONICAL_KEY, { strict: true });
+    previousMeta = await readSeedSnapshot(META_KEY, { strict: true });
+    if (prevIso2List !== null && (!Array.isArray(prevIso2List)
+      || prevIso2List.some((iso2) => typeof iso2 !== 'string' || !/^[A-Z]{2}$/.test(iso2)))) {
+      throw new Error('Invalid PortWatch canonical snapshot');
+    }
+    if (previousMeta !== null && (typeof previousMeta !== 'object' || Array.isArray(previousMeta))) {
+      throw new Error('Invalid PortWatch seed metadata');
+    }
+    previousRead = true;
     prevCountryKeys = Array.isArray(prevIso2List) ? prevIso2List.map(iso2 => `${KEY_PREFIX}${iso2}`) : [];
-    prevCount = Array.isArray(prevIso2List) ? prevIso2List.length : 0;
 
     console.log(`  Fetching port activity data (60d: last30 + prev30 windows)...`);
     const {
       countries,
       countryData,
-      capTriggered,
       servedStaleCount,
       droppedTooOldCount,
       droppedNoCacheCount,
       freshFetchedCount,
       cacheHitCount,
-    } = await fetchAll(progress, { signal: shutdownController.signal });
+      retryState,
+      coverage,
+    } = await fetchAll(progress, {
+      signal: shutdownController.signal,
+      expectedCountries: Array.isArray(prevIso2List) ? prevIso2List : [],
+    });
 
-    console.log(`  Fetched ${countryData.size} countries`);
+    console.log(`  Assembled ${countryData.size} usable country payloads; persistence pending`);
 
-    if (!validateFn({ countries })) {
-      console.error(`  COVERAGE GATE FAILED: only ${countryData.size} countries, need >=${MIN_VALID_COUNTRIES}`);
-      await extendExistingTtl([CANONICAL_KEY, META_KEY, ...prevCountryKeys], TTL).catch(() => {});
-      return;
-    }
+    const canonicalAdvances = !shutdownController.signal.aborted && shouldAdvanceCanonicalForRun({
+      countryCount: countryData.size,
+      referenceCountryCount: coverage.referenceCountryCount,
+      upstreamContactCount: freshFetchedCount + cacheHitCount,
+      coverage,
+    });
+    const metaPayload = canonicalAdvances
+      ? { ...buildPortActivityMetaPayload({ countryData, coverage: { ...coverage, status: 'complete', completionRatio: 1 } }), sourceState: 'ok' }
+      : buildPortActivityFailureMeta(previousMeta, { coverage });
 
-    // Degradation guard — bypass when capTriggered (Greptile PR #3694 round 3 P1).
-    //
-    // The 80%-of-prev guard exists to catch SILENT data loss: an ArcGIS
-    // regression that drops 100 → 50 countries with no other signal. In
-    // cap-mode the partial coverage is LOUD, INTENTIONAL, and ROTATIONAL
-    // (refresh 30 per run, serve rest from cache up to 7d age) — the
-    // coverage gate (countryData.size ≥ MIN_VALID_COUNTRIES) is the right
-    // floor here, not the 80%-of-prev comparison.
-    //
-    // Without this bypass, the cap-mode path would always trip the guard
-    // (cap=30 + ~24 stale-served = ~54 << 0.8 × 174 = 139), seed-meta
-    // would never advance, and the operator-facing WARNING would persist
-    // — defeating the entire recovery design from #3676 onwards.
-    //
-    // PR #3701 review P1: the bypass MUST also require fresh upstream
-    // contact this run (freshFetchedCount + cacheHitCount). Pre-fix, a
-    // worst-case "ArcGIS completely down" run with freshSuccess=0,
-    // cacheHits=0, servedStale=27 would pass the lowered coverage gate
-    // (countryData.size=27 ≥ 25) and bypass the degradation guard, shrinking
-    // the canonical list from ~174 → 27 stale-only entries and advancing
-    // seed-meta as healthy — hiding the upstream outage. With this gate,
-    // such a run falls through to the 80% guard (which fires and
-    // extendExistingTtl-only), preserving the canonical list and the
-    // operator-facing WARNING.
-    const upstreamContactCount = freshFetchedCount + cacheHitCount;
-    const capBypassEarned = capTriggered && upstreamContactCount >= MIN_FRESH_FETCH_FOR_CAP_BYPASS;
-    if (capBypassEarned) {
-      console.warn(
-        `  PARTIAL PUBLISH (cap-mode): ${countryData.size}/${prevCount} countries — ` +
-        `${freshFetchedCount} fresh-fetched, ${cacheHitCount} cache-fresh, ${servedStaleCount} stale-served, ` +
-        `${droppedTooOldCount} dropped (cache > 7d), ${droppedNoCacheCount} dropped (no prior payload). ` +
-        `Degradation guard bypassed (≥${MIN_FRESH_FETCH_FOR_CAP_BYPASS} fresh upstream contacts); seed-meta will advance.`,
-      );
-    } else if (capTriggered) {
-      // Cap-mode WITHOUT enough fresh upstream contact — fall through to the
-      // 80% guard. If we got here, freshFetched + cacheHits < threshold,
-      // which means this is an upstream-degraded run, not a rotational one.
-      // Log explicitly so the operator sees why the bypass didn't fire.
+    let canonicalTtlExtended = false;
+    if (!canonicalAdvances) {
+      const retention = await extendExistingTtlDetailed([CANONICAL_KEY, META_KEY, ...prevCountryKeys], TTL);
+      canonicalTtlExtended = retention.extendedKeys.includes(CANONICAL_KEY);
       console.error(
-        `  CAP-MODE BYPASS REFUSED: only ${upstreamContactCount} fresh upstream contacts ` +
-        `(${freshFetchedCount} fetched + ${cacheHitCount} cache-fresh, threshold ${MIN_FRESH_FETCH_FOR_CAP_BYPASS}). ` +
-        `Stale-only published would hide the upstream outage. Falling through to 80% degradation guard.`,
+        `  INCOMPLETE RUN: ${countryData.size}/${coverage.target} usable countries; ` +
+        `${freshFetchedCount} fetched, ${cacheHitCount} cache-fresh, ${servedStaleCount} stale-served, ` +
+        `${droppedTooOldCount} expired, ${droppedNoCacheCount} missing. ` +
+        'Full publication blocked; recovery-state and failure-metadata writes pending.',
       );
-      if (prevCount > 0 && countryData.size < prevCount * 0.8) {
-        console.error(`  DEGRADATION GUARD: ${countryData.size} countries vs ${prevCount} previous — refusing to overwrite (need ≥${Math.ceil(prevCount * 0.8)})`);
-        await extendExistingTtl([CANONICAL_KEY, META_KEY, ...prevCountryKeys], TTL).catch(() => {});
-        return;
-      }
-    } else if (prevCount > 0 && countryData.size < prevCount * 0.8) {
-      console.error(`  DEGRADATION GUARD: ${countryData.size} countries vs ${prevCount} previous — refusing to overwrite (need ≥${Math.ceil(prevCount * 0.8)})`);
-      await extendExistingTtl([CANONICAL_KEY, META_KEY, ...prevCountryKeys], TTL).catch(() => {});
-      return;
     }
 
-    // PR #3760 round 2 P1: split per-country writes from canonical/meta
-    // advance. Per-country writes always go through (cache-fresh rotation
-    // accumulates), but CANONICAL + META only advance when total coverage
-    // crosses MIN_CANONICAL_PUBLISH — protects consumers from seeing a
-    // 5-country canonical published as fresh during recovery.
-    const canonicalAdvances = shouldAdvanceCanonical(countryData.size);
-    const metaPayload = { fetchedAt: Date.now(), recordCount: countryData.size };
-
-    const commands = [];
-    for (const [iso2, payload] of countryData) {
-      commands.push(['SET', `${KEY_PREFIX}${iso2}`, JSON.stringify(payload), 'EX', TTL]);
-    }
+    console.log(`  Persistence pending: usable coverage ${countryData.size}/${coverage.target}; ${coverage.refreshFailures.length} unresolved refresh failures`);
+    await publishPortActivitySnapshot({
+      countryData,
+      retryState,
+      countries,
+      metaPayload,
+      canonicalAdvances,
+    });
+    failureRecorded = !canonicalAdvances;
+    let canonicalState = 'no prior canonical list';
     if (canonicalAdvances) {
-      commands.push(['SET', CANONICAL_KEY, JSON.stringify(countries), 'EX', TTL]);
-      commands.push(['SET', META_KEY, JSON.stringify(metaPayload), 'EX', TTL]);
-    } else {
-      // Per-country fresh data persists, but canonical list + seed-meta
-      // stay at the prior version. extendExistingTtl preserves the
-      // operator-facing state stable — consumers reading CANONICAL see the
-      // prior canonical list with their existing data (mostly stale for
-      // not-yet-rotated entries, fresh for the ones we just wrote).
-      //
-      // Greptile PR #3760 round 3 P1: prevCountryKeys MUST be extended
-      // here too, mirroring the COVERAGE GATE / DEGRADATION GUARD
-      // failure paths. Without it, untouched countries' per-country
-      // payloads (TTL=3d) can expire during a multi-day partial
-      // recovery while the canonical list still references them —
-      // contradicting the "consumers see the prior canonical list with
-      // their existing data" claim. The keys we DO write in
-      // `commands` below get their own SET ... EX TTL, so this only
-      // affects the un-refreshed entries from the prior list.
-      await extendExistingTtl([CANONICAL_KEY, META_KEY, ...prevCountryKeys], TTL).catch(() => {});
-      console.warn(
-        `  PARTIAL PERSIST: ${countryData.size}/${MIN_CANONICAL_PUBLISH} below canonical-publish floor — ` +
-        `${countryData.size} per-country payload(s) written (cache rotation accumulates), ` +
-        `canonical + seed-meta + prior per-country keys preserved.`,
-      );
+      canonicalState = `canonical list advanced to ${countries.length} countries`;
+    } else if (prevIso2List !== null) {
+      canonicalState = canonicalTtlExtended
+        ? `canonical list retained at ${prevIso2List.length} countries`
+        : `canonical retention unconfirmed (${prevIso2List.length} countries at run start)`;
     }
-
-    const results = await redisPipeline(commands);
-    const failures = results.filter(r => r?.error || r?.result === 'ERR');
-    if (failures.length > 0) {
-      throw new Error(`Redis pipeline: ${failures.length}/${commands.length} commands failed`);
-    }
+    console.log(
+      `  ${canonicalAdvances ? 'State saved' : 'Recovery state saved'}; ${canonicalState}; ` +
+      `usable coverage ${countryData.size}/${coverage.target}; ` +
+      `${canonicalAdvances ? '' : 'full publication blocked; '}` +
+      `${coverage.refreshFailures.length} unresolved refresh failures`,
+    );
+    if (!canonicalAdvances) throw new Error('Incomplete PortWatch coverage; canonical retained');
 
     logSeedResult('supply_chain', countryData.size, Date.now() - startedAt, { source: 'portwatch-ports' });
     console.log(`  Seeded ${countryData.size} countries`);
@@ -1391,8 +1817,17 @@ async function main() {
   } catch (err) {
     console.error(`  SEED FAILED: ${err.message}`);
     await extendExistingTtl([CANONICAL_KEY, META_KEY, ...prevCountryKeys], TTL).catch(() => {});
+    if (previousRead && !failureRecorded) {
+      await publishPortActivitySnapshot({
+        countryData: new Map(),
+        canonicalAdvances: false,
+        metaPayload: buildPortActivityFailureMeta(previousMeta, { reason: err }),
+      });
+    }
     throw err;
   } finally {
+    process.removeListener('SIGTERM', onSigterm);
+    process.removeListener('SIGINT', onSigterm);
     await releaseLock(LOCK_DOMAIN, runId);
   }
 }

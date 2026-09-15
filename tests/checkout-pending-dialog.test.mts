@@ -98,10 +98,15 @@ function installBrowserGlobals(): void {
       globalThis.__pendingDialogHarness.fetchBodies.push(body);
       // With the override flag the backend skips the pending guard -> 200 + url.
       if (body && body.bypassPendingGuard === true) {
+        // Both json() and text() are modelled: a real Response exposes both,
+        // and the success path reads text() so a non-JSON 200 cannot throw an
+        // engine-specific DOMException (WORLDMONITOR-XV).
         return {
           ok: true,
           status: 200,
           json: async () => ({ checkout_url: BYPASS_URL }),
+          text: async () => JSON.stringify({ checkout_url: BYPASS_URL }),
+          headers: { get: () => null },
         };
       }
       // Otherwise the guard fires: a 409 PAYMENT_IN_PROGRESS block.
@@ -150,6 +155,12 @@ const stubSources: Record<string, string> = {
   './analytics': `
     export const trackCheckoutStart = () => {};
   `,
+  // #5911 pulled the desktop detector into checkout.ts (desktop routes
+  // checkout to the OS browser). Stubbed so these web-path suites STATE their
+  // runtime rather than inferring it from a synthesised window.
+  './desktop-runtime': `
+    export const isDesktopRuntime = () => false;
+  `,
   './auth-state': `
     export const subscribeAuthState = () => () => {};
   `,
@@ -164,10 +175,24 @@ const stubSources: Record<string, string> = {
     export const showCheckoutErrorToast = () => {};
   `,
   './checkout-no-user-policy': `
-    export const decideNoUserPathOutcome = () => ({ kind: 'inline-signin', persist: true });
+    // Mirrors the real module's inline-signin sequencing (persist BEFORE
+    // sign-in); the ordering itself is owned by
+    // tests/checkout-no-user-policy.test.mts against the real function.
+    export const runNoUserPath = (_fallbackToPricingPage, handlers) => {
+      handlers.persistIntent();
+      handlers.persistAttempt();
+      handlers.openSignIn();
+    };
   `,
   './checkout-sentry-policy': `
     export const shouldSkipSentryForAction = () => false;
+    export const CHECKOUT_REPORT_KIND = 'checkout_request_failed';
+    export const buildCheckoutReportTags = (input) => ({
+      component: 'dodo-checkout',
+      action: input.action,
+      code: input.code,
+      kind: CHECKOUT_REPORT_KIND,
+    });
   `,
   './entitlements': `
     export const isEntitled = () => false;
@@ -176,10 +201,16 @@ const stubSources: Record<string, string> = {
   './checkout-banner-state': `
     export const CLASSIC_AUTO_DISMISS_MS = 5000;
     export const EXTENDED_UNLOCK_TIMEOUT_MS = 30000;
+    export const ENTITLEMENT_POLL_MS = 1000;
+    export const LATE_ACTIVATION_GRACE_MS = 300000;
     export const maskEmail = (email) => email ?? null;
   `,
   './referral-capture': `
     export const loadActiveReferral = () => null;
+    // Re-exported real, never faked: startCheckout gates its outgoing
+    // referral on this, so a stub that always returns true would make any
+    // referral assertion in this harness vacuous (#6493).
+    export { isAffiliateCode } from './src/services/referral-capture.ts';
   `,
   './checkout-duplicate-dialog': `
     export const showDuplicateSubscriptionDialog = () => {};
@@ -211,6 +242,8 @@ const pendingDialogPlugin: Plugin = {
     buildApi.onLoad({ filter: /.*/, namespace: 'pending-stub' }, (args) => ({
       contents: stubSources[args.path],
       loader: 'js',
+      // Lets a stub re-export the real module it partially replaces.
+      resolveDir: process.cwd(),
     }));
   },
 };

@@ -5,7 +5,7 @@
  * tier view model for the /pro pricing page. Cached in Redis with
  * configurable TTL.
  *
- * GET /api/product-catalog → { tiers: [...], fetchedAt, cachedUntil }
+ * GET /api/product-catalog → { product, currency, plans, capabilities, tiers, fetchedAt, cachedUntil }
  * DELETE /api/product-catalog → purge cache (requires RELAY_SHARED_SECRET)
  */
 
@@ -14,11 +14,19 @@
 export const config = { runtime: 'edge' };
 
 // @ts-expect-error — JS module
-import { getCorsHeaders } from './_cors.js';
+import { getCorsHeaders, getPublicCorsHeaders, isDisallowedOrigin } from './_cors.js';
 // @ts-expect-error — JS module
 import { timingSafeEqualSecret } from './_crypto.js';
 // @ts-expect-error — generated JS module
-import { FALLBACK_PRICES } from './_product-fallback-prices.js';
+import {
+  FALLBACK_PRICES,
+  PRODUCT_CATALOG as CATALOG,
+  PUBLIC_PRODUCT_FACTS,
+  PUBLIC_TIER_GROUPS,
+  TIER_CONFIG,
+} from './_product-catalog.generated.js';
+// @ts-expect-error — build-generated JS module
+import { PUBLIC_INVENTORY_FACTS } from './_inventory-facts.generated.js';
 // @ts-expect-error — JS module
 import { unwrapEnvelope } from './_seed-envelope.js';
 
@@ -28,71 +36,8 @@ const DODO_API_KEY = process.env.DODO_API_KEY ?? '';
 const DODO_ENV = process.env.DODO_PAYMENTS_ENVIRONMENT ?? 'test_mode';
 const RELAY_SECRET = process.env.RELAY_SHARED_SECRET ?? '';
 
-const CACHE_KEY = 'product-catalog:v2';
+const CACHE_KEY = 'product-catalog:v3';
 const CACHE_TTL = 3600; // 1 hour
-
-// Product IDs and their catalog metadata (non-price fields).
-// Prices come from Dodo at runtime, everything else from this map.
-const CATALOG = {
-  'pdt_0Nbtt71uObulf7fGXhQup': { planKey: 'pro_monthly', tierGroup: 'pro', billingPeriod: 'monthly' },
-  'pdt_0NbttMIfjLWC10jHQWYgJ': { planKey: 'pro_annual', tierGroup: 'pro', billingPeriod: 'annual' },
-  'pdt_0NbttVmG1SERrxhygbbUq': { planKey: 'api_starter', tierGroup: 'api_starter', billingPeriod: 'monthly' },
-  'pdt_0Nbu2lawHYE3dv2THgSEV': { planKey: 'api_starter_annual', tierGroup: 'api_starter', billingPeriod: 'annual' },
-  'pdt_0Nbttg7NuOJrhbyBGCius': { planKey: 'api_business', tierGroup: 'api_business', billingPeriod: 'monthly' },
-  'pdt_0Nbttnqrfh51cRqhMdVLx': { planKey: 'enterprise', tierGroup: 'enterprise', billingPeriod: 'none' },
-};
-
-// Marketing features and display config (doesn't change with Dodo prices).
-// ⚠ MANUAL MIRROR — three copies of this tier config exist and must move
-// together: convex/config/productCatalog.ts (source of truth,
-// marketingFeatures), this TIER_CONFIG, and DODO_TIER_CONFIG in
-// scripts/ais-relay.cjs (the Railway seeder whose Redis payload WINS over
-// this endpoint's fallback on cache hits). Parity is enforced by
-// tests/product-catalog-freshness.test.mjs — extend it when adding fields.
-const TIER_CONFIG = {
-  free: {
-    name: 'Free',
-    localeKey: 'free',
-    description: 'Get started with the essentials',
-    features: ['Core dashboard panels', 'Global news feed', 'Earthquake & weather alerts', 'Basic map view'],
-    cta: 'Get Started',
-    href: 'https://worldmonitor.app/dashboard',
-    highlighted: false,
-  },
-  pro: {
-    name: 'Pro',
-    localeKey: 'pro',
-    description: 'Full intelligence dashboard',
-    features: ['Everything in Free', 'AI stock analysis & backtesting', 'Daily market briefs', 'Military & geopolitical tracking', 'Custom widget builder', 'MCP + SDK access for Claude Desktop & other AI clients (50 calls/day)', 'Priority data refresh'],
-    highlighted: true,
-  },
-  api_starter: {
-    name: 'API',
-    localeKey: 'api',
-    description: 'Programmatic access to intelligence data',
-    features: ['REST API + official SDKs (npm, PyPI, RubyGems, Go)', 'License / API key included', 'Real-time data streams', '60 requests/minute', '1,000 requests/day included', 'Webhook notifications', 'Custom data exports'],
-    highlighted: false,
-  },
-  api_business: {
-    name: 'API Business',
-    localeKey: 'apiBusiness',
-    description: 'High-volume API for teams',
-    features: ['Everything in API Starter', '300 requests/minute', '10,000 requests/day included', 'Priority support'],
-    highlighted: false,
-  },
-  enterprise: {
-    name: 'Enterprise',
-    localeKey: 'enterprise',
-    description: 'Custom solutions for organizations',
-    features: ['Everything in Pro + API', 'Unlimited API requests', 'Dedicated support', 'Custom integrations', 'SLA guarantee', 'On-premise option'],
-    cta: 'Contact Sales',
-    href: 'mailto:enterprise@worldmonitor.app',
-    highlighted: false,
-  },
-};
-
-// Tier groups shown on the /pro page (ordered)
-const PUBLIC_TIER_GROUPS = ['free', 'pro', 'api_starter', 'api_business', 'enterprise'];
 
 function json(body, status, cors, cacheControl, source) {
   return new Response(JSON.stringify(body), {
@@ -110,6 +55,14 @@ function json(body, status, cors, cacheControl, source) {
   });
 }
 
+function withPublicFacts(payload) {
+  return {
+    ...payload,
+    ...PUBLIC_PRODUCT_FACTS,
+    capabilities: PUBLIC_INVENTORY_FACTS.capabilities,
+  };
+}
+
 async function getFromCache() {
   if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
   try {
@@ -120,7 +73,7 @@ async function getFromCache() {
     if (!res.ok) return null;
     const { result } = await res.json();
     if (!result) return null;
-    // Envelope-aware: ais-relay now writes `product-catalog:v2` as {_seed, data}
+    // Envelope-aware: ais-relay writes `product-catalog:v3` as {_seed, data}
     // (PR #3097). Return the bare payload so clients see the legacy
     // {tiers, fetchedAt, cachedUntil, priceSource} shape. Pre-contract bare
     // values pass through unchanged.
@@ -128,17 +81,13 @@ async function getFromCache() {
   } catch { return null; }
 }
 
-async function setCache(data) {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
-  try {
-    await fetch(`${UPSTASH_URL}`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(['SET', CACHE_KEY, JSON.stringify(data), 'EX', String(CACHE_TTL)]),
-      signal: AbortSignal.timeout(3000),
-    });
-  } catch { /* non-fatal */ }
-}
+// This handler is READ-ONLY on `product-catalog:v3` on purpose — no setCache
+// here. The Railway ais-relay seed loop owns the key (envelope shape, longer
+// TTL; PR #3097), and the Dodo fallback path below says so explicitly:
+// "Don't write to Redis — let the Railway seed own that key". A writer here
+// would clobber the relay's {_seed, data} envelope with the bare legacy shape
+// and fight its TTL. The orphaned setCache() that used to sit here was the
+// symptom of that fork in ownership, not a missing call (#7211).
 
 async function purgeCache() {
   if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
@@ -245,10 +194,14 @@ function buildTiers(dodoPrices) {
 }
 
 export default async function handler(req) {
-  const cors = getCorsHeaders(req);
+  const cors = getCorsHeaders(req, 'GET, DELETE, OPTIONS');
+
+  if (isDisallowedOrigin(req)) {
+    return json({ error: 'Origin not allowed' }, 403, cors);
+  }
 
   if (req.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: { ...cors, 'Access-Control-Allow-Methods': 'GET, DELETE, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization' } });
+    return new Response(null, { status: 204, headers: cors });
   }
 
   // DELETE = purge cache (authenticated)
@@ -266,10 +219,12 @@ export default async function handler(req) {
     return json({ error: 'Method not allowed' }, 405, cors);
   }
 
+  const publicCors = getPublicCorsHeaders('GET, DELETE, OPTIONS');
+
   // Read from Redis (populated by Railway ais-relay seed loop)
   const cached = await getFromCache();
   if (cached) {
-    return json(cached, 200, cors, 'public, max-age=300, s-maxage=600, stale-while-revalidate=300', 'cache');
+    return json(withPublicFacts(cached), 200, publicCors, 'public, max-age=300, s-maxage=600, stale-while-revalidate=300', 'cache');
   }
 
   // Redis empty (purged or seed hasn't run). Try Dodo directly as backup.
@@ -284,17 +239,17 @@ export default async function handler(req) {
       const priceSource = dodoPriceCount === pricedPublicIds.length ? 'dodo' : 'partial';
       const tiers = buildTiers(dodoPrices);
       const now = Date.now();
-      const result = { tiers, fetchedAt: now, cachedUntil: now + CACHE_TTL * 1000, priceSource };
+      const result = withPublicFacts({ tiers, fetchedAt: now, cachedUntil: now + CACHE_TTL * 1000, priceSource });
       // Don't write to Redis — let the Railway seed own that key with its longer TTL.
       // Just return the result with short cache so the next Railway cycle repopulates properly.
       // Header must carry the SAME source as the body: a partial Dodo read
       // stamped 'dodo' here made probes read a degraded response as fully live.
-      return json(result, 200, cors, 'public, max-age=60, s-maxage=60', priceSource);
+      return json(result, 200, publicCors, 'public, max-age=60, s-maxage=60', priceSource);
     }
   }
 
   // All sources failed. Return fallback with short cache.
   const tiers = buildTiers({});
   const now = Date.now();
-  return json({ tiers, fetchedAt: now, cachedUntil: now + 60_000, priceSource: 'fallback' }, 200, cors, 'public, max-age=60, s-maxage=60', 'fallback');
+  return json(withPublicFacts({ tiers, fetchedAt: now, cachedUntil: now + 60_000, priceSource: 'fallback' }), 200, publicCors, 'public, max-age=60, s-maxage=60', 'fallback');
 }

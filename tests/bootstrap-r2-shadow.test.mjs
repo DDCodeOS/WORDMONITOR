@@ -79,6 +79,19 @@ function assertRedisDurationMatchesHeader(response, event) {
   assert.equal(event.redis_duration_ms.toFixed(3), header);
 }
 
+function nhcScaleConeRing(pointCount = 160) {
+  const points = [];
+  for (let i = 0; i < pointCount; i++) {
+    const angle = (i / pointCount) * Math.PI * 2;
+    points.push([
+      Number((-81 + Math.cos(angle) * 4 + Math.sin(angle * 9) * 0.12).toFixed(6)),
+      Number((26 + Math.sin(angle) * 2 + Math.cos(angle * 7) * 0.08).toFixed(6)),
+    ]);
+  }
+  points.push([...points[0]]);
+  return points;
+}
+
 beforeEach(() => {
   process.env.UPSTASH_REDIS_REST_URL = 'https://fake.upstash.io';
   process.env.UPSTASH_REDIS_REST_TOKEN = 'redis-token';
@@ -112,6 +125,54 @@ test('flag-off public tier response performs no probe and preserves the normal r
   assert.equal(calls.r2, 0);
   assert.equal(calls.axiom, 0);
   assert.equal(pending.length, 0);
+});
+
+test('Redis fallback compacts naturalEvents cones before serializing the public slow tier', async () => {
+  delete process.env.BOOTSTRAP_R2_SHADOW_MEASURE;
+  const rawRing = nhcScaleConeRing();
+  const naturalEvents = {
+    events: [
+      {
+        id: 'al-test-1',
+        source: 'nhc',
+        conePolygon: [rawRing],
+      },
+    ],
+  };
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = input instanceof Request ? input.url : input instanceof URL ? input.href : String(input);
+    if (!url.includes('fake.upstash.io')) throw new Error(`unexpected fetch ${url}`);
+
+    const commands = JSON.parse(init.body);
+    return new Response(JSON.stringify(commands.map((command) => (
+      command[0] === 'GET' && command[1] === 'natural:events:v1'
+        ? { result: JSON.stringify(naturalEvents) }
+        : { result: null }
+    ))), { status: 200 });
+  };
+
+  const response = await handler(makeRequest('tier=slow&public=1'));
+  const body = await response.json();
+  const compactedRing = body.data.naturalEvents.events[0].conePolygon[0];
+
+  assert.equal(response.status, 200);
+  assert.equal(body.missing.includes('naturalEvents'), false);
+  assert.ok(compactedRing.length <= 96, `expected capped cone ring, got ${compactedRing.length} points`);
+  assert.ok(compactedRing.length < rawRing.length, 'expected Redis fallback to reduce the cone ring');
+  assert.deepEqual(compactedRing[0], compactedRing.at(-1), 'compacted cone ring must stay closed');
+});
+
+test('China decision-signal public bootstrap cache is bounded to its 15-minute seed cadence', async () => {
+  delete process.env.BOOTSTRAP_R2_SHADOW_MEASURE;
+  installFetchHarness();
+
+  const response = await handler(makeRequest('keys=chinaDecisionSignals&public=1'));
+
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('Cache-Control') ?? '', /max-age=60\b/);
+  assert.match(response.headers.get('CDN-Cache-Control') ?? '', /\bs-maxage=900\b/);
+  assert.doesNotMatch(response.headers.get('CDN-Cache-Control') ?? '', /\bs-maxage=7200\b/);
 });
 
 test('shadow credentials are never exercised outside the production Vercel environment', async () => {
@@ -273,7 +334,10 @@ test('shadow source pins the uncensored probe ceiling and cannot consume serving
   assert.doesNotMatch(source, /bootstrapR2ServingTimeoutMs|BOOTSTRAP_R2_TIMEOUT_MS_FAST|BOOTSTRAP_R2_TIMEOUT_MS_SLOW/);
 
   const timerStop = source.indexOf('const redisDurationMs = measureR2Shadow');
-  const responseSerialization = source.indexOf('const response = jsonResponse({ data, missing }');
+  const responseSerialization = source.indexOf(
+    'const response = jsonResponse(\n    { data, missing },',
+    timerStop,
+  );
   assert.ok(timerStop >= 0 && responseSerialization >= 0);
   assert.ok(
     timerStop < responseSerialization,

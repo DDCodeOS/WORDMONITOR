@@ -458,11 +458,27 @@ export function dailyCounterKey(userId: string, date?: Date): string {
 }
 
 /**
+ * Companion to `dailyCounterKey`. Stores the highest finite daily limit that
+ * successfully reserved today, or `-1` after an unlimited-plan reserve.
+ * Rejection recovery reads this so a lower-limit credential path cannot
+ * SET the shared counter below a higher allowance already charged (#7298).
+ */
+export function dailyQuotaFloorKey(userId: string, date?: Date): string {
+  if (!userId) return '';
+  const d = date ?? new Date();
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  const base = `mcp:pro-usage-floor:${userId}:${yyyy}-${mm}-${dd}`;
+  return `${envPrefix()}${base}`;
+}
+
+/**
  * Compute the env-prefix at call time (NOT memoized — tests may mutate
  * VERCEL_ENV between calls; the cost is one trivial string read).
  * Production / unset → empty string. Mirrors `redis.ts::getKeyPrefix`.
  */
-function envPrefix(): string {
+export function envPrefix(): string {
   const env = process.env.VERCEL_ENV;
   if (!env || env === 'production') return '';
   const sha = process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 8) || 'dev';
@@ -473,11 +489,7 @@ function envPrefix(): string {
  * Seconds remaining until the next UTC midnight — used for the
  * `Retry-After` header on -32029 quota-exceeded responses.
  */
-export function secondsUntilUtcMidnight(now?: Date): number {
-  const d = now ?? new Date();
-  const next = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 0, 0, 0));
-  return Math.max(1, Math.ceil((next.getTime() - d.getTime()) / 1000));
-}
+export { secondsUntilUtcMidnight } from './api-key-rate-limit';
 
 /** Hard cap per UTC day for Pro MCP `tools/call`s. Plan default. */
 export const PRO_DAILY_QUOTA_LIMIT = 50;

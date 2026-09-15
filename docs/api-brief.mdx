@@ -30,8 +30,8 @@ brief yet.
 | 200 OK | `{ status: "ready", issueDate, issueSlot, dateLong, greeting, threadCount, magazineUrl }` |
 | 200 OK | `{ status: "composing", issueDate, issueSlot? }` — no brief for the current/requested slot yet |
 | 401 | Missing / invalid Clerk JWT |
-| 403 | `pro_required` |
-| 503 | `BRIEF_URL_SIGNING_SECRET` not configured |
+| 403 | `pro_required` (entitlement confirmed non-Pro) / `subscription_lapsed` (lapse confirmed with the provider, `X-Billing-Verification` set) |
+| 503 | `BRIEF_URL_SIGNING_SECRET` not configured — **or** entitlement verification in doubt: `entitlement_verification_unavailable` / `renewal_verification_pending` / `renewal_verification_failed`, with `Retry-After` and `X-Billing-Verification`. Distinguish on the `code` field. See [Error handling](/usage-errors) |
 
 `issueDate` remains the display/date field (`YYYY-MM-DD`). `issueSlot` is the
 frozen edition key (`YYYY-MM-DD-HHMM`) used for Redis lookup and HMAC binding;
@@ -58,9 +58,9 @@ is a pure function of `{userId, issueSlot, BRIEF_SHARE_SECRET}`.
 | 200 | `{ shareUrl, hash, issueSlot }` |
 | 400 | `invalid_slot_shape` / `invalid_payload` |
 | 401 | `UNAUTHENTICATED` |
-| 403 | `pro_required` |
+| 403 | `pro_required` (entitlement confirmed non-Pro) / `subscription_lapsed` (lapse confirmed with the provider, `X-Billing-Verification` set) |
 | 404 | `brief_not_found` — reader can't share what doesn't exist |
-| 503 | `service_unavailable` |
+| 503 | `service_unavailable` — **or** entitlement verification in doubt: `entitlement_verification_unavailable` / `renewal_verification_pending` / `renewal_verification_failed`, with `Retry-After` and `X-Billing-Verification`. Distinguish on the `code` field. See [Error handling](/usage-errors) |
 
 ### `GET /api/brief/public/{hash}`
 
@@ -68,23 +68,24 @@ is a pure function of `{userId, issueSlot, BRIEF_SHARE_SECRET}`.
 
 ## Carousel (images for social)
 
-### `GET /api/brief/carousel/{userId}/{issueSlot}/{page}.png`
+### `GET /api/brief/carousel/{userId}/{issueDate}/{page}.png?t={token}`
 
-Server-rendered PNG page (`page` = 1..N) of the brief, intended for Telegram `sendMediaGroup`, Slack `chat.postMessage`, LinkedIn, etc.
+Server-rendered PNG page of the brief, intended for Telegram `sendMediaGroup`, Slack `chat.postMessage`, LinkedIn, etc.
 
-- Rendered via `@resvg/resvg-js` with the bundled Linux native binding.
-- `Content-Type: image/png`, 1080×1350 (4:5 portrait).
-- Not gated — uses the HMAC'd path as the capability.
+- `page` is **0, 1, or 2** (`cover`, `threads`, `story`); anything else is `404 invalid_page`.
+- Rendered via `@vercel/og`.
+- `Content-Type: image/png`, 1200×630.
+- Gated by an HMAC capability **token in the `?t=` query parameter** — a missing or wrong token returns `403`.
 
 ## Ancillary
 
-### `GET /api/story?date=YYYY-MM-DD`
+### `GET /api/story?c={ISO2}&t={type}`
 
-Public read-only "story view" (web reader) for a shared brief. SEO-friendly HTML response.
+Public read-only HTML page for a shared **country story** (default type `ciianalysis`), built for social-media crawlers. Parameters: `c` (country, required), `t` (story type), `ts` (timestamp), `s` (score), `l` (level). It is not a brief reader and takes no `date` parameter.
 
-### `GET /api/og-story?date=YYYY-MM-DD`
+### `GET /api/og-story?c={ISO2}&t={type}`
 
-Open Graph preview image for `/api/story`. Returns `image/png`, cached aggressively.
+Open Graph preview image for `/api/story`, taking the same `c`/`t`/`s`/`l` parameters. Returns `image/png`, cached aggressively.
 
 ### `POST /api/chat-analyst`
 
@@ -94,6 +95,15 @@ Streaming chat endpoint for the "Ask the analyst" in-dashboard assistant. Takes 
 - Streams: `text/event-stream`
 - Back-end: `intelligence/v1/chat-analyst-*` handlers compose context + prompt
 
+Denials carry the same three-way split as the brief endpoints above, so a
+client can tell a plan verdict from a session problem from an outage:
+
+| Status | Response |
+|--------|----------|
+| 401 | `UNAUTHENTICATED` — no credential, or one that did not validate. Sign in; retrying is futile |
+| 403 | `Pro subscription required` (entitlement confirmed non-Pro) / `Subscription lapsed` (lapse confirmed with the provider, `X-Billing-Verification` set) |
+| 503 | Entitlement verification in doubt: `entitlement_verification_unavailable` / `renewal_verification_pending` / `renewal_verification_failed`, with `Retry-After` and `X-Billing-Verification`. See [Error handling](/usage-errors) |
+
 ### `POST /api/widget-agent`
 
-Single-shot completion endpoint used by embedded widget iframes. Auth via `X-WorldMonitor-Key` (partner keys). Rate-limited per key.
+Single-shot completion endpoint used by embedded widget iframes. Auth via `X-WorldMonitor-Key` (partner keys); the legacy `X-Widget-Key` / `X-Pro-Key` headers and the `wm-widget-key` cookie are also accepted. Rate-limited per key.

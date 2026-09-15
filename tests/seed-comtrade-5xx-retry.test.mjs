@@ -6,7 +6,7 @@
 import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { isTransientComtrade, fetchBilateral, __setSleepForTests } from '../scripts/seed-comtrade-bilateral-hs4.mjs';
+import { isTransientComtrade, fetchBilateral, recentPeriod, candidatePeriods, __setSleepForTests } from '../scripts/seed-comtrade-bilateral-hs4.mjs';
 import { fetchFlows, checkCoverage, KEY_PREFIX, __setSleepForTests as __setFlowsSleep } from '../scripts/seed-trade-flows.mjs';
 import { fetchImportsForReporter, __setSleepForTests as __setHhiSleep } from '../scripts/seed-recovery-import-hhi.mjs';
 
@@ -60,6 +60,63 @@ test('fetchBilateral: succeeds on first attempt with 200', async () => {
   assert.equal(result[0].cmdCode, '2709');
 });
 
+test('fetchBilateral: uses the stable HS API route while metadata tracks HS2022', async () => {
+  fetchResponses = [{ status: 200, body: { data: [] } }];
+
+  await fetchBilateral('699', ['2709']);
+
+  assert.match(new URL(fetchCalls[0]).pathname, /^\/(?:public\/v1\/preview|data\/v1\/get)\/C\/A\/HS$/);
+});
+
+test('recentPeriod: pins the safely-final year and rolls forward at the UTC year boundary', () => {
+  assert.equal(recentPeriod(new Date('2026-07-02T00:00:00Z')), '2024');
+  // Still the old pin one second before the UTC new year...
+  assert.equal(recentPeriod(new Date('2026-12-31T23:59:59Z')), '2024');
+  // ...and it rolls forward the instant the year turns. This is the cliff that
+  // makes a reporter which has not yet filed the new (y-2) year come back
+  // HTTP 200 with zero rows, so any period-fallback work must key off it.
+  assert.equal(recentPeriod(new Date('2027-01-01T00:00:00Z')), '2025');
+  // An explicit lag stays independent of the default.
+  assert.equal(recentPeriod(new Date('2027-01-01T00:00:00Z'), 3), '2024');
+});
+
+test('fetchBilateral: requests an explicit safely-final annual period', async () => {
+  fetchResponses = [{ status: 200, body: { data: [] } }];
+
+  await fetchBilateral('699', ['2709']);
+
+  // Assert the FRESHEST requested year, not the whole parameter: the seeder
+  // sends a multi-year window on the authenticated route and a single year on
+  // the public preview route (which 400s on a list), so the exact string
+  // depends on whether COMTRADE_API_KEYS is present. Pinning the full value
+  // would pass locally and mean something different on CI.
+  const period = new URL(fetchCalls[0]).searchParams.get('period');
+  assert.ok(period, 'period must always be sent — omitting it is the count=0 outage');
+  assert.equal(period.split(',')[0], String(new Date().getUTCFullYear() - 2));
+});
+
+test('recentPeriod: pins y-2 and rolls forward at the UTC year boundary', () => {
+  assert.equal(recentPeriod(new Date('2026-07-02T00:00:00Z')), '2024');
+  assert.equal(recentPeriod(new Date('2026-12-31T23:59:59Z')), '2024');
+  assert.equal(recentPeriod(new Date('2027-01-01T00:00:00Z')), '2025');
+  assert.equal(recentPeriod(new Date('2027-01-01T00:00:00Z'), 3), '2024');
+});
+
+test('candidatePeriods: returns (y-2) then (y-3) for the per-reporter fallback', () => {
+  assert.deepEqual(
+    candidatePeriods(new Date('2026-07-02T00:00:00Z')),
+    ['2024', '2023'],
+  );
+});
+
+test('fetchBilateral: an explicit period argument overrides the default', async () => {
+  fetchResponses = [{ status: 200, body: { data: [] } }];
+
+  await fetchBilateral('699', ['2709'], '2023');
+
+  assert.equal(new URL(fetchCalls[0]).searchParams.get('period'), '2023');
+});
+
 test('fetchBilateral: retries once after a single 503, succeeds on second attempt', async () => {
   fetchResponses = [
     { status: 503, body: {} },
@@ -85,23 +142,21 @@ test('fetchBilateral: retries twice on consecutive 503s, succeeds on third', asy
   assert.deepEqual(sleepCalls, [5_000, 15_000]);
 });
 
-test('fetchBilateral: gives up (returns []) after 3 consecutive 5xx', async () => {
+test('fetchBilateral: rejects after 3 consecutive 5xx to preserve the whole country', async () => {
   fetchResponses = [
     { status: 503, body: {} },
     { status: 502, body: {} },
     { status: 500, body: {} },
   ];
-  const result = await fetchBilateral('699', ['2709']);
+  await assert.rejects(fetchBilateral('699', ['2709']), /HTTP 500/);
   assert.equal(fetchCalls.length, 3, 'caps at 3 attempts');
-  assert.deepEqual(result, [], 'empty array after exhausting retries — caller can skip write');
   assert.deepEqual(sleepCalls, [5_000, 15_000], 'no sleep after final attempt');
 });
 
 test('fetchBilateral: does NOT retry on 4xx (non-transient)', async () => {
   fetchResponses = [{ status: 403, body: {} }];
-  const result = await fetchBilateral('699', ['2709']);
+  await assert.rejects(fetchBilateral('699', ['2709']), /HTTP 403/);
   assert.equal(fetchCalls.length, 1, 'no retry on client error');
-  assert.deepEqual(result, []);
 });
 
 test('fetchBilateral: 429 then 503 still consumes the 5xx retries (regression for PR review)', async () => {
@@ -128,9 +183,8 @@ test('fetchBilateral: 429 once → 429 again does NOT re-wait 60s (one 429 cap)'
     { status: 429, body: {} },
     { status: 429, body: {} },
   ];
-  const result = await fetchBilateral('699', ['2709']);
+  await assert.rejects(fetchBilateral('699', ['2709']), /HTTP 429/);
   assert.equal(fetchCalls.length, 2, 'cap 429 retries at one wait');
-  assert.deepEqual(result, []);
   assert.deepEqual(sleepCalls, [60_000], 'only one 60s wait, no second 429 backoff');
 });
 

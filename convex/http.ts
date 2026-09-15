@@ -1,9 +1,20 @@
 import { anyApi, httpRouter } from "convex/server";
-import { httpAction } from "./_generated/server";
+import { httpAction, type ActionCtx } from "./_generated/server";
 import { internal } from "./_generated/api";
+import { lookupVerifiedAccountEmail, requireVerifiedAccountEmail } from "./lib/notificationEmail";
+import { TOUCH_DEBOUNCE_MS } from "./apiKeys";
+import {
+  CHECKOUT_RATE_LIMITED,
+  isCheckoutRateLimitedOutcome,
+} from "./payments/checkoutRateLimit";
 import { webhookHandler } from "./payments/webhookHandlers";
 import { resendWebhookHandler } from "./resendWebhookHandler";
 import { USER_PREFS_WRITE_RATE_LIMIT } from "./constants";
+import {
+  INTEL_HISTORY_EMBED_DIMS,
+  INTEL_HISTORY_MAX_APPEND_RECORDS,
+  INTEL_HISTORY_MAX_RETRACT_IDENTIFIERS,
+} from "./intelHistory";
 
 const TRUSTED = [
   "https://worldmonitor.app",
@@ -41,6 +52,14 @@ function corsHeaders(origin: string | null): Headers {
     headers.set("Access-Control-Max-Age", "86400");
   }
   return headers;
+}
+
+export async function userPrefsOptionsHttpHandler(
+  _ctx: ActionCtx,
+  request: Request,
+): Promise<Response> {
+  const headers = corsHeaders(request.headers.get("Origin"));
+  return new Response(null, { status: 204, headers });
 }
 
 async function timingSafeEqualStrings(a: string, b: string): Promise<boolean> {
@@ -125,12 +144,100 @@ function setRateLimitResponseHeaders(headers: Headers, limit: number, reset: num
   headers.set("Retry-After", String(retryAfter));
 }
 
-const http = httpRouter();
+const REGISTER_INTEREST_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const REGISTER_INTEREST_MAX_EMAIL_LENGTH = 320;
+const REGISTER_INTEREST_MAX_META_LENGTH = 100;
 
-http.route({
-  path: "/api/internal-entitlements",
-  method: "POST",
-  handler: httpAction(async (ctx, request) => {
+/**
+ * Server-to-server bridge for the anonymous waitlist flow. The public
+ * registerInterest mutation is internal so a Convex client cannot bypass the
+ * edge handler's Turnstile/desktop proof, email validation, and rate limits.
+ */
+export async function registerInterestHttpHandler(
+  ctx: ActionCtx,
+  request: Request,
+): Promise<Response> {
+  const providedSecret = request.headers.get("x-convex-shared-secret") ?? "";
+  const expectedSecret = process.env.CONVEX_SERVER_SHARED_SECRET ?? "";
+  if (!expectedSecret || !(await timingSafeEqualStrings(providedSecret, expectedSecret))) {
+    return new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const body = await parseJsonObjectBody<{
+    email?: unknown;
+    source?: unknown;
+    appVersion?: unknown;
+    referredBy?: unknown;
+  }>(request);
+  if (!body) {
+    return new Response(JSON.stringify({ error: "INVALID_JSON" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const email = typeof body.email === "string" ? body.email : "";
+  if (
+    email.length === 0 ||
+    email.length > REGISTER_INTEREST_MAX_EMAIL_LENGTH ||
+    !REGISTER_INTEREST_EMAIL_RE.test(email)
+  ) {
+    return new Response(JSON.stringify({ error: "INVALID_EMAIL" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const metadata = [
+    ["source", body.source],
+    ["appVersion", body.appVersion],
+    ["referredBy", body.referredBy],
+  ] as const;
+  for (const [field, value] of metadata) {
+    if (
+      value !== undefined &&
+      (typeof value !== "string" || value.length > REGISTER_INTEREST_MAX_META_LENGTH)
+    ) {
+      return new Response(JSON.stringify({ error: `INVALID_${field.toUpperCase()}` }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+  }
+  if (typeof body.referredBy === "string" && body.referredBy.length > 20) {
+    return new Response(JSON.stringify({ error: "INVALID_REFERRED_BY" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  try {
+    const result = await ctx.runMutation(internal.registerInterest.register, {
+      email,
+      source: body.source as string | undefined,
+      appVersion: body.appVersion as string | undefined,
+      referredBy: body.referredBy as string | undefined,
+    });
+    return new Response(JSON.stringify(result), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (err) {
+    console.error("[register-interest] internal mutation failed:", err);
+    return new Response(JSON.stringify({ error: "REGISTRATION_UNAVAILABLE" }), {
+      status: 503,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+}
+
+export async function internalEntitlementsHttpHandler(
+  ctx: ActionCtx,
+  request: Request,
+): Promise<Response> {
     const providedSecret = request.headers.get("x-convex-shared-secret") ?? "";
     const expectedSecret = process.env.CONVEX_SERVER_SHARED_SECRET ?? "";
     if (!expectedSecret || !(await timingSafeEqualStrings(providedSecret, expectedSecret))) {
@@ -159,24 +266,155 @@ http.route({
       });
     }
 
-    const result = await ctx.runQuery(
+    let result = await ctx.runQuery(
       internal.entitlements.getEntitlementsByUserId,
       { userId: body.userId },
     );
-    return new Response(JSON.stringify(result), {
+    let billingStatus:
+      | "subscription_lapsed"
+      | "renewal_verification_pending"
+      | "renewal_verification_failed"
+      | undefined;
+    let retryAfterSeconds: number | undefined;
+    let renewalVerificationFreshness:
+      | { status: "not_applicable"; checkedAt: number }
+      | undefined;
+
+    // Expired stored entitlements are deliberately returned as free-tier
+    // defaults by the query. Before the gateway turns that into a hard denial,
+    // give a recently-stale active subscription one bounded provider re-check.
+    if (result.features.tier === 0) {
+      const verification = await ctx.runAction(
+        internal.payments.billing.verifyRecentlyStaleSubscriptionOnDemand,
+        { userId: body.userId },
+      );
+      if (verification.status === "not_applicable") {
+        // Reached only when the user has NO subscription row at all
+        // (claimRecentlyStaleSubscriptionForVerification: any billing history
+        // yields `lapsed` instead). That cohort includes a buyer whose Dodo
+        // webhook has not landed yet, so the edge deliberately serves this
+        // marker for a short window only — see
+        // NOT_APPLICABLE_VERIFICATION_TTL_SECONDS in
+        // server/_shared/entitlement-check.ts (#5600). Widening the cases that
+        // produce this marker means revisiting that TTL.
+        renewalVerificationFreshness = {
+          status: "not_applicable",
+          checkedAt: Date.now(),
+        };
+      } else {
+        // The provider action and a webhook can interleave. Always re-read the
+        // source of truth before attaching a denial marker so a concurrent
+        // renewal wins over a stale action result.
+        result = await ctx.runQuery(
+          internal.entitlements.getEntitlementsByUserId,
+          { userId: body.userId },
+        );
+        // A stale materialized entitlement can point at the stronger row under
+        // verification even while another lower-plan subscription is still
+        // current. Preserve that known-good coverage in this response; the
+        // billing marker remains attached so callers deny only capabilities
+        // the fallback plan does not authorize.
+        const fallbackState = await ctx.runQuery(
+          internal.payments.billing.getOnDemandRenewalFallbackState,
+          { userId: body.userId, now: Date.now() },
+        );
+        if (
+          result.features.tier === 0 &&
+          fallbackState?.currentEntitlement
+        ) {
+          result = fallbackState.currentEntitlement;
+        }
+        const staleFeatures = fallbackState?.strongestRecentlyStaleFeatures;
+        const verificationCouldExpandCoverage = !!staleFeatures && (
+          staleFeatures.tier > result.features.tier ||
+          (staleFeatures.apiAccess && !result.features.apiAccess) ||
+          (staleFeatures.mcpAccess && !result.features.mcpAccess)
+        );
+        if (
+          verification.status !== "active" &&
+          (
+            result.features.tier === 0 ||
+            verificationCouldExpandCoverage
+          )
+        ) {
+          billingStatus = verification.status;
+          if ("retryAfterSeconds" in verification) {
+            retryAfterSeconds = verification.retryAfterSeconds;
+          }
+        }
+      }
+    }
+
+    return new Response(JSON.stringify({
+      ...result,
+      ...(billingStatus ? { billingStatus } : {}),
+      ...(retryAfterSeconds != null ? { retryAfterSeconds } : {}),
+      ...(renewalVerificationFreshness ? { renewalVerificationFreshness } : {}),
+    }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
+}
+
+const http = httpRouter();
+
+// Only the edge contact handler may write leads after its public abuse checks.
+http.route({
+  path: "/leads/submit-contact",
+  method: "POST",
+  handler: httpAction(async (ctx, request) => {
+    const expected = process.env.CONVEX_SERVER_SHARED_SECRET ?? "";
+    const provided = request.headers.get("x-convex-shared-secret") ?? "";
+    if (!expected || !(await timingSafeEqualStrings(provided, expected))) {
+      return Response.json({ error: "UNAUTHORIZED" }, { status: 401 });
+    }
+    const body = await parseJsonObjectBody<Record<string, unknown>>(request);
+    if (!body || typeof body.name !== "string" || typeof body.email !== "string"
+      || typeof body.source !== "string"
+      || [body.organization, body.phone, body.message].some(
+        (value) => value !== undefined && typeof value !== "string",
+      )) {
+      return Response.json({ error: "INVALID_CONTACT" }, { status: 400 });
+    }
+    try {
+      const result = await ctx.runMutation(internal.contactMessages.submit, {
+        name: body.name,
+        email: body.email,
+        source: body.source,
+        organization: body.organization as string | undefined,
+        phone: body.phone as string | undefined,
+        message: body.message as string | undefined,
+      });
+      return Response.json(result);
+    } catch (error) {
+      const code = extractConvexErrorCode(error);
+      if (code === "rate_limited") {
+        return Response.json({ error: code }, { status: 429 });
+      }
+      if (code === "FREE_EMAIL_NOT_ALLOWED") {
+        return Response.json({ error: code }, { status: 422 });
+      }
+      return Response.json({ error: "CONTACT_STORAGE_FAILED" }, { status: 503 });
+    }
   }),
+});
+
+http.route({
+  path: "/api/internal-register-interest",
+  method: "POST",
+  handler: httpAction(registerInterestHttpHandler),
+});
+
+http.route({
+  path: "/api/internal-entitlements",
+  method: "POST",
+  handler: httpAction(internalEntitlementsHttpHandler),
 });
 
 http.route({
   path: "/api/user-prefs",
   method: "OPTIONS",
-  handler: httpAction(async (_ctx, request) => {
-    const headers = corsHeaders(request.headers.get("Origin"));
-    return new Response(null, { status: 204, headers });
-  }),
+  handler: httpAction(userPrefsOptionsHttpHandler),
 });
 
 http.route({
@@ -335,18 +573,22 @@ http.route({
     if (!msg) return new Response("OK", { status: 200 });
 
     if (msg.chat?.type !== "private") return new Response("OK", { status: 200 });
-
-    if (!msg.date || Math.abs(Date.now() / 1000 - msg.date) > 900) {
+    if (typeof msg.chat.id !== "number" || !Number.isSafeInteger(msg.chat.id) || msg.chat.id <= 0) {
       return new Response("OK", { status: 200 });
     }
 
-    const text = msg.text?.trim() ?? "";
+    if (typeof msg.date !== "number" || !Number.isSafeInteger(msg.date) || Math.abs(Date.now() / 1000 - msg.date) > 900) {
+      return new Response("OK", { status: 200 });
+    }
+
+    if (typeof msg.text !== "string") return new Response("OK", { status: 200 });
+    const text = msg.text.trim();
     const chatId = String(msg.chat.id);
 
     const match = text.match(/^\/start\s+([A-Za-z0-9_-]{40,50})$/);
-    if (!match) return new Response("OK", { status: 200 });
+    if (!match?.[1]) return new Response("OK", { status: 200 });
 
-    const claimed = await ctx.runMutation(anyApi.notificationChannels!.claimPairingToken as any, {
+    const claimed = await ctx.runMutation(internal.notificationChannels.claimPairingToken, {
       token: match[1],
       chatId,
     });
@@ -503,6 +745,7 @@ http.route({
       aiDigestEnabled?: boolean;
       countries?: string[];
       tickers?: string[];
+      scheduleWelcome?: boolean;
     }>(request);
     if (!body) {
       return new Response(JSON.stringify({ error: "INVALID_JSON" }), {
@@ -531,6 +774,13 @@ http.route({
         });
       }
 
+      if (action === "welcome-scheduling-capability") {
+        return new Response(
+          JSON.stringify({ durableWelcomeScheduling: true }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
       if (action === "create-pairing-token") {
         const result = await ctx.runMutation((internal as any).notificationChannels.createPairingTokenForUser, {
           userId,
@@ -543,15 +793,24 @@ http.route({
         if (!body.channelType) {
           return new Response(JSON.stringify({ error: "channelType required" }), { status: 400, headers: { "Content-Type": "application/json" } });
         }
+        const verifiedAccountEmail = body.channelType === "email"
+          ? requireVerifiedAccountEmail(body.email, await lookupVerifiedAccountEmail(userId))
+          : undefined;
         const setResult = await ctx.runMutation((internal as any).notificationChannels.setChannelForUser, {
           userId,
           channelType: body.channelType as "telegram" | "slack" | "email" | "webhook",
           chatId: body.chatId,
           webhookEnvelope: body.webhookEnvelope,
           email: body.email,
+          verifiedAccountEmail,
           webhookLabel: body.webhookLabel,
+          scheduleWelcome: body.scheduleWelcome === true,
         });
-        return new Response(JSON.stringify({ ok: true, isNew: setResult.isNew }), { status: 200, headers: { "Content-Type": "application/json" } });
+        return new Response(JSON.stringify({
+          ok: true,
+          isNew: setResult.isNew,
+          durableWelcomeScheduling: body.scheduleWelcome === true,
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
       }
 
       if (action === "set-slack-oauth") {
@@ -591,8 +850,13 @@ http.route({
           p256dh: body.p256dh,
           auth: body.auth,
           userAgent: body.userAgent,
+          scheduleWelcome: body.scheduleWelcome === true,
         });
-        return new Response(JSON.stringify({ ok: true, isNew: webPushResult.isNew }), { status: 200, headers: { "Content-Type": "application/json" } });
+        return new Response(JSON.stringify({
+          ok: true,
+          isNew: webPushResult.isNew,
+          durableWelcomeScheduling: body.scheduleWelcome === true,
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
       }
 
       if (action === "delete-channel") {
@@ -766,8 +1030,12 @@ http.route({
 
       return new Response(JSON.stringify({ error: "Unknown action" }), { status: 400, headers: { "Content-Type": "application/json" } });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return new Response(JSON.stringify({ error: msg }), { status: 500, headers: { "Content-Type": "application/json" } });
+      const code = extractConvexErrorCode(err);
+      if (code === "EMAIL_OWNERSHIP_REQUIRED" || code === "PRO_REQUIRED") {
+        return new Response(JSON.stringify({ error: code }), { status: code === "PRO_REQUIRED" ? 402 : 400, headers: { "Content-Type": "application/json" } });
+      }
+      console.error('[notification-channels] Operation failed', err);
+      return new Response(JSON.stringify({ error: 'Operation failed' }), { status: 500, headers: { "Content-Type": "application/json" } });
     }
   }),
 });
@@ -995,6 +1263,19 @@ http.route({
 // User API key validation (service-to-service only)
 // ---------------------------------------------------------------------------
 
+// Schedule-site half of the lastUsedAt debounce (the mutation-side half lives
+// in touchKeyLastUsed / touchProMcpTokenLastUsed). Scheduling a touch on
+// EVERY validation meant that at each debounce boundary all concurrently
+// scheduled touches read the same stale lastUsedAt and patched the same hot
+// document — 1,036 OCC write conflicts on userApiKeys in 14 days at up to
+// retry depth 3 (Convex Insights, 2026-08). A fresh lastUsedAt makes the
+// touch a guaranteed no-op, so don't enqueue it at all; only genuinely stale
+// (or never-touched) rows schedule, which also drops one scheduled job per
+// validation off the scheduler.
+function touchIsDue(lastUsedAt: unknown): boolean {
+  return typeof lastUsedAt !== "number" || lastUsedAt <= Date.now() - TOUCH_DEBOUNCE_MS;
+}
+
 // Service-to-service: validate a user API key by its SHA-256 hash.
 // Called by the Vercel edge gateway to look up user-owned keys.
 http.route({
@@ -1030,7 +1311,7 @@ http.route({
       { keyHash: body.keyHash },
     );
 
-    if (result) {
+    if (result && touchIsDue(result.lastUsedAt)) {
       try {
         await ctx.scheduler.runAfter(0, (internal as any).apiKeys.touchKeyLastUsed, { keyId: result.id });
       } catch (err) {
@@ -1040,7 +1321,14 @@ http.route({
       }
     }
 
-    return new Response(JSON.stringify(result), {
+    // Strip the gate's input from the response: the gateway caches this blob
+    // in Redis for 60s and its shape is load-bearing (isUserKeyResult in
+    // api/_user-api-key.js) — lastUsedAt exists for the gate above only.
+    const publicResult = result
+      ? (({ lastUsedAt: _lastUsedAt, ...rest }) => rest)(result)
+      : null;
+
+    return new Response(JSON.stringify(publicResult), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
@@ -1083,6 +1371,66 @@ http.route({
     );
 
     return new Response(JSON.stringify(result), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }),
+});
+
+// Service-to-service: validate a partner-embed key by its SHA-256 hash.
+// Separate from /api/internal-validate-api-key on purpose — the two credential
+// surfaces must never resolve through one another's table.
+http.route({
+  path: "/api/internal-validate-embed-key",
+  method: "POST",
+  handler: httpAction(async (ctx, request) => {
+    const providedSecret = request.headers.get("x-convex-shared-secret") ?? "";
+    const expectedSecret = process.env.CONVEX_SERVER_SHARED_SECRET ?? "";
+    if (!expectedSecret || !(await timingSafeEqualStrings(providedSecret, expectedSecret))) {
+      return new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    const body = await parseJsonObjectBody<{ keyHash?: unknown }>(request);
+    if (!body) {
+      return new Response(JSON.stringify({ error: "INVALID_JSON" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (typeof body.keyHash !== "string" || !/^[a-f0-9]{64}$/.test(body.keyHash)) {
+      return new Response(JSON.stringify({ error: "INVALID_KEY_HASH" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    const result = await ctx.runQuery(
+      (internal as any).embedKeys.validateKeyByHash,
+      { keyHash: body.keyHash },
+    );
+
+    if (result && touchIsDue(result.lastUsedAt)) {
+      try {
+        await ctx.scheduler.runAfter(0, (internal as any).embedKeys.touchKeyLastUsed, { keyId: result.id });
+      } catch (err) {
+        // sentry-coverage-ok: re-throwing here would 500 the edge validator, which
+        // coerces to null and stamps a negative-cache sentinel for a valid key.
+        // lastUsedAt is best-effort telemetry.
+        console.warn("[validate-embed-key] touchKeyLastUsed schedule failed:", err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    // Strip the gate's input from the response for the same reason the API-key
+    // route does: the edge caches this blob and its shape is load-bearing.
+    const publicResult = result
+      ? (({ lastUsedAt: _lastUsedAt, ...rest }) => rest)(result)
+      : null;
+
+    return new Response(JSON.stringify(publicResult), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
@@ -1193,7 +1541,7 @@ http.route({
         { tokenId: body.tokenId },
       );
 
-      if (result) {
+      if (result && touchIsDue(result.lastUsedAt)) {
         try {
           await ctx.scheduler.runAfter(
             0,
@@ -1210,7 +1558,11 @@ http.route({
         }
       }
 
-      return new Response(JSON.stringify(result), {
+      // Strip the gate's input: the wire contract is exactly `{ userId }`
+      // (pinned by mcpProTokens.test.ts) — lastUsedAt feeds the gate only.
+      const publicResult = result ? { userId: result.userId } : null;
+
+      return new Response(JSON.stringify(publicResult), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       });
@@ -1337,6 +1689,7 @@ http.route({
       returnUrl?: string;
       discountCode?: string;
       referralCode?: string;
+      attributionSource?: string;
       bypassPendingGuard?: boolean;
     }>(request);
     if (!body) {
@@ -1364,9 +1717,25 @@ http.route({
           returnUrl: body.returnUrl,
           discountCode: body.discountCode,
           referralCode: body.referralCode,
+          attributionSource: body.attributionSource,
           bypassPendingGuard: body.bypassPendingGuard,
         },
       );
+      if (isCheckoutRateLimitedOutcome(result)) {
+        return new Response(
+          JSON.stringify({
+            error: CHECKOUT_RATE_LIMITED,
+            message: "Checkout is temporarily rate limited. Retry shortly.",
+          }),
+          {
+            status: 429,
+            headers: {
+              "Content-Type": "application/json",
+              "Retry-After": String(result.retryAfterSeconds),
+            },
+          },
+        );
+      }
       if (
         result &&
         typeof result === "object" &&
@@ -1393,6 +1762,9 @@ http.route({
         headers: { "Content-Type": "application/json" },
       });
     } catch (err) {
+      if (extractConvexErrorCode(err) === "INVALID_CHECKOUT_PRODUCT") {
+        return Response.json({ error: "INVALID_CHECKOUT_PRODUCT" }, { status: 400 });
+      }
       const msg = err instanceof Error ? err.message : "Checkout creation failed";
       return new Response(JSON.stringify({ error: msg }), {
         status: 500,
@@ -1518,6 +1890,584 @@ http.route({
         status: 500,
         headers: { "Content-Type": "application/json" },
       });
+    }
+  }),
+});
+
+// ---------------------------------------------------------------------------
+// Historical intelligence memory (#5694).
+//
+// Ingest is server-to-server from the Railway seeders (RELAY_SHARED_SECRET,
+// same bearer convention as every other /relay/* route); the two read routes
+// are called by the Vercel edge (CONVEX_SERVER_SHARED_SECRET, same header
+// convention as the other /api/internal-* routes). Nothing here is reachable
+// by a browser: the underlying Convex functions are all `internal*`.
+//
+// The validation below is the real trust boundary. `append` re-checks the
+// batch size and vector shape, but a seeder should get a 400 naming the bad
+// record, not an opaque mutation throw — and the length caps stop a runaway
+// scraper from writing multi-megabyte titles into a table with no natural
+// ceiling.
+// ---------------------------------------------------------------------------
+
+const INTEL_HISTORY_MAX_TITLE_LEN = 500;
+const INTEL_HISTORY_MAX_SUMMARY_LEN = 2000;
+const INTEL_HISTORY_MAX_SOURCE_URL_LEN = 2048;
+const INTEL_HISTORY_MAX_DEDUPE_KEY_LEN = 256;
+const INTEL_HISTORY_MAX_COUNTRY_LEN = 8;
+const INTEL_HISTORY_MAX_CATEGORY_LEN = 64;
+const INTEL_HISTORY_MAX_IDENTIFIER_LEN = 128;
+
+/** JSON response helper for the intel-history routes below. */
+function intelJson(body: unknown, status: number): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+/**
+ * Bearer check shared by every `/relay/intel-history*` route. A missing
+ * configured secret is a rejection, not an open door — an unconfigured
+ * deployment must not accept writes from anyone who guesses the path.
+ *
+ * DEDICATED RETRACTION CREDENTIAL (#5743). `RELAY_SHARED_SECRET` is held by
+ * every Railway seeder that appends history — a wide distribution that was
+ * fine when the worst a leak could do was write false intelligence, since the
+ * real rows survived alongside it. The retraction routes delete rows and
+ * permanently suppress their identities, and that direction does not undo:
+ * `restore` cannot resurrect a row whose embedding is gone. Setting
+ * `RELAY_RETRACT_SECRET` keeps those three routes on their own credential
+ * that the seeder fleet does not carry. There is deliberately no shared-secret
+ * fallback: an unconfigured deployment fails closed instead of granting every
+ * seeder archive-deletion authority.
+ */
+async function intelRelayUnauthorized(
+  request: Request,
+  { retraction = false }: { retraction?: boolean } = {},
+): Promise<boolean> {
+  const secret = retraction
+    ? (process.env.RELAY_RETRACT_SECRET ?? "")
+    : (process.env.RELAY_SHARED_SECRET ?? "");
+  const provided = (request.headers.get("Authorization") ?? "").replace(/^Bearer\s+/, "");
+  if (!secret) return true;
+  return !(await timingSafeEqualStrings(provided, secret));
+}
+
+type IntelHistoryIngestRecord = {
+  dedupeKey: string;
+  country?: string;
+  category?: string;
+  title: string;
+  summary?: string;
+  sourceUrl?: string;
+  occurredAt: number;
+  embedding: number[];
+};
+
+type FieldResult<T> = { ok: true; value: T } | { ok: false };
+
+/** Absent/null → undefined; present → a non-empty string within `max`. */
+function readOptionalString(value: unknown, max: number): FieldResult<string | undefined> {
+  if (value === undefined || value === null) return { ok: true, value: undefined };
+  if (typeof value !== "string" || value.length === 0 || value.length > max) {
+    return { ok: false };
+  }
+  return { ok: true, value };
+}
+
+/** Absent/null → undefined; present → a finite number. */
+function readOptionalNumber(value: unknown): FieldResult<number | undefined> {
+  if (value === undefined || value === null) return { ok: true, value: undefined };
+  if (typeof value !== "number" || !Number.isFinite(value)) return { ok: false };
+  return { ok: true, value };
+}
+
+/** A query vector is only usable at exactly the index's dimension, all finite. */
+function isValidEmbedding(value: unknown): value is number[] {
+  return (
+    Array.isArray(value) &&
+    value.length === INTEL_HISTORY_EMBED_DIMS &&
+    value.every((n) => typeof n === "number" && Number.isFinite(n))
+  );
+}
+
+/** Only http(s) links may be stored; see the seeder-side twin in scripts/_seed-history.mjs. */
+function isHttpUrl(value: string): boolean {
+  try {
+    const scheme = new URL(value).protocol;
+    return scheme === "https:" || scheme === "http:";
+  } catch {
+    return false;
+  }
+}
+
+function validateIntelHistoryRecord(
+  raw: unknown,
+): { ok: true; record: IntelHistoryIngestRecord } | { ok: false; reason: string } {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return { ok: false, reason: "record must be a JSON object" };
+  }
+  const rec = raw as Record<string, unknown>;
+
+  if (
+    typeof rec.dedupeKey !== "string" ||
+    rec.dedupeKey.length === 0 ||
+    rec.dedupeKey.length > INTEL_HISTORY_MAX_DEDUPE_KEY_LEN
+  ) {
+    return {
+      ok: false,
+      reason: `dedupeKey must be a non-empty string of at most ${INTEL_HISTORY_MAX_DEDUPE_KEY_LEN} chars`,
+    };
+  }
+  if (
+    typeof rec.title !== "string" ||
+    rec.title.length === 0 ||
+    rec.title.length > INTEL_HISTORY_MAX_TITLE_LEN
+  ) {
+    return {
+      ok: false,
+      reason: `title must be a non-empty string of at most ${INTEL_HISTORY_MAX_TITLE_LEN} chars`,
+    };
+  }
+  if (typeof rec.occurredAt !== "number" || !Number.isFinite(rec.occurredAt)) {
+    return { ok: false, reason: "occurredAt must be a finite epoch-ms number" };
+  }
+  if (!isValidEmbedding(rec.embedding)) {
+    return {
+      ok: false,
+      reason: `embedding must be an array of ${INTEL_HISTORY_EMBED_DIMS} finite numbers`,
+    };
+  }
+
+  const country = readOptionalString(rec.country, INTEL_HISTORY_MAX_COUNTRY_LEN);
+  if (!country.ok) return { ok: false, reason: "country must be a short ISO2-ish string" };
+  const category = readOptionalString(rec.category, INTEL_HISTORY_MAX_CATEGORY_LEN);
+  if (!category.ok) {
+    return {
+      ok: false,
+      reason: `category must be a string of at most ${INTEL_HISTORY_MAX_CATEGORY_LEN} chars`,
+    };
+  }
+  const summary = readOptionalString(rec.summary, INTEL_HISTORY_MAX_SUMMARY_LEN);
+  if (!summary.ok) {
+    return {
+      ok: false,
+      reason: `summary must be a string of at most ${INTEL_HISTORY_MAX_SUMMARY_LEN} chars`,
+    };
+  }
+  const sourceUrl = readOptionalString(rec.sourceUrl, INTEL_HISTORY_MAX_SOURCE_URL_LEN);
+  if (!sourceUrl.ok) {
+    return {
+      ok: false,
+      reason: `sourceUrl must be a string of at most ${INTEL_HISTORY_MAX_SOURCE_URL_LEN} chars`,
+    };
+  }
+  // Re-checked here even though the seeder sanitizes: this is the trust
+  // boundary, and a compromised relay credential must not be able to store a
+  // `javascript:`/`data:` value in a field the MCP tools publish to agents as
+  // a canonical link. Rejected rather than silently dropped — unlike the
+  // seeder, which is projecting a whole run and should keep the row, a caller
+  // POSTing here has sent an explicitly bad field and should be told.
+  if (sourceUrl.value !== undefined && !isHttpUrl(sourceUrl.value)) {
+    return { ok: false, reason: "sourceUrl must be an http(s) URL" };
+  }
+
+  return {
+    ok: true,
+    record: {
+      dedupeKey: rec.dedupeKey,
+      title: rec.title,
+      occurredAt: rec.occurredAt,
+      embedding: rec.embedding,
+      country: country.value,
+      category: category.value,
+      summary: summary.value,
+      sourceUrl: sourceUrl.value,
+    },
+  };
+}
+
+/** Shared scope/window parsing for the two read routes. */
+function readIntelQueryScope(body: Record<string, unknown>):
+  | {
+      ok: true;
+      scope: {
+        domain?: string;
+        country?: string;
+        from?: number;
+        to?: number;
+        limit?: number;
+      };
+    }
+  | { ok: false; error: string } {
+  const domain = readOptionalString(body.domain, INTEL_HISTORY_MAX_IDENTIFIER_LEN);
+  if (!domain.ok) return { ok: false, error: "INVALID_DOMAIN" };
+  const country = readOptionalString(body.country, INTEL_HISTORY_MAX_COUNTRY_LEN);
+  if (!country.ok) return { ok: false, error: "INVALID_COUNTRY" };
+  const from = readOptionalNumber(body.from);
+  if (!from.ok) return { ok: false, error: "INVALID_FROM" };
+  const to = readOptionalNumber(body.to);
+  if (!to.ok) return { ok: false, error: "INVALID_TO" };
+  const limit = readOptionalNumber(body.limit);
+  if (!limit.ok) return { ok: false, error: "INVALID_LIMIT" };
+
+  return {
+    ok: true,
+    scope: {
+      domain: domain.value,
+      country: country.value,
+      from: from.value,
+      to: to.value,
+      limit: limit.value,
+    },
+  };
+}
+
+http.route({
+  path: "/relay/intel-history",
+  method: "POST",
+  handler: httpAction(async (ctx, request) => {
+    if (await intelRelayUnauthorized(request)) {
+      return intelJson({ error: "UNAUTHORIZED" }, 401);
+    }
+
+    const body = await parseJsonObjectBody<{
+      domain?: unknown;
+      resource?: unknown;
+      runId?: unknown;
+      records?: unknown;
+    }>(request);
+    if (!body) {
+      return intelJson({ error: "INVALID_JSON" }, 400);
+    }
+
+    const missing: string[] = [];
+    for (const field of ["domain", "resource", "runId"] as const) {
+      const value = body[field];
+      if (
+        typeof value !== "string" ||
+        value.length === 0 ||
+        value.length > INTEL_HISTORY_MAX_IDENTIFIER_LEN
+      ) {
+        missing.push(field);
+      }
+    }
+    if (missing.length > 0) {
+      return intelJson({ error: "MISSING_FIELDS", required: missing }, 400);
+    }
+    if (!Array.isArray(body.records) || body.records.length === 0) {
+      return intelJson({ error: "MISSING_FIELDS", required: ["records"] }, 400);
+    }
+    if (body.records.length > INTEL_HISTORY_MAX_APPEND_RECORDS) {
+      return intelJson(
+        {
+          error: "TOO_MANY_RECORDS",
+          max: INTEL_HISTORY_MAX_APPEND_RECORDS,
+          got: body.records.length,
+        },
+        400,
+      );
+    }
+
+    // Validate the whole batch before writing any of it, so a seeder never
+    // sees a partial ingest reported as a failure.
+    const records: IntelHistoryIngestRecord[] = [];
+    for (let i = 0; i < body.records.length; i++) {
+      const validated = validateIntelHistoryRecord(body.records[i]);
+      if (!validated.ok) {
+        return intelJson(
+          { error: "INVALID_RECORD", index: i, reason: validated.reason },
+          400,
+        );
+      }
+      records.push(validated.record);
+    }
+
+    try {
+      const result = await ctx.runMutation(internal.intelHistory.append, {
+        domain: body.domain as string,
+        resource: body.resource as string,
+        runId: body.runId as string,
+        records,
+      });
+      return intelJson(result, 200);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "intel history append failed";
+      return intelJson({ error: msg }, 500);
+    }
+  }),
+});
+
+// ---------------------------------------------------------------------------
+// Retraction (#5743)
+//
+// The history store is agent-facing and durable for 180 days, so a poisoned or
+// factually wrong feed item is retrievable long after the live snapshot that
+// produced it has rolled over. These two routes are the supported way to take
+// one back and to undo that — the alternative was a hand-run Convex console
+// operation, which is not a path anyone should be following during an
+// incident.
+//
+// Same shared secret as ingest, deliberately: it is the credential the
+// operator tooling already holds, and both directions of this pair only ever
+// affect rows that credential's own seeders wrote. What keeps its blast radius
+// small is the SHAPE of the arguments — explicit ids and dedupe keys, capped
+// per call, with nothing pattern- or scope-shaped that could sweep the table.
+// ---------------------------------------------------------------------------
+
+const INTEL_HISTORY_MAX_REASON_LEN = 500;
+const INTEL_HISTORY_MAX_ID_LEN = 128;
+
+/**
+ * Read an optional array of non-empty identifier strings. Absent → []. Any
+ * malformed member fails the whole request: a retraction that silently drops
+ * one of the identifiers an operator listed would report success while leaving
+ * the record it was called about live.
+ */
+function readIdentifierList(
+  value: unknown,
+  max: number,
+): FieldResult<string[]> {
+  if (value === undefined || value === null) return { ok: true, value: [] };
+  if (!Array.isArray(value)) return { ok: false };
+  for (const entry of value) {
+    if (typeof entry !== "string" || entry.length === 0 || entry.length > max) {
+      return { ok: false };
+    }
+    // Reject anything that is not already trimmed, rather than trimming it
+    // here. A stray space from a copy-paste makes the retraction look up an
+    // identity that does not exist, so it deletes nothing, writes a tombstone
+    // for the typo, and returns 200 — the operator reads "tombstoned: 1" while
+    // the poisoned record stays live and retrievable. Silently trimming would
+    // fix that one case and hide the class; rejecting makes the typo visible.
+    if (entry !== entry.trim()) return { ok: false };
+  }
+  return { ok: true, value: value as string[] };
+}
+
+http.route({
+  path: "/relay/intel-history/retract",
+  method: "POST",
+  handler: httpAction(async (ctx, request) => {
+    if (await intelRelayUnauthorized(request, { retraction: true })) {
+      return intelJson({ error: "UNAUTHORIZED" }, 401);
+    }
+
+    const body = await parseJsonObjectBody<Record<string, unknown>>(request);
+    if (!body) return intelJson({ error: "INVALID_JSON" }, 400);
+
+    const ids = readIdentifierList(body.ids, INTEL_HISTORY_MAX_ID_LEN);
+    if (!ids.ok) return intelJson({ error: "INVALID_IDS" }, 400);
+    const dedupeKeys = readIdentifierList(
+      body.dedupeKeys,
+      INTEL_HISTORY_MAX_DEDUPE_KEY_LEN,
+    );
+    if (!dedupeKeys.ok) return intelJson({ error: "INVALID_DEDUPE_KEYS" }, 400);
+
+    if (ids.value.length + dedupeKeys.value.length === 0) {
+      return intelJson(
+        { error: "MISSING_IDENTIFIERS", required: ["ids", "dedupeKeys"], mode: "any_of" },
+        400,
+      );
+    }
+    if (
+      ids.value.length + dedupeKeys.value.length >
+      INTEL_HISTORY_MAX_RETRACT_IDENTIFIERS
+    ) {
+      return intelJson(
+        {
+          error: "TOO_MANY_IDENTIFIERS",
+          max: INTEL_HISTORY_MAX_RETRACT_IDENTIFIERS,
+          got: ids.value.length + dedupeKeys.value.length,
+        },
+        400,
+      );
+    }
+
+    // Required, not defaulted. A tombstone outlives the incident that produced
+    // it by up to 180 days, and "why is this key suppressed?" is unanswerable
+    // from the row alone unless the caller was made to say so here.
+    const reason =
+      typeof body.reason === "string" ? body.reason.trim() : "";
+    if (!reason || reason.length > INTEL_HISTORY_MAX_REASON_LEN) {
+      return intelJson(
+        {
+          error: "MISSING_REASON",
+          reason: `reason must be a non-empty string of at most ${INTEL_HISTORY_MAX_REASON_LEN} chars`,
+        },
+        400,
+      );
+    }
+
+    try {
+      const result = await ctx.runMutation(internal.intelHistory.retract, {
+        ids: ids.value,
+        dedupeKeys: dedupeKeys.value,
+        reason,
+      });
+      return intelJson(result, 200);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "intel history retract failed";
+      return intelJson({ error: msg }, 500);
+    }
+  }),
+});
+
+http.route({
+  path: "/relay/intel-history/restore",
+  method: "POST",
+  handler: httpAction(async (ctx, request) => {
+    if (await intelRelayUnauthorized(request, { retraction: true })) {
+      return intelJson({ error: "UNAUTHORIZED" }, 401);
+    }
+
+    const body = await parseJsonObjectBody<Record<string, unknown>>(request);
+    if (!body) return intelJson({ error: "INVALID_JSON" }, 400);
+
+    // Only dedupe keys: the document ids are gone with the rows they named, so
+    // accepting one here would be an argument that can never resolve.
+    const dedupeKeys = readIdentifierList(
+      body.dedupeKeys,
+      INTEL_HISTORY_MAX_DEDUPE_KEY_LEN,
+    );
+    if (!dedupeKeys.ok) return intelJson({ error: "INVALID_DEDUPE_KEYS" }, 400);
+    if (dedupeKeys.value.length === 0) {
+      return intelJson({ error: "MISSING_IDENTIFIERS", required: ["dedupeKeys"] }, 400);
+    }
+    if (dedupeKeys.value.length > INTEL_HISTORY_MAX_RETRACT_IDENTIFIERS) {
+      return intelJson(
+        {
+          error: "TOO_MANY_IDENTIFIERS",
+          max: INTEL_HISTORY_MAX_RETRACT_IDENTIFIERS,
+          got: dedupeKeys.value.length,
+        },
+        400,
+      );
+    }
+
+    try {
+      const result = await ctx.runMutation(internal.intelHistory.restore, {
+        dedupeKeys: dedupeKeys.value,
+      });
+      return intelJson(result, 200);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "intel history restore failed";
+      return intelJson({ error: msg }, 500);
+    }
+  }),
+});
+
+http.route({
+  path: "/relay/intel-history/retractions",
+  method: "POST",
+  handler: httpAction(async (ctx, request) => {
+    if (await intelRelayUnauthorized(request, { retraction: true })) {
+      return intelJson({ error: "UNAUTHORIZED" }, 401);
+    }
+
+    const body = await parseJsonObjectBody<Record<string, unknown>>(request);
+    if (!body) return intelJson({ error: "INVALID_JSON" }, 400);
+
+    const limit = readOptionalNumber(body.limit);
+    if (!limit.ok) return intelJson({ error: "INVALID_LIMIT" }, 400);
+
+    try {
+      const result = await ctx.runQuery(internal.intelHistory.listRetractions, {
+        limit: limit.value,
+      });
+      return intelJson(result, 200);
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : "intel history retractions read failed";
+      return intelJson({ error: msg }, 500);
+    }
+  }),
+});
+
+http.route({
+  path: "/api/internal-intel-timeline",
+  method: "POST",
+  handler: httpAction(async (ctx, request) => {
+    const providedSecret = request.headers.get("x-convex-shared-secret") ?? "";
+    const expectedSecret = process.env.CONVEX_SERVER_SHARED_SECRET ?? "";
+    if (!expectedSecret || !(await timingSafeEqualStrings(providedSecret, expectedSecret))) {
+      return intelJson({ error: "UNAUTHORIZED" }, 401);
+    }
+
+    const body = await parseJsonObjectBody<Record<string, unknown>>(request);
+    if (!body) {
+      return intelJson({ error: "INVALID_JSON" }, 400);
+    }
+
+    const parsed = readIntelQueryScope(body);
+    if (!parsed.ok) {
+      return intelJson({ error: parsed.error }, 400);
+    }
+    // An unscoped read has no index to serve it; the query throws on this too.
+    if (parsed.scope.domain === undefined && parsed.scope.country === undefined) {
+      return intelJson(
+        { error: "MISSING_SCOPE", required: ["domain", "country"], mode: "any_of" },
+        400,
+      );
+    }
+
+    try {
+      const result = await ctx.runQuery(internal.intelHistory.timeline, parsed.scope);
+      return intelJson(result, 200);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "intel history timeline failed";
+      return intelJson({ error: msg }, 500);
+    }
+  }),
+});
+
+http.route({
+  path: "/api/internal-intel-search",
+  method: "POST",
+  handler: httpAction(async (ctx, request) => {
+    const providedSecret = request.headers.get("x-convex-shared-secret") ?? "";
+    const expectedSecret = process.env.CONVEX_SERVER_SHARED_SECRET ?? "";
+    if (!expectedSecret || !(await timingSafeEqualStrings(providedSecret, expectedSecret))) {
+      return intelJson({ error: "UNAUTHORIZED" }, 401);
+    }
+
+    const body = await parseJsonObjectBody<Record<string, unknown>>(request);
+    if (!body) {
+      return intelJson({ error: "INVALID_JSON" }, 400);
+    }
+    if (!isValidEmbedding(body.embedding)) {
+      return intelJson(
+        { error: "INVALID_EMBEDDING", expectedDimensions: INTEL_HISTORY_EMBED_DIMS },
+        400,
+      );
+    }
+
+    const parsed = readIntelQueryScope(body);
+    if (!parsed.ok) {
+      return intelJson({ error: parsed.error }, 400);
+    }
+    const minScore = body.minScore;
+    if (
+      minScore !== undefined &&
+      (typeof minScore !== "number" ||
+        !Number.isFinite(minScore) ||
+        minScore < -1 ||
+        minScore > 1)
+    ) {
+      return intelJson({ error: "INVALID_MIN_SCORE" }, 400);
+    }
+
+    try {
+      const result = await ctx.runAction(internal.intelHistory.search, {
+        embedding: body.embedding,
+        ...parsed.scope,
+        ...(typeof minScore === "number" ? { minScore } : {}),
+      });
+      return intelJson(result, 200);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "intel history search failed";
+      return intelJson({ error: msg }, 500);
     }
   }),
 });

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { loadEnvFile, CHROME_UA, runSeed } from './_seed-utils.mjs';
+import { decodeHtmlEntities } from './_html-entities.mjs';
 // Pure contentMeta helper lives in its own module so tests can import the
 // real code (no replicas, no drift). See helpers module header for rationale.
 import { climateNewsContentMeta, CLIMATE_NEWS_MAX_CONTENT_AGE_MIN } from './_climate-news-helpers.mjs';
@@ -12,7 +13,10 @@ const CACHE_TTL = 5400; // 90min = 3× 30-min relay interval (gold standard: TTL
 const MAX_ITEMS = 100;
 const RSS_MAX_BYTES = 500_000;
 
-const FEEDS = [
+// 8 sources after #4714. One investigative outlet's official WordPress /feed
+// is Cloudflare-gated (HTTP 403 on every Railway run); there is no official
+// ungated mirror, and WAF/bot-detection evasion is out of scope.
+export const CLIMATE_NEWS_FEEDS = [
   { sourceName: 'Carbon Brief', url: 'https://www.carbonbrief.org/feed' },
   { sourceName: 'The Guardian Environment', url: 'https://www.theguardian.com/environment/climate-crisis/rss' },
   { sourceName: 'ReliefWeb Disasters', isApi: true },
@@ -20,24 +24,14 @@ const FEEDS = [
   { sourceName: 'UNEP', url: 'https://www.unep.org/rss.xml' },
   { sourceName: 'Phys.org Earth Science', url: 'https://phys.org/rss-feed/earth-news/earth-sciences/' },
   { sourceName: 'Copernicus Climate', url: 'https://climate.copernicus.eu/rss.xml' },
-  { sourceName: 'Inside Climate News', url: 'https://insideclimatenews.org/feed/' },
   { sourceName: 'Climate Central', url: 'https://www.climatecentral.org/rss' },
 ];
+const FEEDS = CLIMATE_NEWS_FEEDS;
 
 function stableHash(str) {
   let h = 0;
   for (let i = 0; i < str.length; i++) h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
   return Math.abs(h).toString(36);
-}
-
-function decodeHtmlEntities(text) {
-  return text
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, ' ');
 }
 
 function extractTag(block, tagName) {
@@ -66,7 +60,9 @@ function extractLink(block) {
   return decodeHtmlEntities(href).trim();
 }
 
-function parseRssItems(xml, sourceName) {
+// Exported as a test seam (tests/climate-news-entity-decode.test.mjs); the
+// isMain guard below keeps importing this module from triggering a seed run.
+export function parseRssItems(xml, sourceName) {
   const bounded = xml.length > RSS_MAX_BYTES ? xml.slice(0, RSS_MAX_BYTES) : xml;
   const items = [];
   const seenIds = new Set();
@@ -199,10 +195,12 @@ export function declareRecords(data) {
   return Array.isArray(data?.items) ? data.items.length : 0;
 }
 
-runSeed('climate', 'news-intelligence', CANONICAL_KEY, fetchClimateNews, {
+const isMain = process.argv[1]?.endsWith('seed-climate-news.mjs');
+if (isMain) {
+  runSeed('climate', 'news-intelligence', CANONICAL_KEY, fetchClimateNews, {
   validateFn: validate,
   ttlSeconds: CACHE_TTL,
-  sourceVersion: 'climate-rss-v1',
+  sourceVersion: 'climate-rss-v2',
   recordCount: (data) => data?.items?.length || 0,
 
   declareRecords,
@@ -219,8 +217,9 @@ runSeed('climate', 'news-intelligence', CANONICAL_KEY, fetchClimateNews, {
   // can read item.publishedAt directly — no synthetic-tagging needed.
   contentMeta: climateNewsContentMeta,
   maxContentAgeMin: CLIMATE_NEWS_MAX_CONTENT_AGE_MIN,
-}).catch((err) => {
-  const _cause = err.cause ? ` (cause: ${err.cause.message || err.cause.code || err.cause})` : '';
-  console.error('FATAL:', (err.message || err) + _cause);
-  process.exit(1);
-});
+  }).catch((err) => {
+    const _cause = err.cause ? ` (cause: ${err.cause.message || err.cause.code || err.cause})` : '';
+    console.error('FATAL:', (err.message || err) + _cause);
+    process.exit(1);
+  });
+}

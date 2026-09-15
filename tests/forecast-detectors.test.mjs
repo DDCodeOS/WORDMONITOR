@@ -56,6 +56,7 @@ import {
   rankForecastsForAnalysis,
   selectPublishedForecastPool,
   selectDeferredForecastForPublishBackfill,
+  markDeferredFamilySelection,
   buildPublishedForecastArtifacts,
   filterPublishedForecasts,
   applySituationFamilyCaps,
@@ -86,6 +87,7 @@ import {
 } from '../scripts/seed-forecasts.mjs';
 import { OPENROUTER_PROVIDER_ROUTING } from '../scripts/_llm-model-timeouts.mjs';
 import { CONFLICT_COUNT_SOURCE_FEED } from '../scripts/_forecast-resolution.mjs';
+import { assessFunnelDiversity } from '../scripts/_forecast-funnel.mjs';
 
 const originalForecastEnv = {
   FORECAST_LLM_PROVIDER_ORDER: process.env.FORECAST_LLM_PROVIDER_ORDER,
@@ -293,6 +295,50 @@ describe('calibrateWithMarkets', () => {
     });
     assert.equal(pred.calibration, null);
     assert.equal(pred.probability, 0.45);
+  });
+
+  // #5733: these two readers used `markets.geopolitical` as a stand-in for "all
+  // markets", which was true only while the producer published near-duplicate
+  // pools. Now that the pools are a disjoint partition, a macro/rates/crypto
+  // anchor lives ONLY in tech or finance, and reading one pool would silently
+  // drop it. Every other test in this describe passes a geopolitical-only
+  // fixture, so without these the regression ships green.
+  it('calibrates from an anchor that lives in the finance pool, not geopolitical', () => {
+    const pred = makePrediction(
+      'economic', 'United States', 'US recession',
+      0.7, 0.6, '7d', [],
+    );
+    pred.region = 'United States';
+    calibrateWithMarkets([pred], {
+      geopolitical: [],
+      tech: [],
+      finance: [{ title: 'US recession by end of 2026?', yesPrice: 30, source: 'polymarket', volume: 50000 }],
+    });
+    assert.ok(pred.calibration !== null, 'a finance-pool market must still calibrate');
+    assert.equal(pred.probability, +(0.4 * 0.3 + 0.6 * 0.7).toFixed(3));
+  });
+
+  it('calibrates from an anchor that lives in the tech pool', () => {
+    const pred = makePrediction(
+      'economic', 'United States', 'US AI market correction',
+      0.7, 0.6, '7d', [],
+    );
+    pred.region = 'United States';
+    calibrateWithMarkets([pred], {
+      geopolitical: [],
+      tech: [{ title: 'US AI market correction in 2026?', yesPrice: 30, source: 'polymarket', volume: 50000 }],
+      finance: [],
+    });
+    assert.ok(pred.calibration !== null, 'a tech-pool market must still calibrate');
+  });
+
+  it('returns early only when every pool is empty', () => {
+    const pred = makePrediction('economic', 'United States', 'US recession', 0.7, 0.6, '7d', []);
+    const original = pred.probability;
+    calibrateWithMarkets([pred], { geopolitical: [], tech: [], finance: [] });
+    assert.equal(pred.probability, original);
+    calibrateWithMarkets([pred], undefined);
+    assert.equal(pred.probability, original);
   });
 
   it('does not calibrate de-escalation risk from an adverse YES market', () => {
@@ -1553,7 +1599,7 @@ describe('forecast llm overrides', () => {
     const options = getForecastLlmCallOptions('combined');
     const providers = resolveForecastLlmProviders(options);
 
-    assert.deepEqual(options.providerOrder, ['openrouter', 'groq']);
+    assert.deepEqual(options.providerOrder, ['openrouter', 'openrouter-free', 'openrouter-free-backup', 'groq']);
     assert.equal(providers[0]?.name, 'openrouter');
     assert.equal(providers[0]?.model, 'deepseek/deepseek-v4-flash');
     // Was 15_000: a 'stall cutoff' that treated the SYMPTOM of unrouted OpenRouter
@@ -1564,9 +1610,13 @@ describe('forecast llm overrides', () => {
     // every market_implications run wrote a SEED_ERROR. Flash now gets a completion
     // deadline that covers its measured distribution.
     assert.equal(providers[0]?.timeout, 40_000, 'Flash gets its measured completion deadline under pinned routing');
-    assert.equal(providers[1]?.name, 'groq');
-    assert.equal(providers[1]?.model, 'llama-3.3-70b-versatile');
-    assert.equal(providers[1]?.timeout, 20_000, 'the fallback keeps its provider-specific window');
+    assert.equal(providers[1]?.name, 'openrouter-free');
+    assert.equal(providers[1]?.model, 'google/gemma-4-26b-a4b-it:free');
+    assert.equal(providers[2]?.name, 'openrouter-free-backup');
+    assert.equal(providers[2]?.model, 'minimax/minimax-m3:free');
+    assert.equal(providers[3]?.name, 'groq');
+    assert.equal(providers[3]?.model, 'openai/gpt-oss-20b');
+    assert.equal(providers[3]?.timeout, 20_000, 'the fallback keeps its provider-specific window');
   });
 
   it('pins critical_signals to the pre-#4944 chain (probability-coupled stage)', () => {
@@ -1583,7 +1633,7 @@ describe('forecast llm overrides', () => {
 
     assert.deepEqual(options.providerOrder, ['groq', 'openrouter']);
     assert.equal(providers[0]?.name, 'groq');
-    assert.equal(providers[0]?.model, 'llama-3.1-8b-instant');
+    assert.equal(providers[0]?.model, 'openai/gpt-oss-20b');
     assert.equal(providers[1]?.name, 'openrouter');
     assert.equal(providers[1]?.model, 'google/gemini-2.5-flash');
     assert.equal(providers[1]?.timeout, 25_000, 'the DeepSeek stall cutoff must not change the pinned Gemini fallback');
@@ -1619,7 +1669,7 @@ describe('forecast llm overrides', () => {
     const providers = resolveForecastLlmProviders(options);
 
     assert.deepEqual(options.providerOrder, ['groq', 'openrouter']);
-    assert.equal(providers[0]?.model, 'llama-3.1-8b-instant');
+    assert.equal(providers[0]?.model, 'openai/gpt-oss-20b');
     assert.equal(providers[1]?.model, 'google/gemini-2.5-flash');
 
     delete process.env.FORECAST_LLM_PROVIDER_ORDER;
@@ -1636,7 +1686,7 @@ describe('forecast llm overrides', () => {
     const options = getForecastLlmCallOptions('critical_signals');
     const providers = resolveForecastLlmProviders(options);
 
-    assert.equal(providers[0]?.model, 'llama-3.1-8b-instant');
+    assert.equal(providers[0]?.model, 'openai/gpt-oss-20b');
     assert.equal(providers[1]?.model, 'google/gemini-2.5-flash');
     assert.deepEqual(providers[1]?.extraBody, { provider: OPENROUTER_PROVIDER_ROUTING });
 
@@ -1664,11 +1714,13 @@ describe('forecast llm overrides', () => {
     assert.equal(combinedProviders[0]?.model, 'google/gemini-2.5-pro');
     assert.equal(combinedProviders[0]?.timeout, 25_000, 'model overrides outside DeepSeek Flash keep the original timeout');
 
-    assert.deepEqual(scenarioOptions.providerOrder, ['openrouter', 'groq']);
+    assert.deepEqual(scenarioOptions.providerOrder, ['openrouter', 'openrouter-free', 'openrouter-free-backup', 'groq']);
     assert.equal(scenarioProviders[0]?.name, 'openrouter');
     assert.equal(scenarioProviders[0]?.model, 'deepseek/deepseek-v4-flash');
     assert.equal(scenarioProviders[0]?.timeout, 40_000, 'Flash completion deadline (see above); non-Flash overrides keep 25s');
-    assert.equal(scenarioProviders[1]?.model, 'llama-3.3-70b-versatile');
+    assert.equal(scenarioProviders[1]?.model, 'google/gemma-4-26b-a4b-it:free');
+    assert.equal(scenarioProviders[2]?.model, 'minimax/minimax-m3:free');
+    assert.equal(scenarioProviders[3]?.model, 'openai/gpt-oss-20b');
   });
 
   it('lets a global provider order and openrouter model apply to non-combined stages', () => {
@@ -1682,6 +1734,38 @@ describe('forecast llm overrides', () => {
     assert.equal(providers.length, 1);
     assert.equal(providers[0]?.name, 'openrouter');
     assert.equal(providers[0]?.model, 'google/gemini-2.5-flash-lite-preview');
+  });
+
+  it('migrates the production openrouter,groq order through both fixed free fallbacks', () => {
+    process.env.FORECAST_LLM_PROVIDER_ORDER = 'openrouter,groq';
+    delete process.env.FORECAST_LLM_CRITICAL_PROVIDER_ORDER;
+    delete process.env.FORECAST_LLM_MARKET_IMPLICATIONS_PROVIDER_ORDER;
+
+    assert.deepEqual(
+      getForecastLlmCallOptions('scenario').providerOrder,
+      ['openrouter', 'openrouter-free', 'openrouter-free-backup', 'groq'],
+    );
+    assert.deepEqual(
+      getForecastLlmCallOptions('critical_signals').providerOrder,
+      ['groq', 'openrouter'],
+      'probability-coupled critical signals keep their pinned chain',
+    );
+    assert.deepEqual(
+      getForecastLlmCallOptions('market_implications').providerOrder,
+      ['openrouter'],
+      'market implications keep their paid-only budgeted chain',
+    );
+  });
+
+  it('keeps stage-scoped provider orders exact', () => {
+    process.env.FORECAST_LLM_PROVIDER_ORDER = 'openrouter,groq';
+    process.env.FORECAST_LLM_COMBINED_PROVIDER_ORDER = 'openrouter,groq';
+
+    assert.deepEqual(
+      getForecastLlmCallOptions('combined').providerOrder,
+      ['openrouter', 'groq'],
+      'a stage-scoped operator override must not receive implicit providers',
+    );
   });
 
   it('falls through immediately after a DeepSeek Flash stall instead of retrying the hung provider', async () => {
@@ -1702,7 +1786,7 @@ describe('forecast llm overrides', () => {
           status: 200,
           headers: { get: () => null },
           json: async () => ({
-            model: 'llama-3.3-70b-versatile',
+            model: 'openai/gpt-oss-20b',
             choices: [{ message: { content: 'Groq fallback returned a complete narrative.' } }],
           }),
         };
@@ -1712,7 +1796,7 @@ describe('forecast llm overrides', () => {
     const result = await __callForecastLlmForTests('system', 'user', { stage: 'scenario', retryDelayMs: 0 });
 
     assert.equal(result?.provider, 'groq');
-    assert.equal(calls.filter((url) => url.includes('openrouter.ai')).length, 1);
+    assert.equal(calls.filter((url) => url.includes('openrouter.ai')).length, 3);
     assert.equal(calls.filter((url) => url.includes('api.groq.com')).length, 1);
   });
 
@@ -1935,7 +2019,7 @@ describe('forecast llm overrides', () => {
 
     const result = await __callForecastLlmForTests('system', 'user', { stage: 'scenario', retryDelayMs: 0 });
 
-    assert.deepEqual(providers, ['openrouter', 'openrouter', 'openrouter', 'openrouter', 'groq']);
+    assert.deepEqual(providers, ['openrouter', 'openrouter', 'openrouter', 'openrouter', 'openrouter', 'openrouter', 'groq']);
     assert.deepEqual(result, {
       text: 'Groq fallback succeeded with enough narrative content.',
       model: 'groq/llama-test',
@@ -1973,7 +2057,7 @@ describe('forecast llm overrides', () => {
 
     const result = await __callForecastLlmForTests('system', 'user', { stage: 'scenario', retryDelayMs: 0 });
 
-    assert.deepEqual(providers, ['openrouter', 'groq']);
+    assert.deepEqual(providers, ['openrouter', 'openrouter', 'openrouter', 'groq']);
     assert.deepEqual(result, {
       text: 'Groq fallback after non retryable status has enough content.',
       model: 'groq/no-retry-test',
@@ -2757,6 +2841,37 @@ describe('detectFromPredictionMarkets', () => {
     })) };
     assert.ok(detectFromPredictionMarkets({ predictionMarkets: markets }).length <= 5);
   });
+
+  // #5733: reads every pool, not just geopolitical. The detector's own gate is
+  // "the title tags a region", so a tech- or finance-classified market with a
+  // regional title is in scope — and since the producer's pools became a
+  // disjoint partition those markets no longer appear in `geopolitical`.
+  it('detects from the tech and finance pools, not only geopolitical', () => {
+    const fromTech = detectFromPredictionMarkets({
+      predictionMarkets: {
+        geopolitical: [],
+        tech: [{ title: 'Will China ship the best AI model by December 31?', yesPrice: 70, source: 'polymarket' }],
+        finance: [],
+      },
+    });
+    assert.equal(fromTech.length, 1, 'a tech-pool market must still produce a prediction');
+    assert.equal(fromTech[0].region, 'Asia-Pacific');
+
+    const fromFinance = detectFromPredictionMarkets({
+      predictionMarkets: {
+        geopolitical: [],
+        tech: [],
+        finance: [{ title: 'Will the ECB cut rates in 2026?', yesPrice: 70, source: 'polymarket' }],
+      },
+    });
+    assert.equal(fromFinance.length, 1, 'a finance-pool market must still produce a prediction');
+    assert.equal(fromFinance[0].region, 'Europe');
+  });
+
+  it('tolerates a payload missing pools entirely', () => {
+    assert.equal(detectFromPredictionMarkets({ predictionMarkets: {} }).length, 0);
+    assert.equal(detectFromPredictionMarkets({}).length, 0);
+  });
 });
 
 describe('lowered CII conflict threshold', () => {
@@ -3317,6 +3432,200 @@ describe('forecast quality gating', () => {
     assert.ok(hard.publishSelectionScore > judged.publishSelectionScore);
   });
 
+  it('preserves five real domains through selection, hard rebalance, and publication', () => {
+    const candidates = [];
+    function add(domain, index, kind, priority) {
+      const pred = makePrediction(domain, `${domain} region ${index}`, `${domain} outlook ${index}`, 0.6, 0.6, '7d', [
+        { type: 'news_corroboration', value: `${domain} evidence ${index}`, weight: 0.4 },
+      ]);
+      pred.id = `${domain}-${index}`;
+      pred.resolution = { kind };
+      attachPublishSelectionContext(pred, { priority });
+      candidates.push(pred);
+      return pred;
+    }
+    for (let i = 0; i < 6; i++) add('market', i, 'judged', 0.9 - i * 0.01);
+    for (let i = 0; i < 6; i++) add('supply_chain', i, 'hard', 0.6 - i * 0.01);
+    for (let i = 0; i < 6; i++) add('political', i, 'hard', 0.5 - i * 0.01);
+    add('market', 6, 'hard', 0.2);
+    const conflict = add('conflict', 0, 'judged', 0.3);
+    const cyber = add('cyber', 0, 'hard', 0.01);
+    const run = input => {
+      const pool = selectPublishedForecastPool(structuredClone(input));
+      const artifacts = buildPublishedForecastArtifacts(pool, []);
+      const published = artifacts.publishedPredictions;
+      assert.equal(published.length, 14);
+      assert.deepEqual(assessFunnelDiversity(published).domains, ['conflict', 'cyber', 'market', 'political', 'supply_chain']);
+      assert.equal(assessFunnelDiversity(published).collapsed, false);
+      assert.ok(published.some(pred => pred.id === conflict.id));
+      assert.ok(published.some(pred => pred.id === cyber.id));
+      assert.ok(published.filter(pred => pred.resolution.kind === 'hard').length >= 12);
+      return published.map(pred => pred.id);
+    };
+    assert.deepEqual(run(candidates), run([...candidates].reverse()));
+  });
+
+  it('backfills an absent real domain before adding another represented hard forecast', () => {
+    const supply = { id: 'supply', domain: 'supply_chain', probability: 0.7, resolution: { kind: 'hard' } };
+    const cyber = { id: 'cyber', domain: 'cyber', probability: 0.5, resolution: { kind: 'hard' } };
+    const deferred = [supply, cyber];
+    const selected = selectDeferredForecastForPublishBackfill(deferred, [
+      { id: 'published-supply', domain: 'supply_chain', resolution: { kind: 'hard' } },
+    ], 3);
+    assert.equal(selected.id, 'cyber');
+    assert.deepEqual(deferred.map(pred => pred.id), ['supply']);
+  });
+
+  it('breaks equal selection scores by ID, independent of input order', () => {
+    const candidates = ['b', 'a'].map(id => {
+      const pred = makePrediction('cyber', id, 'Cyber concentration', 0.6, 0.6, '7d', []);
+      pred.id = id;
+      return attachPublishSelectionContext(pred);
+    });
+    for (const input of [candidates, [...candidates].reverse()]) {
+      assert.deepEqual(selectPublishedForecastPool(input, { targetCount: 1 }).map(pred => pred.id), ['a']);
+    }
+  });
+
+  it('continues past a protected cross-domain swap to allow a same-domain hard upgrade', () => {
+    const candidates = [
+      ['cyber', 'judged', 0.9], ['market', 'hard', 0.8],
+      ['political', 'hard', 0.2], ['cyber', 'hard', 0.01],
+    ].map(([domain, kind, priority], index) => {
+      const pred = makePrediction(domain, `Region ${index}`, `Outlook ${index}`, 0.6, 0.6, '7d', []);
+      pred.id = `upgrade-${index}`;
+      pred.resolution = { kind };
+      return attachPublishSelectionContext(pred, { priority });
+    });
+    const pool = selectPublishedForecastPool(candidates, { targetCount: 2 });
+    assert.deepEqual(pool.map(pred => pred.id), ['upgrade-1', 'upgrade-3']);
+    assert.deepEqual(summarizePublishFiltering(candidates, pool, pool).domainCoverage, {
+      eligible: ['cyber', 'market', 'political'], selected: ['cyber', 'market'],
+      published: ['cyber', 'market'], missing: ['political'],
+    });
+  });
+
+  it('reserves real domains without using weak or synthetic-only candidates as coverage', () => {
+    const real = ['market', 'cyber'].map(domain => attachPublishSelectionContext(
+      makePrediction(domain, domain, `${domain} outlook`, 0.6, 0.6, '7d', []), { priority: 0.3 },
+    ));
+    const synthetic = attachPublishSelectionContext(
+      makePrediction('political', 'France', 'Political outlook', 0.8, 0.8, '7d', []), { priority: 0.9 },
+    );
+    synthetic.generationOrigin = 'state_derived';
+    const weak = attachPublishSelectionContext(
+      makePrediction('conflict', 'Thinland', 'Thin outlook', 0.1, 0.3, '7d', []), { priority: 0.01, readiness: 0.2 },
+    );
+    weak.caseFile.counterEvidence = [{ type: 'coverage_gap' }, { type: 'confidence' }];
+    const candidates = [synthetic, weak, ...real];
+    assert.ok(!selectPublishedForecastPool(candidates, { targetCount: 3 }).some(pred => pred.id === weak.id));
+    const pool = selectPublishedForecastPool(candidates, { targetCount: 2 });
+    const published = buildPublishedForecastArtifacts(pool, []).publishedPredictions;
+    markDeferredFamilySelection(candidates, pool);
+    assert.deepEqual(new Set(published.map(pred => pred.id)), new Set(real.map(pred => pred.id)));
+    assert.equal(weak.publishDiagnostics.reason, 'weak_fallback');
+    const telemetry = summarizePublishFiltering(candidates, pool, published);
+    assert.deepEqual(telemetry.domainCoverage, {
+      eligible: ['cyber', 'market'], selected: ['cyber', 'market'], published: ['cyber', 'market'], missing: [],
+    });
+    assert.equal(telemetry.suppressedWeakFallback, 1);
+    assert.equal(assessFunnelDiversity(published).collapsed, true);
+  });
+
+  it('preserves real domain breadth under final situation and family caps without raising those caps', () => {
+    const candidates = ['market', 'market', 'political', 'political', 'cyber'].map((domain, index) => {
+      const pred = makePrediction(domain, `Region ${index}`, `Distinct outlook ${index}`, 0.6, 0.6, '7d', []);
+      return attachPublishSelectionContext(pred, { stateId: 'shared-state', familyId: 'shared-family' });
+    });
+    const situationPublished = filterPublishedForecasts(candidates);
+    assert.equal(situationPublished.length, 3);
+    assert.deepEqual(situationPublished.map(pred => pred.domain), ['market', 'political', 'cyber']);
+    const familyPublished = applySituationFamilyCaps(candidates, [{
+      id: 'shared-family', situationIds: candidates.map(pred => pred.situationContext.id),
+    }]);
+    assert.equal(familyPublished.length, 4);
+    assert.deepEqual(familyPublished.map(pred => pred.domain), ['market', 'market', 'political', 'cyber']);
+  });
+
+  it('does not let a higher-ranked synthetic or shadow duplicate erase real coverage', () => {
+    for (const generationOrigin of ['state_derived', 'bet_engine']) {
+      const real = attachPublishSelectionContext(
+        makePrediction('cyber', 'United States', 'Cyber concentration', 0.5, 0.6, '7d', []), { priority: 0.3 },
+      );
+      buildForecastCases([real]);
+      const synthetic = { ...structuredClone(real), id: 'synthetic-duplicate', generationOrigin, analysisPriority: 0.9 };
+      const pool = selectPublishedForecastPool([synthetic, real], { targetCount: 2 });
+      const published = buildPublishedForecastArtifacts(pool, []).publishedPredictions;
+      assert.ok(published.some(pred => pred.id === real.id), generationOrigin);
+      assert.ok(!published.some(pred => pred.id === synthetic.id), generationOrigin);
+      assert.deepEqual(synthetic.publishDiagnostics, {
+        reason: 'situation_overlap', keptForecastId: real.id, situationId: real.stateContext.id,
+      }, generationOrigin);
+      assert.deepEqual(summarizePublishFiltering([real, synthetic], pool, published).domainCoverage.missing, []);
+    }
+  });
+
+  it('keeps every state anchor and real domain when reserved representatives share a busy state', () => {
+    const candidates = [
+      ['market', 'Gulf', 0.95, 'S1'], ['supply_chain', 'Gulf', 0.94, 'S1'],
+      ['political', 'France', 0.6, 'S2'], ['conflict', 'Sahel', 0.55, 'S3'],
+      ['cyber', 'US', 0.5, 'S4'], ['political', 'Germany', 0.45, 'S5'],
+      ['political', 'Italy', 0.44, 'S6'], ['political', 'Rome', 0.3, 'S7'],
+      ['market', 'Paris', 0.2, 'S2'],
+    ].map(([domain, region, priority, stateId]) => {
+      const pred = makePrediction(domain, region, `${domain} outlook ${region}`, 0.6, 0.6, '7d', []);
+      pred.id = `${domain}-${region}`;
+      pred.resolution = { kind: 'judged' };
+      return attachPublishSelectionContext(pred, {
+        priority, stateId, situationId: `sit-${stateId}`, familyId: stateId === 'S1' ? 'F1' : `fam-${region}`,
+      });
+    });
+    candidates.at(-1).marketSelectionContext = { confirmationScore: 0.6, transmissionEdgeCount: 2 };
+    const pool = selectPublishedForecastPool(candidates, { targetCount: 8 });
+    assert.equal(pool.length, 8);
+    assert.deepEqual([...new Set(pool.map(pred => pred.stateContext.id))].sort(), ['S1', 'S2', 'S3', 'S4', 'S5', 'S6', 'S7']);
+    assert.deepEqual([...new Set(pool.map(pred => pred.domain))].sort(), ['conflict', 'cyber', 'market', 'political', 'supply_chain']);
+  });
+
+  it('backfills an absent real judged domain before a represented hard forecast, ignoring synthetic absent domains', () => {
+    const supply = { id: 'supply', domain: 'supply_chain', probability: 0.7, resolution: { kind: 'hard' } };
+    const syntheticCyber = { id: 'synthetic-cyber', domain: 'cyber', probability: 0.7, generationOrigin: 'state_derived', resolution: { kind: 'judged' } };
+    const cyber = { id: 'cyber', domain: 'cyber', probability: 0.5, resolution: { kind: 'judged' } };
+    const deferred = [supply, syntheticCyber, cyber];
+    const selected = selectDeferredForecastForPublishBackfill(deferred, [
+      { id: 'published-supply', domain: 'supply_chain', resolution: { kind: 'judged' } },
+    ], 3);
+    assert.equal(selected.id, 'cyber');
+    assert.deepEqual(deferred.map(pred => pred.id), ['supply', 'synthetic-cyber']);
+  });
+
+  it('does not let a synthetic same-domain hard forecast replace a sole real representative', () => {
+    const candidates = [
+      ['cyber', 'judged', 0.9, undefined], ['market', 'hard', 0.8, undefined], ['cyber', 'hard', 0.01, 'state_derived'],
+    ].map(([domain, kind, priority, generationOrigin], index) => {
+      const pred = makePrediction(domain, `Region ${index}`, `Outlook ${index}`, 0.6, 0.6, '7d', []);
+      pred.id = `swap-${index}`;
+      pred.resolution = { kind };
+      if (generationOrigin) pred.generationOrigin = generationOrigin;
+      return attachPublishSelectionContext(pred, { priority });
+    });
+    const pool = selectPublishedForecastPool(candidates, { targetCount: 2 });
+    assert.deepEqual(pool.map(pred => pred.id).sort(), ['swap-0', 'swap-1']);
+  });
+
+  it('lets a strategic supply-chain hard forecast replace the sole strategic supply-chain representative', () => {
+    const candidates = [
+      ['supply_chain', 'judged', 0.9], ['market', 'hard', 0.8], ['supply_chain', 'hard', 0.01],
+    ].map(([domain, kind, priority], index) => {
+      const pred = makePrediction(domain, `Region ${index}`, `Outlook ${index}`, 0.6, 0.6, '7d', []);
+      pred.id = `strategic-${index}`;
+      pred.resolution = { kind };
+      return attachPublishSelectionContext(pred, { priority, stateKind: domain === 'supply_chain' ? 'maritime_disruption' : '' });
+    });
+    const pool = selectPublishedForecastPool(candidates, { targetCount: 2 });
+    assert.deepEqual(pool.map(pred => pred.id).sort(), ['strategic-1', 'strategic-2']);
+  });
+
   it('rebalances the freshest selected snapshot to >=80% hard when hard supply exists', () => {
     const deadline = Date.parse('2026-08-01T00:00:00Z');
     const forecasts = [];
@@ -3449,7 +3758,12 @@ describe('forecast quality gating', () => {
     const hardCount = pool.filter((pred) => pred.resolution?.kind === 'hard').length;
     assert.ok(poolIds.includes(military.id), poolIds.join(', '));
     assert.ok(poolIds.includes(supply.id), poolIds.join(', '));
-    assert.equal(hardCount, 8, poolIds.join(', '));
+    assert.ok(pool.some(pred => pred.domain === 'market'), poolIds.join(', '));
+    assert.equal(pool.length, 10);
+    assert.equal(hardCount, 7, poolIds.join(', '));
+    assert.deepEqual(summarizePublishFiltering([...rankedJudged, military, supply, ...hardCandidates], pool, pool).hardResolutionTarget, {
+      target: 8, actual: 7, met: false,
+    });
   });
 
   it('tops out hard rebalance at constrained hard supply', () => {

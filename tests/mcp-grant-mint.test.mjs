@@ -16,11 +16,34 @@
 import { strict as assert } from 'node:assert';
 import { describe, it, beforeEach, afterEach } from 'node:test';
 
-import { signGrant, verifyGrant, GrantConfigError } from '../api/_mcp-grant-hmac.ts';
+import { signGrant, verifyGrant, readGrantSecret, GrantConfigError } from '../api/_mcp-grant-hmac.ts';
 import { mintGrantHandler } from '../api/internal/mcp-grant-mint.ts';
 import { grantContextHandler } from '../api/internal/mcp-grant-context.ts';
 
 const FIXED_NOW = 1_700_000_000_000; // arbitrary, far past Y2K
+
+/**
+ * These handlers now read the entitlement backend's CONFIGURATION, not just the
+ * row their injected loader returns (#5619 follow-up): an absent row is a plan
+ * verdict only when a lookup could actually run. Default to configured — that
+ * is production, and it keeps `getEntitlements: async () => null` meaning
+ * "Convex confirmed no row", which is what the 403 assertions below are about.
+ * The unconfigured case gets its own explicit test.
+ */
+const ORIGINAL_CONVEX_SITE_URL = process.env.CONVEX_SITE_URL;
+const ORIGINAL_CONVEX_SECRET = process.env.CONVEX_SERVER_SHARED_SECRET;
+
+beforeEach(() => {
+  process.env.CONVEX_SITE_URL = 'https://fake.convex.site';
+  process.env.CONVEX_SERVER_SHARED_SECRET = 'fake-secret';
+});
+
+afterEach(() => {
+  if (ORIGINAL_CONVEX_SITE_URL === undefined) delete process.env.CONVEX_SITE_URL;
+  else process.env.CONVEX_SITE_URL = ORIGINAL_CONVEX_SITE_URL;
+  if (ORIGINAL_CONVEX_SECRET === undefined) delete process.env.CONVEX_SERVER_SHARED_SECRET;
+  else process.env.CONVEX_SERVER_SHARED_SECRET = ORIGINAL_CONVEX_SECRET;
+});
 
 const BASE_NONCE_DATA = {
   client_id: 'client_abc',
@@ -46,7 +69,13 @@ const PRO_ENT_NO_MCP_ACCESS = {
   validUntil: FIXED_NOW + 86_400_000,
 };
 
+// `planKey` is REQUIRED on the real entitlement shape (CachedEntitlements in
+// server/_shared/entitlement-check.ts) and every production free shape carries
+// 'free' — convex's FREE_TIER_DEFAULTS and the edge fallback both set it.
+// Omitting it here made this fixture classify as insufficient_tier rather than
+// free_account, so free-account assertions were exercising the wrong verdict.
 const FREE_ENT = {
+  planKey: 'free',
   features: { tier: 0, mcpAccess: false },
   validUntil: FIXED_NOW + 86_400_000,
 };
@@ -198,6 +227,23 @@ describe('_mcp-grant-hmac', () => {
       (err) => err instanceof GrantConfigError,
     );
   });
+
+  it('readGrantSecret missing-secret warn is value-free and does not enumerate MCP_* keys (#7278)', () => {
+    const decoyKey = 'MCP_DECOY_UNUSED_FOR_7278';
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => warnings.push(args.map(String).join(' '));
+    try {
+      assert.throws(
+        () => readGrantSecret({ [decoyKey]: 'decoy-value-must-not-appear' }),
+        (err) => err instanceof GrantConfigError,
+      );
+    } finally {
+      console.warn = originalWarn;
+    }
+    assert.deepEqual(warnings, ['[mcp-grant-hmac] MCP_PRO_GRANT_HMAC_SECRET is not set']);
+    assert.equal(warnings.join('\n').includes(decoyKey), false);
+  });
 });
 
 // =========================================================================
@@ -325,49 +371,80 @@ describe('mintGrantHandler', () => {
     assert.equal(json.error, 'INVALID_REDIRECT_URI');
   });
 
-  it('returns 403 INSUFFICIENT_TIER for free-tier user', async () => {
-    const { deps } = makeMintDeps({ getEntitlements: async () => FREE_ENT });
-    const res = await mintGrantHandler(makePostReq({ nonce: 'nonce_xyz' }), deps);
-    assert.equal(res.status, 403);
-    const json = await res.json();
-    assert.equal(json.error, 'INSUFFICIENT_TIER');
-  });
+  // #6716 — the handshake admits a CONFIRMED free account and nothing else.
+  //
+  // The allowance is selected only after a user-bound credential resolves, and
+  // this is one of four gates on the only path to that credential (a `wm_` key
+  // is not an option: convex/apiKeys.ts requires `apiAccess`, which the free
+  // plan lacks). Refusing here left the allowance reachable only by accounts
+  // that had already been Pro, while SERVER_INSTRUCTIONS advertised it to
+  // every client on `initialize`.
+  const FREE_ACCOUNT_SHAPES = [
+    ['a canonical free row', () => FREE_ENT],
+    ['no entitlement row at all (never subscribed)', () => null],
+  ];
 
-  it('returns 403 INSUFFICIENT_TIER for tier-1 user with validUntil < now (lapsed subscription)', async () => {
-    const { deps } = makeMintDeps({ getEntitlements: async () => EXPIRED_PRO_ENT });
-    const res = await mintGrantHandler(makePostReq({ nonce: 'nonce_xyz' }), deps);
-    assert.equal(res.status, 403);
-    const json = await res.json();
-    assert.equal(json.error, 'INSUFFICIENT_TIER');
-  });
-
-  it('returns 403 INSUFFICIENT_TIER when getEntitlements returns null (Convex blip / unknown user)', async () => {
-    const { deps } = makeMintDeps({ getEntitlements: async () => null });
-    const res = await mintGrantHandler(makePostReq({ nonce: 'nonce_xyz' }), deps);
-    assert.equal(res.status, 403);
-    const json = await res.json();
-    assert.equal(json.error, 'INSUFFICIENT_TIER');
-  });
-
-  it('reviewer round-2 P2: returns 403 INSUFFICIENT_TIER for tier-1 user with mcpAccess: false', async () => {
-    const { deps } = makeMintDeps({ getEntitlements: async () => PRO_ENT_NO_MCP_ACCESS });
-    const res = await mintGrantHandler(makePostReq({ nonce: 'nonce_xyz' }), deps);
-    assert.equal(res.status, 403);
-    const json = await res.json();
-    assert.equal(json.error, 'INSUFFICIENT_TIER');
-  });
-
-  it('reviewer round-2 P2: returns 403 INSUFFICIENT_TIER for tier-1 user with undefined mcpAccess (legacy entitlement row)', async () => {
-    const { deps } = makeMintDeps({
-      getEntitlements: async () => ({
-        features: { tier: 1 }, // no mcpAccess field — pre-U10 row
-        validUntil: FIXED_NOW + 86_400_000,
-      }),
+  for (const [label, ent] of FREE_ACCOUNT_SHAPES) {
+    it(`mints for ${label} — the free funnel needs a door (#6716)`, async () => {
+      const { deps } = makeMintDeps({ getEntitlements: async () => ent() });
+      const res = await mintGrantHandler(makePostReq({ nonce: 'nonce_xyz' }), deps);
+      assert.equal(res.status, 200, 'a confirmed free account must be able to connect');
+      const json = await res.json();
+      assert.ok(json.redirect, 'the handshake continues to authorize-pro');
+      assert.equal(json.error, undefined);
     });
-    const res = await mintGrantHandler(makePostReq({ nonce: 'nonce_xyz' }), deps);
-    assert.equal(res.status, 403);
-    const json = await res.json();
-    assert.equal(json.error, 'INSUFFICIENT_TIER');
+  }
+
+  // Everything that is NOT a confirmed free account still refuses. The
+  // last entry is the one that matters most: a row whose stored features were
+  // overridden to look tier-0 while `planKey` still names a paid plan is a data
+  // fault, and a data fault must fail closed rather than land on an allowance
+  // by resembling a free account.
+  const INSUFFICIENT_TIER_SHAPES = [
+    ['a Pro row whose validUntil has passed', () => EXPIRED_PRO_ENT],
+    ['tier-1 with mcpAccess: false', () => PRO_ENT_NO_MCP_ACCESS],
+    ['tier-1 with mcpAccess undefined (legacy row)', () => ({
+      planKey: 'pro',
+      features: { tier: 1 },
+      validUntil: FIXED_NOW + 86_400_000,
+    })],
+    ['a tier-0 shape carrying a PAID planKey (feature-override data fault)', () => ({
+      planKey: 'pro_monthly',
+      features: { tier: 0, mcpAccess: false },
+      validUntil: FIXED_NOW + 86_400_000,
+    })],
+    ['a tier-0 shape with no planKey at all', () => ({
+      features: { tier: 0, mcpAccess: false },
+      validUntil: FIXED_NOW + 86_400_000,
+    })],
+  ];
+
+  for (const [label, ent] of INSUFFICIENT_TIER_SHAPES) {
+    it(`refuses to mint for ${label} (#6716)`, async () => {
+      const { deps } = makeMintDeps({ getEntitlements: async () => ent() });
+      const res = await mintGrantHandler(makePostReq({ nonce: 'nonce_xyz' }), deps);
+      assert.equal(res.status, 403);
+      const json = await res.json();
+      assert.equal(json.error, 'INSUFFICIENT_TIER');
+      assert.equal(json.redirect, undefined);
+    });
+  }
+
+  it('still refuses an UNVERIFIABLE entitlement — that is not a free account (#6716)', async () => {
+    // The distinction the whole gate now rests on: `insufficient_tier` is a
+    // confirmed answer ("this account has no subscription"), while
+    // billing_verification means we could not get an answer. Minting on a read
+    // we do not trust would hand out credentials during an entitlement outage.
+    // With CONVEX_SITE_URL absent, getEntitlements returns null BEFORE
+    // attempting a lookup, so null is not a verdict about the account.
+    delete process.env.CONVEX_SITE_URL;
+    try {
+      const { deps } = makeMintDeps({ getEntitlements: async () => null });
+      const res = await mintGrantHandler(makePostReq({ nonce: 'nonce_xyz' }), deps);
+      assert.notEqual(res.status, 200, 'an unverifiable entitlement must not mint');
+    } finally {
+      process.env.CONVEX_SITE_URL = 'https://fake.convex.site';
+    }
   });
 
   it('returns 503 when Redis SET NX of mcp-grant:<n> fails AND no prior record exists (transport failure)', async () => {
@@ -501,38 +578,111 @@ describe('grantContextHandler', () => {
     assert.equal(json.error, 'INVALID_REQUEST');
   });
 
-  it('returns 403 INSUFFICIENT_TIER for free user — must NOT leak client_name to non-Pro callers', async () => {
+  // The consent surface is also an OAuth issuance gate. It must refuse before
+  // revealing client metadata when the account does not have active Pro MCP.
+  // #6716 — the consent card renders for a CONFIRMED free account, mirroring
+  // the mint that immediately follows. A user cannot meaningfully approve a
+  // connection without seeing what they are approving, and refusing here would
+  // strand a free account mid-flow on an error page.
+  it('renders the consent card for a canonical free row (#6716)', async () => {
     const { deps } = makeContextDeps({ getEntitlements: async () => FREE_ENT });
     const res = await grantContextHandler(makeGetReq('nonce_xyz'), deps);
-    assert.equal(res.status, 403);
+    assert.equal(res.status, 200);
     const json = await res.json();
-    assert.equal(json.error, 'INSUFFICIENT_TIER');
-    // Negative assertion: response body MUST not contain client_name or redirect_host.
-    assert.equal(json.client_name, undefined);
-    assert.equal(json.redirect_host, undefined);
+    assert.equal(json.error, undefined);
+    assert.ok(json.client_name, 'the user must see what they are approving');
   });
 
-  it('reviewer round-2 P2: returns 403 for tier-1 user with mcpAccess: false (and no client_name leak)', async () => {
-    const { deps } = makeContextDeps({ getEntitlements: async () => PRO_ENT_NO_MCP_ACCESS });
-    const res = await grantContextHandler(makeGetReq('nonce_xyz'), deps);
-    assert.equal(res.status, 403);
-    const json = await res.json();
-    assert.equal(json.error, 'INSUFFICIENT_TIER');
-    assert.equal(json.client_name, undefined);
-    assert.equal(json.redirect_host, undefined);
-  });
+  // The client-metadata disclosure this gate guards is still bounded to
+  // Clerk-authenticated sessions (resolveUserId rejects anonymous callers
+  // first) — but anything that is NOT a confirmed free account still gets
+  // nothing, so an expired paid row or a feature-override data fault cannot
+  // enumerate registered clients.
+  const CONTEXT_INSUFFICIENT_TIER_SHAPES = [
+    ['tier-1 with mcpAccess: false', () => PRO_ENT_NO_MCP_ACCESS],
+    ['tier-1 with mcpAccess undefined (legacy row)', () => ({
+      planKey: 'pro',
+      features: { tier: 1 },
+      validUntil: FIXED_NOW + 86_400_000,
+    })],
+    ['a tier-0 shape carrying a PAID planKey (feature-override data fault)', () => ({
+      planKey: 'pro_monthly',
+      features: { tier: 0, mcpAccess: false },
+      validUntil: FIXED_NOW + 86_400_000,
+    })],
+  ];
 
-  it('reviewer round-2 P2: returns 403 for tier-1 user with undefined mcpAccess (legacy entitlement row)', async () => {
+  for (const [label, ent] of CONTEXT_INSUFFICIENT_TIER_SHAPES) {
+    it(`refuses the consent card for ${label} (#6716)`, async () => {
+      const { deps } = makeContextDeps({ getEntitlements: async () => ent() });
+      const res = await grantContextHandler(makeGetReq('nonce_xyz'), deps);
+      assert.equal(res.status, 403);
+      const json = await res.json();
+      assert.equal(json.error, 'INSUFFICIENT_TIER');
+      assert.equal(json.client_name, undefined);
+    });
+  }
+
+  /**
+   * #5619 — the consent card is the one Pro gate with no client-side
+   * entitlement subscription to contradict it, so a lookup failure rendered as
+   * "buy Pro" is unanswerable from the page. A Convex 4xx (our own shared
+   * secret / contract, not the user's plan) now arrives here as the
+   * verification marker, and it must keep the retryable vocabulary.
+   */
+  it('#5619: an unverifiable entitlement is 503 TIER_VERIFICATION_UNAVAILABLE, not the upsell', async () => {
     const { deps } = makeContextDeps({
       getEntitlements: async () => ({
-        features: { tier: 1 }, // no mcpAccess field
-        validUntil: FIXED_NOW + 86_400_000,
+        features: { tier: 0, mcpAccess: false },
+        validUntil: 0,
+        verificationUnavailable: true,
       }),
     });
     const res = await grantContextHandler(makeGetReq('nonce_xyz'), deps);
-    assert.equal(res.status, 403);
+    assert.equal(res.status, 503);
     const json = await res.json();
-    assert.equal(json.error, 'INSUFFICIENT_TIER');
+    assert.equal(json.error, 'TIER_VERIFICATION_UNAVAILABLE');
+    assert.equal(res.headers.get('X-Billing-Verification'), 'entitlement_verification_unavailable');
+    assert.ok(Number(res.headers.get('Retry-After')) > 0);
+    // Still leaks nothing — a caller we cannot verify is not a Pro caller.
+    assert.equal(json.client_name, undefined);
+    assert.equal(json.redirect_host, undefined);
+  });
+
+  it('#5619: an UNCONFIGURED backend is 503, not the upsell', async () => {
+    // The consent card is the one Pro gate with no client-side entitlement
+    // subscription to contradict it, and #5619 item 3 named this endpoint
+    // specifically. With CONVEX_SITE_URL / the shared secret missing,
+    // getEntitlements returns null for everyone before attempting a lookup —
+    // so INSUFFICIENT_TIER here tells a paying subscriber to buy the plan they
+    // already own, because of our deploy defect.
+    delete process.env.CONVEX_SITE_URL;
+    delete process.env.CONVEX_SERVER_SHARED_SECRET;
+    const { deps } = makeContextDeps({ getEntitlements: async () => null });
+    const res = await grantContextHandler(makeGetReq('nonce_xyz'), deps);
+    assert.equal(res.status, 503);
+    const json = await res.json();
+    assert.equal(json.error, 'TIER_VERIFICATION_UNAVAILABLE');
+    assert.equal(
+      res.headers.get('X-Billing-Verification'),
+      'entitlement_verification_unavailable',
+    );
+    // Still leaks nothing — a caller we cannot verify is not a Pro caller.
+    assert.equal(json.client_name, undefined);
+    assert.equal(json.redirect_host, undefined);
+  });
+
+  it('#5619 + #6716: a CONFIRMED absent entitlement is a free account, and connects', async () => {
+    // #5619 established the distinction that still matters: a null reaching
+    // this gate means Convex ANSWERED and the user has no row, versus a null
+    // that means we never got to ask (the retryable case above). #6716 changes
+    // only what the confirmed answer earns — a never-subscribed account is the
+    // free funnel's target, so it connects and is metered per call.
+    const { deps } = makeContextDeps({ getEntitlements: async () => null });
+    const res = await grantContextHandler(makeGetReq('nonce_xyz'), deps);
+    assert.equal(res.status, 200);
+    // The retryable vocabulary stays reserved for states we could not verify.
+    assert.equal(res.headers.get('X-Billing-Verification'), null);
   });
 
   it('returns 400 INVALID_NONCE when nonce row is missing', async () => {
@@ -642,5 +792,136 @@ describe('grantContextHandler', () => {
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.client_name, BASE_CLIENT_DATA.client_name);
+  });
+});
+
+// =========================================================================
+// #5622 — the grant handshake splits "unverifiable" from "not entitled"
+// =========================================================================
+
+/**
+ * Both endpoints answered every sub-Pro entitlement with a terminal 403
+ * INSUFFICIENT_TIER, including the transient marker `getEntitlements`
+ * synthesizes when the backend lookup FAILS. The SPA maps that code to
+ * "A WorldMonitor Pro subscription is required to authorize MCP clients." — a
+ * paying customer told to buy what they already own because Convex blipped.
+ *
+ * The pair is asserted together on purpose: they share the gate
+ * (server/_shared/pro-mcp-gate.ts) precisely because the SPA branches on `error`
+ * and a divergence would change the user's outcome depending on whether they had
+ * clicked Authorize yet.
+ */
+describe('grant handshake billing-verification denials (#5622)', () => {
+  const TRANSIENT_ENT = {
+    features: { tier: 0, mcpAccess: false },
+    validUntil: 0,
+    verificationUnavailable: true,
+  };
+  const LAPSED_ENT = {
+    features: { tier: 0, mcpAccess: false },
+    validUntil: 0,
+    billingStatus: 'subscription_lapsed',
+  };
+  const RENEWAL_FAILED_ENT = {
+    features: { tier: 0, mcpAccess: false },
+    validUntil: 0,
+    billingStatus: 'renewal_verification_failed',
+    retryAfterSeconds: 22,
+  };
+
+  const SURFACES = [
+    ['mint', (deps) => mintGrantHandler(makePostReq({ nonce: 'nonce_xyz' }), deps), makeMintDeps],
+    ['context', (deps) => grantContextHandler(makeGetReq('nonce_xyz'), deps), makeContextDeps],
+  ];
+
+  for (const [label, invoke, makeDeps] of SURFACES) {
+    it(`${label}: an unverifiable entitlement is a retryable 503, not INSUFFICIENT_TIER`, async () => {
+      const { deps } = makeDeps({ getEntitlements: async () => TRANSIENT_ENT });
+      const res = await invoke(deps);
+
+      assert.equal(res.status, 503);
+      assert.equal(res.headers.get('Cache-Control'), 'no-store');
+      assert.equal(res.headers.get('Retry-After'), '5');
+      assert.equal(
+        res.headers.get('X-Billing-Verification'),
+        'entitlement_verification_unavailable',
+      );
+      const json = await res.json();
+      assert.equal(json.error, 'TIER_VERIFICATION_UNAVAILABLE');
+      assert.notEqual(
+        json.error,
+        'INSUFFICIENT_TIER',
+        'the SPA renders INSUFFICIENT_TIER as a terminal upsell',
+      );
+      // The non-leak invariant still holds on the new path.
+      assert.equal(json.client_name, undefined);
+      assert.equal(json.redirect_host, undefined);
+    });
+
+    it(`${label}: an in-flight renewal re-check carries the provider's own delay`, async () => {
+      const { deps } = makeDeps({ getEntitlements: async () => RENEWAL_FAILED_ENT });
+      const res = await invoke(deps);
+
+      assert.equal(res.status, 503);
+      assert.equal(res.headers.get('Retry-After'), '22');
+      assert.equal(res.headers.get('X-Billing-Verification'), 'renewal_verification_failed');
+      assert.equal((await res.json()).error, 'TIER_VERIFICATION_UNAVAILABLE');
+    });
+
+    it(`${label}: a provider-confirmed lapse connects — dunning is already over (#6716)`, async () => {
+      // Dunning runs while the row is `on_hold`, and isCoveringAt keeps those
+      // users on FULL Pro throughout. A CONFIRMED lapse therefore means the
+      // billing attempts have ended and the account is now simply a free one,
+      // so it takes the free-account door like any other. The RETRYABLE states
+      // above still refuse — that distinction is #5600 and it is intact.
+      const { deps } = makeDeps({ getEntitlements: async () => LAPSED_ENT });
+      const res = await invoke(deps);
+
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get('Retry-After'), null);
+    });
+
+    it(`${label}: a CONFIRMED free row connects, and carries no verification header`, async () => {
+      // The #5622 contract this block defends is retryable-vs-terminal, and it
+      // is intact: X-Billing-Verification and Retry-After stay reserved for
+      // states we could not verify. A confirmed free row is a verified answer,
+      // and since #6716 that answer is "connect and meter", not "buy Pro".
+      const { deps } = makeDeps({ getEntitlements: async () => FREE_ENT });
+      const res = await invoke(deps);
+
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get('X-Billing-Verification'), null);
+      assert.equal(res.headers.get('Retry-After'), null);
+    });
+  }
+
+  it('mint does NOT claim the nonce on a retryable denial, so the retry can still succeed', async () => {
+    // The whole value of a retryable answer is that the SAME click works a moment
+    // later. Burning the SET-NX claim here would make the advertised retry fail
+    // with NONCE_CLAIMED_BY_OTHER_USER or a stale record.
+    const setNxCalls = [];
+    const { deps } = makeMintDeps({
+      getEntitlements: async () => TRANSIENT_ENT,
+      redisSetNxEx: async (key, value, ttl) => {
+        setNxCalls.push({ key, value, ttl });
+        return true;
+      },
+    });
+    const res = await mintGrantHandler(makePostReq({ nonce: 'nonce_xyz' }), deps);
+
+    assert.equal(res.status, 503);
+    assert.deepEqual(setNxCalls, [], 'the gate must run before the nonce claim');
+  });
+
+  it('a CURRENT Pro row carrying a renewal marker for a stronger plan still mints', async () => {
+    const { deps } = makeMintDeps({
+      getEntitlements: async () => ({
+        ...PRO_ENT,
+        billingStatus: 'renewal_verification_pending',
+        retryAfterSeconds: 9,
+      }),
+    });
+    const res = await mintGrantHandler(makePostReq({ nonce: 'nonce_xyz' }), deps);
+    assert.equal(res.status, 200);
   });
 });

@@ -18,6 +18,7 @@ export const config = { runtime: 'edge', regions: ['iad1', 'lhr1', 'fra1', 'sfo1
 import { getCorsHeaders } from './_cors.js';
 // @ts-expect-error — JS module, no declaration file
 import { captureSilentError } from './_sentry-edge.js';
+import { renderBillingVerificationDenial } from '../server/_shared/entitlement-check';
 import { resolvePremiumCallerIdentity } from '../server/_shared/premium-check';
 import { checkRateLimit } from '../server/_shared/rate-limit';
 import { runRedisPipeline } from '../server/_shared/redis';
@@ -53,11 +54,16 @@ function json(body: unknown, status: number, cors: Record<string, string>): Resp
   });
 }
 
-function directLlmQuotaError(status: 429 | 503, retryAfterSec: number, cors: Record<string, string>): Response {
+function directLlmQuotaError(
+  status: 429 | 503,
+  retryAfterSec: number,
+  cors: Record<string, string>,
+  limit = DIRECT_LLM_DAILY_QUOTA_LIMIT,
+): Response {
   const body = status === 429
     ? {
         error: 'Direct LLM daily quota exceeded',
-        limit: DIRECT_LLM_DAILY_QUOTA_LIMIT,
+        limit,
         resetsAt: 'next UTC midnight',
       }
     : { error: 'Direct LLM quota unavailable' };
@@ -72,26 +78,75 @@ function directLlmQuotaError(status: 429 | 503, retryAfterSec: number, cors: Rec
   });
 }
 
-function prependSseEvents(events: Array<Record<string, unknown>>, stream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+function prependSseEvents(
+  events: Array<Record<string, unknown>>,
+  stream: ReadableStream<Uint8Array>,
+  rollbackUnservedQuota: () => Promise<void>,
+): ReadableStream<Uint8Array> {
   const enc = new TextEncoder();
   const prefixes = events.map((e) => enc.encode(`data: ${JSON.stringify(e)}\n\n`));
   let innerReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let outerCancelled = false;
+  let answerProduced = false;
   return new ReadableStream<Uint8Array>({
     async start(controller) {
-      for (const p of prefixes) controller.enqueue(p);
-      innerReader = stream.getReader();
-      while (true) {
-        const { done, value } = await innerReader.read();
-        if (done) { controller.close(); return; }
-        controller.enqueue(value);
+      const decoder = new TextDecoder();
+      let buffered = '';
+      const observeAnswer = (value: Uint8Array) => {
+        buffered += decoder.decode(value, { stream: true });
+        const lines = buffered.split('\n');
+        buffered = lines.pop() ?? '';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const event = JSON.parse(line.slice(6)) as { delta?: unknown; done?: unknown };
+            if ((typeof event.delta === 'string' && event.delta.length > 0) || event.done === true) {
+              answerProduced = true;
+            }
+          } catch {
+            // The inner stream owns malformed-event handling. This wrapper only
+            // needs to know whether answer content was served.
+          }
+        }
+      };
+      const rollbackIfUnserved = () => (
+        answerProduced ? Promise.resolve() : rollbackUnservedQuota()
+      );
+
+      try {
+        for (const p of prefixes) controller.enqueue(p);
+        innerReader = stream.getReader();
+        while (true) {
+          const { done, value } = await innerReader.read();
+          if (done) break;
+          observeAnswer(value);
+          controller.enqueue(value);
+        }
+        await rollbackIfUnserved();
+        if (!outerCancelled) controller.close();
+      } catch (err) {
+        await rollbackIfUnserved();
+        if (!outerCancelled) controller.error(err);
       }
     },
-    cancel() { innerReader?.cancel(); },
+    async cancel(reason) {
+      outerCancelled = true;
+      await Promise.allSettled([
+        innerReader?.cancel(reason),
+        answerProduced ? Promise.resolve() : rollbackUnservedQuota(),
+      ]);
+    },
   });
 }
 
 export default async function handler(req: Request): Promise<Response> {
   const corsHeaders = getCorsHeaders(req) as Record<string, string>;
+  let rollbackQuota: (() => Promise<void>) | null = null;
+  const rollbackUnservedQuota = async () => {
+    const rollback = rollbackQuota;
+    rollbackQuota = null;
+    if (rollback) await rollback();
+  };
 
   if (req.method === 'OPTIONS') {
     return new Response(null, {
@@ -123,22 +178,25 @@ export default async function handler(req: Request): Promise<Response> {
   try {
     const premiumIdentity = await resolvePremiumCallerIdentity(req);
     if (!premiumIdentity.isPremium) {
-      return json({ error: 'Pro subscription required' }, 403, corsHeaders);
-    }
-    if (!premiumIdentity.quotaExempt) {
-      const reservation = await reserveDirectLlmQuota({
-        userId: premiumIdentity.userId,
-        pipeline: (cmds) => runRedisPipeline(cmds, true),
-      });
-      if (!reservation.ok) {
-        return directLlmQuotaError(
-          reservation.reason === 'cap-exceeded' ? 429 : 503,
-          reservation.retryAfterSec,
+      // Preserve retryable billing-verification denials instead of flattening
+      // them to the Pro 403. The panel renders this header without auto-retrying.
+      if (premiumIdentity.billingDenial) {
+        const denial = renderBillingVerificationDenial(
+          premiumIdentity.billingDenial,
           corsHeaders,
         );
+        if (denial) return denial;
       }
+      // A caller we could not identify is not a caller on the free plan (#5619).
+      // Selling a subscription to someone who is merely signed out is both wrong
+      // and unactionable, and it left the client's `sign_in_required` verdict
+      // (#5608) unreachable on this route — every denial arrived as a 403.
+      // Matches api/latest-brief.ts, which has always answered 401 here.
+      if (premiumIdentity.unauthenticated) {
+        return json({ error: 'UNAUTHENTICATED' }, 401, corsHeaders);
+      }
+      return json({ error: 'Pro subscription required' }, 403, corsHeaders);
     }
-
     // Streaming LLM endpoint — the rate-limit IS the abuse defence (each
     // call hits a frontier model). This route doesn't go through gateway
     // checkEndpointRateLimit, so opt into fail-closed explicitly: a Redis
@@ -181,6 +239,29 @@ export default async function handler(req: Request): Promise<Response> {
       })
       .filter((m) => m.content.length > 0);
 
+    // Spend quota only after the request has passed every body-level gate.
+    // The fail-closed request rate limit above still protects malformed input,
+    // while invalid JSON and empty queries cannot consume a subscriber's daily
+    // LLM allowance. Hold the rollback until the SSE stream serves answer
+    // content; failures and client aborts before the first delta release the
+    // slot, while a delivered partial answer remains charged.
+    if (!premiumIdentity.quotaExempt && premiumIdentity.directLlmDailyLimit !== null) {
+      const reservation = await reserveDirectLlmQuota({
+        userId: premiumIdentity.userId,
+        limit: premiumIdentity.directLlmDailyLimit,
+        pipeline: (cmds) => runRedisPipeline(cmds, true),
+      });
+      if (!reservation.ok) {
+        return directLlmQuotaError(
+          reservation.reason === 'cap-exceeded' ? 429 : 503,
+          reservation.retryAfterSec,
+          corsHeaders,
+          reservation.floor ?? DIRECT_LLM_DAILY_QUOTA_LIMIT,
+        );
+      }
+      rollbackQuota = reservation.rollback;
+    }
+
     // Build retrieval query with current turn FIRST so its keywords fill the
     // extraction cap before prior-turn terms. This ensures pivot words like
     // "Germany" in "What about Germany?" are never crowded out by a long
@@ -215,6 +296,7 @@ export default async function handler(req: Request): Promise<Response> {
         ...buildActionEvents(query).map((a) => ({ action: a })),
       ],
       llmStream,
+      rollbackUnservedQuota,
     );
 
     return new Response(stream, {
@@ -227,6 +309,7 @@ export default async function handler(req: Request): Promise<Response> {
       },
     });
   } catch (err) {
+    await rollbackUnservedQuota();
     captureSilentError(err, { tags: { route: 'api/chat-analyst', step: 'pre-stream' } });
     return json({ error: 'service_unavailable' }, 503, corsHeaders);
   }

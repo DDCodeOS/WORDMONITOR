@@ -9,9 +9,10 @@
  * code for one domain per function, cutting cold-start cost by ~20×.
  */
 
-import { createRouter, type RouteDescriptor } from './router';
-import { getCorsHeaders, isDisallowedOrigin, isAllowedOrigin } from './cors';
+import { createRouter, toHeadResponse, type RouteDescriptor } from './router';
+import { getCorsHeaders, getOriginDeniedCorsHeaders, isDisallowedOrigin, isAllowedOrigin } from './cors';
 import { isPublicSharedRpcRequest } from '../src/shared/public-rpc-cache';
+import { PRO_FRESH_CACHE_RPC_PATHS } from '../src/shared/pro-fresh-rpc';
 // @ts-expect-error — JS module, no declaration file
 import { USER_API_KEY_GATEWAY_VALIDATION_ERROR, validateApiKey } from '../api/_api-key.js';
 // @ts-expect-error — JS module, no declaration file
@@ -25,10 +26,37 @@ import {
   checkFailClosedScopedIpRateLimit,
   hasEndpointRatePolicy,
 } from './_shared/rate-limit';
-import { drainResponseHeaders, drainSuccessStatusOverride } from './_shared/response-headers';
-import { projectJsonResponse } from './_shared/response-projection';
+import {
+  drainResponseHeaders,
+  drainRetryableResponse,
+  drainSuccessStatusOverride,
+} from './_shared/response-headers';
+import {
+  appendDeprecationPolicyLink,
+  appendDeprecationPolicyLinkToRecord,
+  DEPRECATION_POLICY_LINK,
+} from './_shared/deprecation-policy';
+import {
+  REST_ATTRIBUTION_EXPRESSIONS,
+  buildAttributionRider,
+  mergeAttributionRider,
+} from '../shared/attribution-rider';
+import {
+  enforceRestProjectionOutputLimit,
+  projectJsonResponse,
+} from './_shared/response-projection';
 import { getRpcNoStoreReasonFromJson } from './_shared/cache-contract';
-import { checkEntitlementDetailed, getRequiredTier, getEntitlements, type CachedEntitlements } from './_shared/entitlement-check';
+import {
+  checkEntitlementDetailed,
+  getBillingVerificationDenial,
+  getRequiredTier,
+  getEntitlements,
+  isEntitlementBackendConfigured,
+  type CachedEntitlements,
+} from './_shared/entitlement-check';
+import { EMBED_KEY_RPC_PATHS } from '../shared/embed-panels';
+import { hasEmbedAccess } from '../shared/embed-access';
+import { checkProMcpAccess } from './_shared/pro-mcp-gate';
 import { resolveClerkSession } from './_shared/auth-session';
 import {
   INTERNAL_MCP_SIG_HEADER,
@@ -39,7 +67,8 @@ import {
   INTERNAL_MCP_REPLAY_CACHE_TTL_SECONDS,
   getInternalMcpVerifiedNonce,
   sha256Hex,
-  verifyInternalMcpRequest,
+  verifyInternalMcpRequestDetailed,
+  type InternalMcpVerifyFailure,
 } from './_shared/mcp-internal-hmac';
 import { buildUsageIdentity, hashKeySync, type UsageIdentityInput } from './_shared/usage-identity';
 import { runRedisPipeline } from './_shared/redis';
@@ -47,6 +76,7 @@ import {
   beginIdempotency,
   peekIdempotency,
   IDEMPOTENCY_HEADER,
+  IDEMPOTENCY_EXEMPT_RPC_PATHS,
   IDEMPOTENT_REPLAYED_HEADER,
   type IdempotencyOutcome,
 } from './_shared/idempotency';
@@ -55,11 +85,12 @@ import {
   reserveDailyMeter,
   rateLimitHeaders,
   ENTERPRISE_API_RATE_LIMIT,
-  CEILING_MULTIPLIER,
 } from './_shared/api-key-rate-limit';
 import {
   DIRECT_LLM_DAILY_QUOTA_LIMIT,
+  DIRECT_LLM_UNVERIFIED_DAILY_QUOTA_LIMIT,
   DIRECT_LLM_GATEWAY_QUOTA_PATHS,
+  resolveActiveDirectLlmLimit,
   reserveDirectLlmQuota,
 } from './_shared/direct-llm-quota';
 import {
@@ -86,8 +117,16 @@ import {
 } from './_shared/usage';
 import { timingSafeEqual } from './_shared/internal-auth';
 import type { ServerOptions } from '../src/generated/server/worldmonitor/seismology/v1/service_server';
+import { validateGeneratedRequest } from './request-validator';
+import {
+  buildMarkdownTwinResponse,
+  isMarkdownTwinPath,
+} from '../api/_md-url-twin';
 
-export const serverOptions: ServerOptions = { onError: mapErrorToResponse };
+export const serverOptions: ServerOptions = {
+  onError: mapErrorToResponse,
+  validateRequest: validateGeneratedRequest,
+};
 
 /**
  * Internal-MCP request body size cap (256 KB). Internal-MCP fetches
@@ -107,6 +146,54 @@ const MAX_INTERNAL_MCP_BODY = 256 * 1024;
 
 type InternalMcpReplayClaim = 'fresh' | 'replay' | 'unavailable';
 
+/**
+ * The ONE response every internal-MCP signature rejection returns.
+ *
+ * Routed through a single constructor on purpose: the security property is
+ * that a caller cannot tell a stale timestamp from a forged signature from a
+ * spent nonce, and that property is only as strong as the guarantee that no
+ * branch builds its own subtly different reply. Add a new rejection mode and
+ * it returns this too — status, body and headers, identical.
+ */
+function internalMcpSignatureDenial(corsHeaders: Record<string, string>): Response {
+  return new Response(
+    JSON.stringify({ error: 'invalid_internal_mcp_signature' }),
+    { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+  );
+}
+
+/**
+ * Server-side telemetry label for a verification failure. This is the half of
+ * the rejection that IS allowed to differ — it goes to wm_api_usage, never to
+ * the caller.
+ */
+function internalMcpReasonFor(failure: InternalMcpVerifyFailure): RequestReason {
+  switch (failure) {
+    // Cannot normally happen here: the handler returns 500 CONFIGURATION
+    // before reaching the verifier when the secret is absent. Mapped to the
+    // existing config reason so a deploy incident never lands in an auth
+    // dashboard.
+    case 'no_secret': return 'hmac_secret_unconfigured';
+    case 'no_user_id': return 'internal_mcp_no_user';
+    case 'missing_signature':
+    case 'malformed_signature': return 'internal_mcp_malformed_sig';
+    case 'invalid_nonce': return 'internal_mcp_bad_nonce';
+    case 'timestamp_window': return 'internal_mcp_ts_window';
+    case 'malformed_request': return 'internal_mcp_bad_request';
+    case 'signature_mismatch': return 'internal_mcp_sig_mismatch';
+  }
+}
+
+function getRateLimitTelemetryReason(
+  response: Response,
+  rejectedReason: RequestReason,
+): RequestReason {
+  return response.status === 503 &&
+    response.headers.get('X-RateLimit-Mode') === 'degraded'
+    ? 'rate_limit_degraded'
+    : rejectedReason;
+}
+
 async function claimInternalMcpReplayNonce(userId: string, nonce: string): Promise<InternalMcpReplayClaim> {
   const digest = await sha256Hex(`${userId}:${nonce}`);
   const key = `internal-mcp-replay:v1:${digest}`;
@@ -123,7 +210,7 @@ async function claimInternalMcpReplayNonce(userId: string, nonce: string): Promi
 // NOTE: This map is shared across all domain bundles (~3KB). Kept centralised for
 // single-source-of-truth maintainability; the size is negligible vs handler code.
 
-type CacheTier = 'fast' | 'medium' | 'slow' | 'slow-browser' | 'static' | 'daily' | 'no-store' | 'live';
+type CacheTier = 'fast' | 'medium' | 'slow' | 'slow-browser' | 'live-browser' | 'static' | 'daily' | 'no-store' | 'live';
 
 // Three-tier caching: browser (max-age) → CF edge (s-maxage) → Vercel CDN (CDN-Cache-Control).
 // CF ignores Vary: Origin so it may pin a single ACAO value, but this is acceptable
@@ -138,6 +225,7 @@ const TIER_HEADERS: Record<CacheTier, string> = {
   medium: 'public, max-age=120, s-maxage=600, stale-while-revalidate=120, stale-if-error=900',
   slow: 'public, max-age=300, s-maxage=1800, stale-while-revalidate=300, stale-if-error=3600',
   'slow-browser': 'max-age=300, stale-while-revalidate=60, stale-if-error=1800',
+  'live-browser': 'private, max-age=30, stale-while-revalidate=60, stale-if-error=300',
   static: 'public, max-age=600, s-maxage=3600, stale-while-revalidate=600, stale-if-error=14400',
   daily: 'public, max-age=3600, s-maxage=14400, stale-while-revalidate=7200, stale-if-error=172800',
   'no-store': 'no-store',
@@ -152,6 +240,7 @@ const TIER_CDN_CACHE: Record<CacheTier, string | null> = {
   medium: 'public, s-maxage=1200, stale-while-revalidate=600, stale-if-error=1800',
   slow: 'public, s-maxage=3600, stale-while-revalidate=900, stale-if-error=7200',
   'slow-browser': 'public, s-maxage=900, stale-while-revalidate=60, stale-if-error=1800',
+  'live-browser': null,
   static: 'public, s-maxage=14400, stale-while-revalidate=3600, stale-if-error=28800',
   daily: 'public, s-maxage=86400, stale-while-revalidate=14400, stale-if-error=172800',
   'no-store': null,
@@ -171,6 +260,8 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/market/v1/list-ai-tokens': 'slow',
   '/api/market/v1/list-other-tokens': 'slow',
   '/api/market/v1/list-commodity-quotes': 'medium',
+  '/api/market/v1/get-physical-premiums': 'no-store',
+  '/api/market/v1/get-physical-divergence-index': 'no-store',
   '/api/market/v1/list-stablecoin-markets': 'medium',
   '/api/market/v1/get-sector-summary': 'medium',
   '/api/market/v1/get-fear-greed-index': 'slow',
@@ -186,11 +277,13 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/infrastructure/v1/list-internet-ddos-attacks': 'slow',
   '/api/infrastructure/v1/list-internet-traffic-anomalies': 'slow',
   '/api/forecast/v1/get-forecast-scorecard': 'fast',
+  '/api/safety/v1/get-toronto-safety': 'slow',
 
   '/api/unrest/v1/list-unrest-events': 'slow',
   '/api/cyber/v1/list-cyber-threats': 'static',
   '/api/conflict/v1/list-acled-events': 'slow',
   '/api/military/v1/get-theater-posture': 'slow',
+  '/api/military/v1/get-defense-industrial-base': 'daily',
   '/api/infrastructure/v1/get-temporal-baseline': 'slow',
   '/api/aviation/v1/list-airport-delays': 'static',
   '/api/aviation/v1/get-airport-ops-summary': 'static',
@@ -207,6 +300,7 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/natural/v1/list-natural-events': 'slow',
   '/api/wildfire/v1/list-fire-detections': 'static',
   '/api/maritime/v1/list-navigational-warnings': 'static',
+  '/api/supply-chain/v1/get-china-corridor-control-towers': 'medium',
   '/api/supply-chain/v1/get-shipping-rates': 'daily',
   '/api/supply-chain/v1/list-pipelines': 'static',
   '/api/supply-chain/v1/get-pipeline-detail': 'static',
@@ -222,6 +316,10 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/research/v1/list-trending-repos': 'static',
   '/api/giving/v1/get-giving-summary': 'static',
   '/api/intelligence/v1/get-country-intel-brief': 'static',
+  // The canonical Railway projection refreshes every 15 minutes. Keep the
+  // public composition route's Vercel TTL (10m on fast) inside that cadence so
+  // the seeder cannot keep re-publishing a two-hour-old medium-tier response.
+  '/api/intelligence/v1/get-china-decision-signals': 'fast',
   '/api/intelligence/v1/get-gdelt-topic-timeline': 'medium',
   '/api/climate/v1/list-climate-anomalies': 'daily',
   '/api/climate/v1/list-climate-disasters': 'daily',
@@ -260,6 +358,7 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/economic/v1/get-nat-gas-storage': 'daily',
   '/api/economic/v1/get-eu-yield-curve': 'daily',
   '/api/supply-chain/v1/get-critical-minerals': 'daily',
+  '/api/supply-chain/v1/get-mineral-production': 'daily',
   '/api/military/v1/get-aircraft-details': 'static',
   '/api/military/v1/get-wingbits-status': 'static',
   '/api/military/v1/get-wingbits-live-flight': 'no-store',
@@ -268,6 +367,14 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/market/v1/list-etf-flows': 'slow',
   '/api/research/v1/list-hackernews-items': 'slow',
   '/api/intelligence/v1/get-country-risk': 'slow',
+  // get-country-coverage is premium-gated via PREMIUM_RPC_PATHS, so the gateway
+  // short-circuits to 'slow-browser' before consulting this map — same as
+  // get-regional-snapshot below. This entry exists to satisfy the parity
+  // contract in tests/route-cache-tier.test.mjs and to record the intended tier
+  // if the endpoint ever stops being premium: `medium` rather than the sibling
+  // `slow`, because the response can carry degraded=true and an hour of shared
+  // edge cache would pin a transient upstream failure long after it healed.
+  '/api/intelligence/v1/get-country-coverage': 'medium',
   '/api/intelligence/v1/get-risk-scores': 'slow',
   '/api/intelligence/v1/get-pizzint-status': 'slow',
   '/api/intelligence/v1/classify-event': 'static',
@@ -285,6 +392,7 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/supply-chain/v1/get-chokepoint-status': 'medium',
   '/api/supply-chain/v1/get-chokepoint-history': 'slow',
   '/api/news/v1/list-feed-digest': 'slow',
+  '/api/news/v1/list-country-headlines': 'fast',
   '/api/intelligence/v1/get-country-facts': 'daily',
   '/api/intelligence/v1/list-security-advisories': 'slow',
   '/api/intelligence/v1/list-satellites': 'static',
@@ -292,8 +400,11 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/intelligence/v1/list-cross-source-signals': 'medium',
   '/api/intelligence/v1/list-oref-alerts': 'fast',
   '/api/intelligence/v1/list-telegram-feed': 'fast',
+  '/api/intelligence/v1/list-x-feed': 'fast',
   '/api/intelligence/v1/get-company-enrichment': 'slow',
   '/api/intelligence/v1/list-company-signals': 'slow',
+  '/api/intelligence/v1/search-sec-filings': 'medium',
+  '/api/intelligence/v1/list-material-events': 'medium',
   '/api/news/v1/summarize-article-cache': 'slow',
 
   '/api/imagery/v1/search-imagery': 'static',
@@ -321,7 +432,9 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/market/v1/get-insider-transactions': 'slow',
   '/api/economic/v1/get-economic-calendar': 'slow',
   '/api/economic/v1/get-china-macro-snapshot': 'slow',
+  '/api/economic/v1/get-china-activity-nowcast': 'medium',
   '/api/intelligence/v1/list-market-implications': 'slow',
+  '/api/intelligence/v1/list-wsb-tickers': 'no-store',
   '/api/economic/v1/get-ecb-fx-rates': 'slow',
   '/api/economic/v1/get-eurostat-country-data': 'slow',
   '/api/economic/v1/get-eu-gas-storage': 'slow',
@@ -336,6 +449,11 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/supply-chain/v1/get-bypass-options': 'slow-browser',
   '/api/supply-chain/v1/get-country-cost-shock': 'slow-browser',
   '/api/supply-chain/v1/get-country-products': 'slow-browser',
+  // These responses differ by caller redistribution rights. The gateway cache
+  // key does not vary on session/API-key audience, so they must never be stored.
+  '/api/supply-chain/v1/get-country-vulnerabilities': 'no-store',
+  '/api/supply-chain/v1/get-chokepoint-dependencies': 'no-store',
+  '/api/supply-chain/v1/list-vulnerability-rankings': 'no-store',
   '/api/supply-chain/v1/get-multi-sector-cost-shock': 'slow-browser',
   '/api/supply-chain/v1/get-sector-dependency': 'slow-browser',
   '/api/supply-chain/v1/get-route-explorer-lane': 'slow-browser',
@@ -364,9 +482,19 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/intelligence/v1/get-regime-history': 'slow',
   // get-regional-brief is premium-gated; slow-browser in practice, slow entry for route-parity.
   '/api/intelligence/v1/get-regional-brief': 'slow',
+  // Historical intelligence memory (#5694) — the timeline is a generated GET
+  // and therefore requires an explicit gateway cache tier. The two semantic
+  // reads are POSTs and cache successful results inside their handlers.
+  '/api/intelligence/v1/get-intel-timeline': 'slow',
   '/api/resilience/v1/get-resilience-score': 'slow',
+  '/api/resilience/v1/get-resilience-indicators': 'slow',
   '/api/resilience/v1/get-resilience-ranking': 'slow',
+  '/api/resilience/v1/get-food-stocks': 'slow',
+  '/api/resilience/v1/get-demographics-capability': 'slow',
   '/api/resilience/v1/get-runtime-manifest': 'no-store',
+  '/api/scorecard/v1/get-five-factor-scorecard': 'slow',
+  '/api/scorecard/v1/list-five-factor-scorecards': 'slow',
+  '/api/scorecard/v1/get-bloc-scorecard': 'slow',
 
   // Partner-facing shipping/v2. route-intelligence is premium-gated; gateway
   // short-circuits to slow-browser. Entry required by tests/route-cache-tier.test.mjs.
@@ -374,16 +502,23 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   // GET /webhooks lists caller's webhooks — premium-gated; short-circuited to
   // slow-browser. Entry required by tests/route-cache-tier.test.mjs.
   '/api/v2/shipping/webhooks': 'slow-browser',
+
+  // Company Monitoring is account-private and remains unrouted until #6003.
+  // Keep every generated read no-store so future activation cannot inherit a
+  // shared CDN tier before its account isolation is proven end to end.
+  '/api/company-monitoring/v1/get-company-coverage': 'no-store',
+  '/api/company-monitoring/v1/get-company-material-event': 'no-store',
+  '/api/company-monitoring/v1/get-company-monitoring-status': 'no-store',
+  '/api/company-monitoring/v1/list-company-event-changes': 'no-store',
+  '/api/company-monitoring/v1/list-company-event-impacts': 'no-store',
+  '/api/company-monitoring/v1/list-monitored-companies': 'no-store',
 };
 
 import { PREMIUM_RPC_PATHS } from '../src/shared/premium-paths';
 
 export const PUBLIC_NO_AUTH_RPC_PATHS = new Set<string>([
-  '/api/conflict/v1/list-acled-events',
-  '/api/natural/v1/list-natural-events',
+  '/api/intelligence/v1/get-china-decision-signals',
   '/api/resilience/v1/get-runtime-manifest',
-  '/api/seismology/v1/list-earthquakes',
-  '/api/unrest/v1/list-unrest-events',
   // Lead-capture RPCs serve ANONYMOUS prospects by definition: the /pro
   // marketing page contact form and the waitlist/desktop signup both POST
   // without a wms_ session or API key (see pro-test/src/App.tsx onSubmit and
@@ -416,6 +551,10 @@ export const RELAY_WARM_PING_PATHS = new Set<string>([
   '/api/infrastructure/v1/list-temporal-anomalies',
   '/api/intelligence/v1/get-risk-scores',
   '/api/supply-chain/v1/get-chokepoint-status',
+  // Classify reads the same public digest a session holder can already trigger
+  // so self-host / Railway can send WORLDMONITOR_RELAY_KEY instead of an
+  // enterprise key (#7437).
+  '/api/news/v1/list-feed-digest',
 ]);
 
 /**
@@ -447,6 +586,113 @@ function isPostToGetCompatibleBodySize(headers: Headers): boolean {
 
   const contentLength = Number(rawContentLength);
   return Number.isSafeInteger(contentLength) && contentLength < POST_TO_GET_MAX_BODY_BYTES;
+}
+
+type PostToGetScalar = string | number | boolean;
+
+function isPostToGetScalar(value: unknown): value is PostToGetScalar {
+  return typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
+}
+
+function isPostToGetPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+type PostToGetCompatField =
+  | { kind: 'scalar'; name: string; value: string }
+  | { kind: 'array'; name: string; values: string[] };
+
+type PostToGetCompatParse =
+  | { status: 'ok'; fields: PostToGetCompatField[] }
+  | { status: 'too_large' }
+  | { status: 'malformed_json' }
+  | { status: 'unsupported_body' }
+  | { status: 'unsupported_value'; parameter: string }
+  | { status: 'oversized_array'; parameter: string };
+
+/**
+ * Decode a legacy POST body into GET query fields.
+ *
+ * Empty / whitespace-only bodies stay on the silent GET fallback for stale
+ * clients that POST with no payload. Any other body is all-or-nothing: a
+ * JSON object of scalars and scalar arrays becomes query parameters; mixed
+ * or nested values, non-object JSON, and malformed JSON return 400 without
+ * applying a partial translation. Compatibility-body errors are only
+ * returned when a GET handler exists for the path; unknown routes still
+ * 404/405. Body-read failures return 400. The 1 MB byte cap and
+ * 200-values-per-key cap from #3550 still bound expansion cost.
+ */
+function parsePostToGetCompatBody(bodyText: string): PostToGetCompatParse {
+  if (new TextEncoder().encode(bodyText).byteLength >= POST_TO_GET_MAX_BODY_BYTES) {
+    return { status: 'too_large' };
+  }
+  if (bodyText.trim().length === 0) {
+    return { status: 'ok', fields: [] };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch {
+    return { status: 'malformed_json' };
+  }
+
+  if (!isPostToGetPlainObject(parsed)) {
+    return { status: 'unsupported_body' };
+  }
+
+  const fields: PostToGetCompatField[] = [];
+  for (const [name, value] of Object.entries(parsed)) {
+    if (Array.isArray(value)) {
+      if (value.length > POST_TO_GET_MAX_ARRAY_VALUES_PER_KEY) {
+        return { status: 'oversized_array', parameter: name };
+      }
+      const values: string[] = [];
+      for (const item of value) {
+        if (!isPostToGetScalar(item)) {
+          return { status: 'unsupported_value', parameter: name };
+        }
+        values.push(String(item));
+      }
+      fields.push({ kind: 'array', name, values });
+      continue;
+    }
+    if (isPostToGetScalar(value)) {
+      fields.push({ kind: 'scalar', name, value: String(value) });
+      continue;
+    }
+    return { status: 'unsupported_value', parameter: name };
+  }
+  return { status: 'ok', fields };
+}
+
+function applyPostToGetCompatFields(searchParams: URLSearchParams, fields: PostToGetCompatField[]): void {
+  for (const field of fields) {
+    if (field.kind === 'scalar') {
+      searchParams.set(field.name, field.value);
+      continue;
+    }
+    for (const value of field.values) {
+      searchParams.append(field.name, value);
+    }
+  }
+}
+
+function postToGetCompatErrorBody(parsed: Exclude<PostToGetCompatParse, { status: 'ok' }>): Record<string, unknown> {
+  if (parsed.status === 'too_large') return { error: 'malformed_request' };
+  if (parsed.status === 'malformed_json') return { error: 'Invalid JSON body for POST compatibility' };
+  if (parsed.status === 'unsupported_body') return { error: 'Unsupported POST compatibility body' };
+  if (parsed.status === 'oversized_array') {
+    return {
+      error: 'Too many values for POST compatibility parameter',
+      parameter: parsed.parameter,
+      maxValues: POST_TO_GET_MAX_ARRAY_VALUES_PER_KEY,
+    };
+  }
+  return {
+    error: 'Unsupported value for POST compatibility parameter',
+    parameter: parsed.parameter,
+  };
 }
 
 function getRequiredBboxQueryProblems(searchParams: URLSearchParams): { missing: string[]; invalid: string[]; allZero: boolean } {
@@ -556,6 +802,7 @@ function createGatewayAuthErrorResponse(
       'Content-Type': 'application/json',
       'Cache-Control': 'no-store',
       ...corsHeaders,
+      Link: DEPRECATION_POLICY_LINK,
     },
   });
 }
@@ -568,9 +815,15 @@ const GATEWAY_DIRECT_LLM_QUOTA_METHODS: Record<string, string> = {
   '/api/news/v1/summarize-article': 'POST',
 };
 
+const COUNTRY_INTEL_BRIEF_PATH = '/api/intelligence/v1/get-country-intel-brief';
+
+function methodForGetEquivalentPolicy(method: string): string {
+  return method === 'HEAD' ? 'GET' : method;
+}
+
 async function shouldReserveGatewayDirectLlmQuota(request: Request, pathname: string): Promise<boolean> {
   if (!DIRECT_LLM_GATEWAY_QUOTA_PATHS.has(pathname)) return false;
-  if (GATEWAY_DIRECT_LLM_QUOTA_METHODS[pathname] !== request.method) return false;
+  if (GATEWAY_DIRECT_LLM_QUOTA_METHODS[pathname] !== methodForGetEquivalentPolicy(request.method)) return false;
   if (pathname !== '/api/news/v1/summarize-article') return true;
 
   const contentLength = Number(request.headers.get('Content-Length') ?? '0');
@@ -598,7 +851,7 @@ function createDirectLlmQuotaFailureResponse(
   if (reservation.reason === 'cap-exceeded') {
     return new Response(JSON.stringify({
       error: 'Direct LLM daily quota exceeded',
-      limit: DIRECT_LLM_DAILY_QUOTA_LIMIT,
+      limit: reservation.floor ?? DIRECT_LLM_DAILY_QUOTA_LIMIT,
       resetsAt: 'next UTC midnight',
     }), {
       status: 429,
@@ -679,7 +932,23 @@ export function createDomainGateway(
   assertProMcpGatewayHmacConfig();
   const router = createRouter(routes);
 
-  return async function handler(originalRequest: Request, ctx?: GatewayCtx): Promise<Response> {
+  async function dispatch(originalRequest: Request, ctx?: GatewayCtx): Promise<Response> {
+    const originalPathname = new URL(originalRequest.url).pathname;
+
+    // Vercel resolves versioned API paths such as
+    // `/api/forecast/v1/get-forecast-scorecard.md` to the more-specific
+    // `api/<domain>/v1/[rpc].ts` function before the root API catch-all. Handle
+    // markdown probes here, before auth and RPC dispatch, so every dynamic
+    // domain gateway follows the same site-wide `.md` twin contract without a
+    // broad rewrite that would shadow the real endpoints (#4724).
+    if (
+      originalPathname.startsWith('/api/') &&
+      isMarkdownTwinPath(originalPathname) &&
+      (originalRequest.method === 'GET' || originalRequest.method === 'HEAD')
+    ) {
+      return buildMarkdownTwinResponse(originalRequest, originalPathname);
+    }
+
     let request = stripClientUserIdHeader(originalRequest);
     const rawPathname = new URL(request.url).pathname;
     const pathname = rawPathname.length > 1 ? rawPathname.replace(/\/+$/, '') : rawPathname;
@@ -709,6 +978,14 @@ export function createDomainGateway(
     };
     function recordUsageEntitlement(ent: CachedEntitlements | null): void {
       if (!ent) return;
+      // The synthesized verification marker is not an answer about this
+      // caller's plan — it is free-SHAPED so the gates deny, nothing more.
+      // Copying its tier-0/'free' fields into usage telemetry would durably
+      // label unverifiable paying callers as free in Axiom, and it would do so
+      // precisely during the outage window this data exists to diagnose. Leave
+      // both fields null, which is what an unanswered lookup used to record
+      // back when this state arrived as a null (#5619 follow-up).
+      if (ent.verificationUnavailable) return;
       usage.tier = typeof ent.features.tier === 'number' ? ent.features.tier : 0;
       usage.planKey = ent.planKey;
     }
@@ -724,6 +1001,23 @@ export function createDomainGateway(
     // volume signal Phase-2 pricing reuses isn't double-counted. Overrides only
     // a successful terminal reason (status < 400); a real 4xx/5xx outcome wins.
     let pendingShadowReason: RequestReason | null = null;
+    // Shared emit+return for the three billing-verification denial sites below
+    // (internal-MCP re-check, wm_ key, legacy bearer).
+    function denyForBillingVerification(
+      ent: CachedEntitlements | null | undefined,
+      cors: Record<string, string>,
+      capabilityCovered = false,
+    ): Response | null {
+      if (capabilityCovered) return null;
+      const billingDenial = getBillingVerificationDenial(ent, cors);
+      if (!billingDenial) return null;
+      emitRequest(
+        billingDenial.status,
+        billingDenial.status === 503 ? 'billing_verification_503' : 'tier_403',
+        null,
+      );
+      return billingDenial;
+    }
     function emitRequest(status: number, reason: RequestReason, cacheTier: UsageCacheTier | null, resBytes = 0): void {
       if (!ctx?.waitUntil) return;
       const effectiveReason: RequestReason =
@@ -770,22 +1064,15 @@ export function createDomainGateway(
       })());
     }
 
-    // Origin check — skip CORS headers for disallowed origins
-    if (isDisallowedOrigin(request)) {
-      emitRequest(403, 'origin_403', null);
-      return new Response(JSON.stringify({ error: 'Origin not allowed' }), {
-        status: 403,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
-
     // Fail closed on CORS-header generation errors. Previous behaviour fell
     // back to a wildcard ACAO, which converted the allowlist into wildcard
     // CORS on the error path. Now we omit CORS headers and surface a 500
     // so the browser blocks any cross-origin read. See issue #3705.
     let corsHeaders: Record<string, string>;
     try {
-      corsHeaders = getCorsHeaders(request);
+      corsHeaders = isDisallowedOrigin(request)
+        ? getOriginDeniedCorsHeaders(request)
+        : getCorsHeaders(request);
     } catch (err) {
       // Pass the Sentry delivery promise through ctx.waitUntil so the
       // Vercel Edge isolate survives long enough to actually flush the
@@ -808,10 +1095,31 @@ export function createDomainGateway(
       });
     }
 
-    // OPTIONS preflight
+    // RFC 9745 policy discovery on every CORS-bearing response, including
+    // 401/403/404/405 early returns. Idempotent if a handler already set
+    // rel="deprecation". Absolute URL: api.worldmonitor.app would 404 a
+    // root-relative /api-versioning.md.
+    appendDeprecationPolicyLinkToRecord(corsHeaders);
+
+    // OPTIONS preflight must succeed even for origins we refuse on the actual
+    // request — otherwise the browser never sends POST/GET and origin_403 is
+    // an opaque network error (#6411).
     if (request.method === 'OPTIONS') {
       emitRequest(204, 'preflight', null);
       return new Response(null, { status: 204, headers: corsHeaders });
+    }
+
+    // Origin check — refuse with readable CORS so the browser can surface the
+    // 403 instead of an opaque network error (#6411).
+    if (isDisallowedOrigin(request)) {
+      emitRequest(403, 'origin_403', null);
+      return new Response(JSON.stringify({ error: 'Origin not allowed' }), {
+        status: 403,
+        headers: {
+          'Content-Type': 'application/json',
+          ...corsHeaders,
+        },
+      });
     }
 
     // ----------------------------------------------------------------------
@@ -918,7 +1226,10 @@ export function createDomainGateway(
         // CONFIGURATION so operators see it; legacy wm_ key path is
         // unaffected because we only enter this branch when the caller
         // explicitly tried to use the internal-MCP route.
-        emitRequest(500, 'auth_401', null);
+        // Telemetry must not use auth_401 here: that reason is for caller
+        // authentication failure, and a missing HMAC secret is a deploy
+        // configuration incident (#7277).
+        emitRequest(500, 'hmac_secret_unconfigured', null);
         return new Response(
           JSON.stringify({ error: 'CONFIGURATION', detail: 'MCP_INTERNAL_HMAC_SECRET not configured' }),
           { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
@@ -949,11 +1260,8 @@ export function createDomainGateway(
         try {
           bodyBytes = await request.clone().arrayBuffer();
         } catch {
-          emitRequest(401, 'auth_401', null);
-          return new Response(
-            JSON.stringify({ error: 'invalid_internal_mcp_signature' }),
-            { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-          );
+          emitRequest(401, 'internal_mcp_bad_request', null);
+          return internalMcpSignatureDenial(corsHeaders);
         }
         if (bodyBytes.byteLength > MAX_INTERNAL_MCP_BODY) {
           emitRequest(413, 'malformed_request', null);
@@ -970,19 +1278,18 @@ export function createDomainGateway(
           body: bodyBytes,
         });
       }
-      // verifyInternalMcpRequest returns null when X-WM-MCP-User-Id is
-      // missing, signature header is malformed, timestamp is out of
-      // window, or the HMAC compare fails. All collapse to a single 401 —
-      // intentionally do NOT distinguish (don't leak which piece failed
-      // to a forge probe).
-      const verified = await verifyInternalMcpRequest(request, hmacSecret);
-      if (!verified) {
-        emitRequest(401, 'auth_401', null);
-        return new Response(
-          JSON.stringify({ error: 'invalid_internal_mcp_signature' }),
-          { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-        );
+      // X-WM-MCP-User-Id missing, malformed signature header, timestamp out of
+      // window, and a failed HMAC compare all collapse to ONE 401 — telling a
+      // forge probe which piece failed is exactly the oracle this must not be.
+      // That stays true below: every branch returns the identical response
+      // built in one place. Only the emitted telemetry reason differs, and it
+      // never leaves the server.
+      const verifyResult = await verifyInternalMcpRequestDetailed(request, hmacSecret);
+      if (!verifyResult.ok) {
+        emitRequest(401, internalMcpReasonFor(verifyResult.failure), null);
+        return internalMcpSignatureDenial(corsHeaders);
       }
+      const verified = verifyResult.verified;
       const replayClaim = await claimInternalMcpReplayNonce(verified.userId, verified.nonce);
       if (replayClaim === 'unavailable') {
         // Fail closed: without an atomic replay-cache claim, a valid captured
@@ -994,11 +1301,10 @@ export function createDomainGateway(
         );
       }
       if (replayClaim === 'replay') {
-        emitRequest(401, 'auth_401', null);
-        return new Response(
-          JSON.stringify({ error: 'invalid_internal_mcp_signature' }),
-          { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-        );
+        // Same response as a bad signature, by design — a probe must not learn
+        // that its nonce was the thing that was already spent.
+        emitRequest(401, 'internal_mcp_replay', null);
+        return internalMcpSignatureDenial(corsHeaders);
       }
       // Entitlement re-check at the gateway: the MCP edge already verifies
       // tier ≥ 1 + mcpAccess + validUntil before signing the outbound
@@ -1015,15 +1321,17 @@ export function createDomainGateway(
       // re-check via the fallback path. Mirror the per-handler runProPreChecks
       // and authorize-pro entitlement guards.
       const ent = await getEntitlements(verified.userId);
-      if (
-        !ent ||
-        ent.features.tier < 1 ||
-        // mcpAccess flag lands in U10 — undefined means "field not present
-        // on this entitlement row", which we treat as false. This keeps
-        // pre-U10 entitlement rows from accidentally granting MCP access.
-        (ent.features as { mcpAccess?: boolean }).mcpAccess !== true ||
-        ent.validUntil < Date.now()
-      ) {
+      // Single-source Pro MCP decision. The gateway keeps its HTTP denial and
+      // telemetry contract; the shared gate owns access and billing precedence.
+      const gate = checkProMcpAccess(ent, Date.now());
+      const mcpCovered = gate === null;
+      const billingDenial = denyForBillingVerification(
+        ent,
+        corsHeaders,
+        mcpCovered,
+      );
+      if (billingDenial) return billingDenial;
+      if (!mcpCovered) {
         emitRequest(401, 'auth_401', null);
         return new Response(
           JSON.stringify({ error: 'insufficient_entitlement' }),
@@ -1079,16 +1387,47 @@ export function createDomainGateway(
       || isPublicSharedRpcRequest(request.url, request.method);
     const seedRefreshVerified = await isResilienceRankingSeedRefreshRequest(request, pathname);
     const relayWarmPingVerified = await isRelayWarmPingRequest(request, pathname);
-    const requiresDirectLlmQuota = !internalMcpVerified && await shouldReserveGatewayDirectLlmQuota(request, pathname);
+    // Resolve the quota policy against the route POST compatibility will use.
+    // Keep body validation after auth and abuse limiting; invalid bodies still
+    // return before reservation or dispatch.
+    let directLlmPolicyRequest = request;
+    if (
+      request.method === 'POST'
+      && GATEWAY_DIRECT_LLM_QUOTA_METHODS[pathname] === 'GET'
+      && isPostToGetCompatibleBodySize(request.headers)
+      && !router.match(request)
+    ) {
+      const getProbe = new Request(request.url, { method: 'GET', headers: request.headers });
+      if (router.match(getProbe)) directLlmPolicyRequest = getProbe;
+    }
+    const requiresDirectLlmQuota = !internalMcpVerified && await shouldReserveGatewayDirectLlmQuota(directLlmPolicyRequest, pathname);
     const isTierGated = !internalMcpVerified && !isPublicNoAuthRpc && !seedRefreshVerified && !relayWarmPingVerified && getRequiredTier(pathname) !== null;
+    // Docker self-hosting has no Clerk/Convex entitlement backend. Its browser
+    // still obtains and presents a server-signed anonymous session, so that
+    // proof remains the gateway authentication boundary on this one route.
+    // Cloud deployments do not set LOCAL_API_MODE=docker, and every other
+    // premium route retains forceKey + entitlement enforcement below.
+    const isDockerSelfHostCountryBrief =
+      (request.method === 'GET' || request.method === 'HEAD') &&
+      pathname === COUNTRY_INTEL_BRIEF_PATH &&
+      process.env.LOCAL_API_MODE === 'docker';
     const needsLegacyProBearerGate = !internalMcpVerified && !isPublicNoAuthRpc && PREMIUM_RPC_PATHS.has(pathname) && !isTierGated;
-    let endpointRateLimitPrincipalUserId: string | undefined;
+    const isProFreshCacheRpc = PRO_FRESH_CACHE_RPC_PATHS.has(pathname);
+    const needsProFreshnessResolution =
+      !internalMcpVerified &&
+      !isPublicNoAuthRpc &&
+      isProFreshCacheRpc &&
+      request.headers.get('Authorization')?.startsWith('Bearer ') === true;
+    let rateLimitPrincipalUserId: string | undefined;
 
     // Session resolution — extract userId from bearer token (Clerk JWT) if present.
-    // Only runs for tier-gated or direct-LLM endpoints to avoid JWKS lookup on every request.
+    // Runs only for tier gates, direct-LLM quota, or the explicit Pro-fresh
+    // market allowlist to avoid JWKS lookup on every request.
     let sessionUserId: string | null = null;
     let sessionRole: 'free' | 'pro' | null = null;
-    if (isTierGated || requiresDirectLlmQuota) {
+    let quotaEntitlements: CachedEntitlements | null = null;
+    let directLlmDailyLimit: number | null | undefined;
+    if (isTierGated || requiresDirectLlmQuota || needsProFreshnessResolution) {
       const session = await resolveClerkSession(request);
       sessionUserId = session?.userId ?? null;
       sessionRole = session?.role ?? null;
@@ -1108,11 +1447,12 @@ export function createDomainGateway(
     // request). Telemetry stays attributed via the verified userId set
     // above; entitlement re-check (`features.tier ≥ 1 && mcpAccess`) was
     // already performed before flipping `internalMcpVerified = true`.
-    let keyCheck: { valid: boolean; required: boolean; error?: string; kind?: 'enterprise' | 'session' | 'user' } = internalMcpVerified || isPublicNoAuthRpc || seedRefreshVerified || relayWarmPingVerified
+    let keyCheck: { valid: boolean; required: boolean; error?: string; kind?: 'enterprise' | 'session' | 'user'; credential?: string } = internalMcpVerified || isPublicNoAuthRpc || seedRefreshVerified || relayWarmPingVerified
       ? { valid: true, required: false }
       : ((await validateApiKey(request, {
-          forceKey: (isTierGated && !sessionUserId) || needsLegacyProBearerGate,
-        })) as { valid: boolean; required: boolean; error?: string; kind?: 'enterprise' | 'session' | 'user' });
+          forceKey: ((isTierGated && !sessionUserId) || needsLegacyProBearerGate)
+            && !isDockerSelfHostCountryBrief,
+        })) as { valid: boolean; required: boolean; error?: string; kind?: 'enterprise' | 'session' | 'user'; credential?: string });
 
     // User-owned API keys (wm_ prefix): when the static WORLDMONITOR_VALID_KEYS
     // check fails, try async Convex-backed validation for user-issued keys.
@@ -1126,35 +1466,177 @@ export function createDomainGateway(
       request.headers.get('X-WorldMonitor-Key') ??
       request.headers.get('X-Api-Key') ??
       '';
+    const dockerSelfHostSessionAuthorized =
+      isDockerSelfHostCountryBrief &&
+      keyCheck.valid &&
+      !keyCheck.required &&
+      keyCheck.kind === 'session';
     if (keyCheck.required && !keyCheck.valid && wmKey.startsWith('wm_')) {
+      // Unknown wm_ credentials require a Convex-backed hash lookup before we
+      // know the account principal. Bound that unattributed work by IP first:
+      // otherwise an attacker can rotate syntactically-valid keys and evade the
+      // per-hash negative cache while every request reaches Convex. The 600/min
+      // ceiling matches the repo-wide global IP budget and deliberately fails
+      // closed when Redis is unavailable because this guard protects the auth
+      // backend itself.
+      const validationGuardResponse = await checkFailClosedScopedIpRateLimit(
+        request,
+        'user-api-key:pre-auth-validation',
+        600,
+        '60 s',
+        corsHeaders,
+      );
+      if (validationGuardResponse) {
+        const reason = getRateLimitTelemetryReason(
+          validationGuardResponse,
+          'rate_limit_429',
+        );
+        emitRequest(validationGuardResponse.status, reason, null);
+        return validationGuardResponse;
+      }
+
+      // Only destructure validateUserApiKey: several gateway unit tests mock this
+      // module with a partial surface. Requiring isUserApiKeyUnavailableError at
+      // import time breaks those mocks (vitest throws "No export is defined").
+      // Classify unavailability by the stable `code` field instead.
       const { validateUserApiKey } = await import('./_shared/user-api-key');
-      const userKeyResult = await validateUserApiKey(wmKey);
-      if (userKeyResult) {
-        isUserApiKey = true;
-        usage.isUserApiKey = true;
-        usage.userApiKeyCustomerRef = userKeyResult.userId;
-        keyCheck = { valid: true, required: true };
-        // Propagate the resolved key-owner identity to downstream route
-        // handlers via x-user-id. The entitlement check itself takes the
-        // userId argument directly (see checkEntitlement(sessionUserId, …))
-        // so it no longer depends on this header — the header is now for
-        // handler consumption + the internal-MCP `isCallerPremium` path.
-        sessionUserId = userKeyResult.userId;
-        // The Clerk role belongs to the bearer subject, not the user-key owner.
-        // Once the explicit wm_ key becomes the identity source, require the
-        // key owner's Convex entitlement to drive tier-gated access.
-        sessionRole = null;
-        usage.sessionUserId = sessionUserId;
-        usage.clerkOrgId = null;
-        request = withAuthenticatedUserId(request, sessionUserId);
+      try {
+        const userKeyResult = await validateUserApiKey(wmKey);
+        if (userKeyResult) {
+          isUserApiKey = true;
+          usage.isUserApiKey = true;
+          usage.userApiKeyCustomerRef = userKeyResult.userId;
+          keyCheck = { valid: true, required: true };
+          // Propagate the resolved key-owner identity to downstream route
+          // handlers via x-user-id. The entitlement check itself takes the
+          // userId argument directly (see checkEntitlement(sessionUserId, …))
+          // so it no longer depends on this header — the header is now for
+          // handler consumption + the internal-MCP `isCallerPremium` path.
+          sessionUserId = userKeyResult.userId;
+          // The Clerk role belongs to the bearer subject, not the user-key owner.
+          // Once the explicit wm_ key becomes the identity source, require the
+          // key owner's Convex entitlement to drive tier-gated access.
+          sessionRole = null;
+          usage.sessionUserId = sessionUserId;
+          usage.clerkOrgId = null;
+          request = withAuthenticatedUserId(request, sessionUserId);
+        }
+      } catch (err) {
+        // Transient Convex validation outage must not look like an invalid key.
+        // Mirror api/_user-api-key.js serviceUnavailable() (503 + Retry-After +
+        // X-Validation-Mode: degraded) so clients retry instead of rotating keys.
+        // Duck-type on `code` so partial test mocks of user-api-key still work.
+        const code =
+          typeof err === 'object' && err !== null
+            ? (err as { code?: unknown }).code
+            : undefined;
+        if (code === 'validation_unavailable') {
+          emitRequest(503, 'validation_unavailable', null);
+          return new Response(JSON.stringify({ error: 'Service temporarily unavailable' }), {
+            status: 503,
+            headers: {
+              'Content-Type': 'application/json',
+              'Cache-Control': 'no-store',
+              'Retry-After': '5',
+              'X-Validation-Mode': 'degraded',
+              ...corsHeaders,
+            },
+          });
+        }
+        throw err;
+      }
+    }
+
+    // ── Partner-embed keys (`wme_`) ─────────────────────────────────────────
+    // Accepted ONLY on the RPC paths a paid embed panel declares in the panel
+    // registry, and nowhere else. `EMBED_KEY_RPC_PATHS` is derived from those
+    // declarations, so this surface cannot widen without a panel owning it.
+    //
+    // Not an escalation: neither declared path is tier-gated or in
+    // PREMIUM_RPC_PATHS, so both already answer an anonymous wms_ session
+    // token. What this buys is a credential SHAPE the gateway understands for
+    // a frame that has no session and must stop being handed a wm_ key — the
+    // over-powered credential the whole embed-key stack exists to retire.
+    // Without it, /api/embed/entitlement answers 200 for a wme_ key and the
+    // panel's own data read still 401s, which is a feature that does not work.
+    //
+    // `isUserApiKey` deliberately stays false: an embed key must not enter the
+    // per-account REST meter (#3199) or the apiAccess gate (#4611), and must
+    // not become the request's rate-limit principal — an embed is read by many
+    // viewers on many IPs, so the per-IP bucket is the correct one.
+    if (
+      keyCheck.required &&
+      !keyCheck.valid &&
+      wmKey.startsWith('wme_') &&
+      EMBED_KEY_RPC_PATHS.has(pathname)
+    ) {
+      // Same amplification guard, and the same reasoning, as the wm_ branch
+      // above: an unknown wme_ key costs a Convex lookup, and rotating keys
+      // defeats the per-hash negative cache. Fails closed when Redis is down.
+      const embedGuardResponse = await checkFailClosedScopedIpRateLimit(
+        request,
+        'embed-key:pre-auth-validation',
+        600,
+        '60 s',
+        corsHeaders,
+      );
+      if (embedGuardResponse) {
+        const reason = getRateLimitTelemetryReason(embedGuardResponse, 'rate_limit_429');
+        emitRequest(embedGuardResponse.status, reason, null);
+        return embedGuardResponse;
+      }
+
+      const { validateEmbedKey } = await import('./_shared/embed-key');
+      try {
+        const embedKeyResult = await validateEmbedKey(wmKey);
+        if (embedKeyResult) {
+          const embedEntitlement = await getEntitlements(embedKeyResult.userId);
+          const embedCovered = hasEmbedAccess(embedEntitlement, Date.now());
+          // A transient billing lookup failure must stay retryable rather than
+          // collapse into "invalid key" — the frame backs off on 503 and keeps
+          // its last render, but treats 401/403 as terminal.
+          const billingDenial = denyForBillingVerification(
+            embedEntitlement,
+            corsHeaders,
+            embedCovered,
+          );
+          if (billingDenial) return billingDenial;
+          if (embedCovered) {
+            keyCheck = { valid: true, required: true };
+          }
+        }
+      } catch (err) {
+        const code =
+          typeof err === 'object' && err !== null
+            ? (err as { code?: unknown }).code
+            : undefined;
+        if (code === 'validation_unavailable') {
+          emitRequest(503, 'validation_unavailable', null);
+          return new Response(JSON.stringify({ error: 'Service temporarily unavailable' }), {
+            status: 503,
+            headers: {
+              'Content-Type': 'application/json',
+              'Cache-Control': 'no-store',
+              'Retry-After': '5',
+              'X-Validation-Mode': 'degraded',
+              ...corsHeaders,
+            },
+          });
+        }
+        throw err;
       }
     }
 
     // Clerk session is itself proof of authentication (validated at line 410).
     // validateApiKey is strict-no-trust-of-headers per #3541 and would 401 every
     // Clerk-authenticated user who hasn't also minted a wms_ session token.
-    // Override: tier-gated routes with a resolved sessionUserId pass this layer.
-    if ((isTierGated || requiresDirectLlmQuota) && sessionUserId && keyCheck.required && !keyCheck.valid) {
+    // Override: routes that deliberately resolved a sessionUserId pass this layer.
+    if (
+      (isTierGated || requiresDirectLlmQuota || needsProFreshnessResolution) &&
+      sessionUserId &&
+      keyCheck.required &&
+      !keyCheck.valid
+    ) {
       keyCheck = { valid: true, required: false };
     }
 
@@ -1163,8 +1645,14 @@ export function createDomainGateway(
     // them valid, wmKey is set, !isUserApiKey, and 'wms_' doesn't startsWith
     // 'wm_'), so telemetry mislabelled them as enterprise_api_key with
     // customer_id='enterprise-unmapped'. PR #3557 round-3 review.
-    if (keyCheck.valid && wmKey && !isUserApiKey && keyCheck.kind === 'enterprise') {
-      usage.enterpriseApiKey = wmKey;
+    // A browser request can carry both an automatic wms_ header and an HttpOnly
+    // enterprise cookie. Use the credential validateApiKey actually selected;
+    // the raw header belongs to a different anonymous principal.
+    const enterpriseCredential = keyCheck.valid && keyCheck.kind === 'enterprise'
+      ? (keyCheck.credential ?? wmKey)
+      : '';
+    if (enterpriseCredential && !isUserApiKey) {
+      usage.enterpriseApiKey = enterpriseCredential;
     }
 
     // ── Active-subscription gate for user API keys (#4611) ──────────────────
@@ -1195,16 +1683,51 @@ export function createDomainGateway(
     if (isUserApiKey && sessionUserId) {
       userKeyEntitlement = await getEntitlements(sessionUserId);
       recordUsageEntitlement(userKeyEntitlement);
-      // Fail-OPEN on an unresolved entitlement (null ⇒ transient Convex/cache
-      // failure, indistinguishable from "no row"): mirrors the #3199 block below
-      // and avoids 403-ing an ACTIVE subscriber fleet-wide during a backend
-      // blip. Reject only on an AFFIRMATIVELY inactive/expired entitlement — the
-      // systematic churn case (#4611), always resolvable under normal operation
-      // (the warm 15-min entitlement cache closes the leak; an outage degrades
-      // to prior behavior rather than denying paying customers).
-      if (
-        userKeyEntitlement &&
-        (!userKeyEntitlement.features.apiAccess || userKeyEntitlement.validUntil < Date.now())
+      const apiAccessCovered = !!userKeyEntitlement &&
+        userKeyEntitlement.features.apiAccess &&
+        (userKeyEntitlement.validUntil ?? 0) >= Date.now();
+      const billingDenial = denyForBillingVerification(
+        userKeyEntitlement,
+        corsHeaders,
+        apiAccessCovered,
+      );
+      if (billingDenial) return billingDenial;
+      // A validated wm_ key proves key ownership, not current paid access.
+      // Transient lookup failures now arrive as a verificationUnavailable
+      // marker and were already answered with the retryable 503 by
+      // denyForBillingVerification above; a null here means the backend is
+      // unconfigured or gave a confirmed/malformed answer, and allowing it
+      // would turn that state into paid API access. Fail closed with a 503
+      // — EXCEPT when the entitlement backend itself is unconfigured: that is
+      // a deploy defect, not customer billing state, and 503ing every wm_ key
+      // fleet-wide would convert a config regression into a total API outage.
+      // Misconfig serves fail-open (pre-#4770 behavior) and logs loudly.
+      if (!userKeyEntitlement) {
+        if (isEntitlementBackendConfigured()) {
+          emitRequest(503, 'billing_verification_503', null);
+          return new Response(
+            JSON.stringify({
+              error: 'Unable to verify API access',
+              code: 'entitlement_verification_unavailable',
+            }),
+            {
+              status: 503,
+              headers: {
+                ...corsHeaders,
+                'Content-Type': 'application/json',
+                'Cache-Control': 'no-store',
+                'Retry-After': '5',
+                'X-Billing-Verification': 'entitlement_verification_unavailable',
+              },
+            },
+          );
+        }
+        console.error(
+          '[gateway] entitlement backend unconfigured (CONVEX_SITE_URL / shared secret missing) — serving wm_-key request fail-open',
+        );
+      } else if (
+        !userKeyEntitlement.features.apiAccess ||
+        (userKeyEntitlement.validUntil ?? 0) < Date.now()
       ) {
         emitRequest(403, 'tier_403', null);
         return createGatewayAuthErrorResponse(
@@ -1212,6 +1735,33 @@ export function createDomainGateway(
           'API access requires an active subscription',
           corsHeaders,
         );
+      } else {
+        // A validated user key plus active apiAccess is a trusted paid
+        // principal even on routes without an endpoint tier policy.
+        rateLimitPrincipalUserId = sessionUserId;
+      }
+    }
+
+    // Pro freshness is an optional paid benefit, not an access gate. Resolve
+    // only identities that were already verified above (Clerk bearer or a
+    // user-owned API key), then fail closed to the ordinary cache policy when
+    // entitlement state is absent, expired, or temporarily unavailable.
+    //
+    // Do not accept the Clerk role alone here: this contract is specifically
+    // for active plans, while role='pro' can also represent legacy/test grants.
+    let hasProFreshCacheAccess = internalMcpVerified && isProFreshCacheRpc;
+    if (!hasProFreshCacheAccess && isProFreshCacheRpc && sessionUserId) {
+      const ent =
+        userKeyEntitlement !== undefined
+          ? userKeyEntitlement
+          : await getEntitlements(sessionUserId);
+      recordUsageEntitlement(ent);
+      hasProFreshCacheAccess =
+        !!ent &&
+        ent.features.tier >= 1 &&
+        ent.validUntil >= Date.now();
+      if (hasProFreshCacheAccess) {
+        rateLimitPrincipalUserId = sessionUserId;
       }
     }
 
@@ -1253,12 +1803,22 @@ export function createDomainGateway(
           if (!allowed && session.userId) {
             const ent = await getEntitlements(session.userId);
             recordUsageEntitlement(ent);
+            const proCovered = !!ent &&
+              ent.features.tier >= 1 &&
+              ent.validUntil >= Date.now();
+            const billingDenial = denyForBillingVerification(
+              ent,
+              corsHeaders,
+              proCovered,
+            );
+            if (billingDenial) return billingDenial;
             allowed = !!ent && ent.features.tier >= 1 && ent.validUntil >= Date.now();
           }
           if (!allowed) {
             emitRequest(403, 'tier_403', null);
             return createGatewayAuthErrorResponse(403, 'Pro subscription required', corsHeaders);
           }
+          rateLimitPrincipalUserId = session.userId;
           // Valid pro session (Clerk role OR Dodo entitlement) — fall through to route handling.
         } else {
           emitRequest(401, 'auth_401', null);
@@ -1280,22 +1840,41 @@ export function createDomainGateway(
     // tier ≥ 1 + mcpAccess === true above. Some ENDPOINT_ENTITLEMENTS
     // routes require tier 2, but Pro MCP callers only reach the gateway
     // through the MCP edge's whitelisted tool set.
-    const isEnterpriseAuth = keyCheck.valid && wmKey && !isUserApiKey && keyCheck.kind === 'enterprise';
-    if (!isEnterpriseAuth && !internalMcpVerified && !seedRefreshVerified && !relayWarmPingVerified) {
+    const isEnterpriseAuth = keyCheck.valid
+      && Boolean(enterpriseCredential)
+      && !isUserApiKey
+      && keyCheck.kind === 'enterprise';
+    if (
+      !dockerSelfHostSessionAuthorized &&
+      !isEnterpriseAuth &&
+      !internalMcpVerified &&
+      !seedRefreshVerified &&
+      !relayWarmPingVerified
+    ) {
       const entitlementCheck = await checkEntitlementDetailed(sessionUserId, pathname, corsHeaders, {
         clerkRole: sessionRole,
       });
+      quotaEntitlements = entitlementCheck.entitlements;
       recordUsageEntitlement(entitlementCheck.entitlements);
       const entitlementResponse = entitlementCheck.response;
       if (entitlementResponse) {
         const entReason: RequestReason =
           entitlementResponse.status === 401 ? 'auth_401'
           : entitlementResponse.status === 403 ? 'tier_403'
+          : entitlementResponse.status === 503 ? 'billing_verification_503'
           : 'ok';
         emitRequest(entitlementResponse.status, entReason, null);
         return entitlementResponse.status === 401 || entitlementResponse.status === 403
           ? markAuthErrorNoStore(entitlementResponse)
           : entitlementResponse;
+      }
+
+      // A successful tier gate proves this server-derived principal currently
+      // holds the paid access required by the route. Reuse that authorization
+      // decision for both endpoint and global limiter attribution so Pro users
+      // behind a NAT do not share an IP bucket with unrelated traffic.
+      if (sessionUserId && isTierGated) {
+        rateLimitPrincipalUserId = sessionUserId;
       }
 
       // #5206: summarize refreshes from multiple active Pro users can share a
@@ -1325,11 +1904,10 @@ export function createDomainGateway(
           corsHeaders,
         );
         if (attributionGuardResponse) {
-          const reason =
-            attributionGuardResponse.status === 503 &&
-            attributionGuardResponse.headers.get('X-RateLimit-Mode') === 'degraded'
-              ? 'rate_limit_degraded'
-              : 'rate_limit_429';
+          const reason = getRateLimitTelemetryReason(
+            attributionGuardResponse,
+            'rate_limit_429',
+          );
           emitRequest(attributionGuardResponse.status, reason, null);
           return attributionGuardResponse;
         }
@@ -1339,55 +1917,53 @@ export function createDomainGateway(
             ? userKeyEntitlement
             : await getEntitlements(sessionUserId)
         );
+        quotaEntitlements = ent;
         recordUsageEntitlement(ent);
         if (ent && ent.features.tier >= 1 && ent.validUntil >= Date.now()) {
-          endpointRateLimitPrincipalUserId = sessionUserId;
+          rateLimitPrincipalUserId = sessionUserId;
         }
       }
     }
 
-    // Route matching — if POST doesn't match, convert to GET for stale clients
+    // Route matching — if POST doesn't match, convert to GET for stale clients.
+    // Strict compatibility 400s stay pending until the normal endpoint/global
+    // limiter path runs so malformed or nested bodies still consume the GET
+    // route's abuse budget. The pending response is returned before
+    // direct-LLM quota and handler dispatch.
     let matchedHandler = router.match(request);
+    let pendingPostToGetCompatError: Response | null = null;
     if (!matchedHandler && request.method === 'POST') {
       if (isPostToGetCompatibleBodySize(request.headers)) {
         const url = new URL(request.url);
-        let oversizedKey: string | null = null;
-        try {
-          const bodyText = await request.clone().text();
-          if (new TextEncoder().encode(bodyText).byteLength >= POST_TO_GET_MAX_BODY_BYTES) {
-            emitRequest(400, 'malformed_request', null);
-            return new Response(JSON.stringify({ error: 'malformed_request' }), {
+        const getProbe = new Request(url.toString(), { method: 'GET', headers: request.headers });
+        const getProbeHandler = router.match(getProbe);
+        if (getProbeHandler) {
+          let compatErrorBody: Record<string, unknown> | null = null;
+          let compatFields: PostToGetCompatField[] = [];
+          try {
+            const parsed = parsePostToGetCompatBody(await request.clone().text());
+            if (parsed.status === 'ok') {
+              compatFields = parsed.fields;
+            } else {
+              compatErrorBody = postToGetCompatErrorBody(parsed);
+            }
+          } catch {
+            compatErrorBody = { error: 'malformed_request' };
+          }
+          if (compatErrorBody) {
+            pendingPostToGetCompatError = new Response(JSON.stringify(compatErrorBody), {
               status: 400,
               headers: { 'Content-Type': 'application/json', ...corsHeaders },
             });
+            matchedHandler = getProbeHandler;
+            request = getProbe;
+          } else {
+            applyPostToGetCompatFields(url.searchParams, compatFields);
+            const getReq = new Request(url.toString(), { method: 'GET', headers: request.headers });
+            matchedHandler = router.match(getReq);
+            if (matchedHandler) request = getReq;
           }
-          const body = JSON.parse(bodyText);
-          const isScalar = (x: unknown): x is string | number | boolean =>
-            typeof x === 'string' || typeof x === 'number' || typeof x === 'boolean';
-          for (const [k, v] of Object.entries(body as Record<string, unknown>)) {
-            if (Array.isArray(v)) {
-              if (v.length > POST_TO_GET_MAX_ARRAY_VALUES_PER_KEY) {
-                oversizedKey = k;
-                break;
-              }
-              v.forEach((item) => { if (isScalar(item)) url.searchParams.append(k, String(item)); });
-            } else if (isScalar(v)) url.searchParams.set(k, String(v));
-          }
-        } catch { /* non-JSON body — preserve legacy POST→GET fallback */ }
-        if (oversizedKey !== null) {
-          emitRequest(400, 'malformed_request', null);
-          return new Response(JSON.stringify({
-            error: 'Too many values for POST compatibility parameter',
-            parameter: oversizedKey,
-            maxValues: POST_TO_GET_MAX_ARRAY_VALUES_PER_KEY,
-          }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json', ...corsHeaders },
-          });
         }
-        const getReq = new Request(url.toString(), { method: 'GET', headers: request.headers });
-        matchedHandler = router.match(getReq);
-        if (matchedHandler) request = getReq;
       }
     }
     if (!matchedHandler) {
@@ -1414,8 +1990,15 @@ export function createDomainGateway(
     // (compat block above) are already GET here and are skipped. Scope by the
     // resolved principal so a key can never replay another caller's response.
     // Fail-open: any Redis issue proceeds without idempotency (see the module).
+    // Routes in IDEMPOTENCY_EXEMPT_RPC_PATHS own their own retry semantics (per-row
+    // outcomes recomputed against current state), so generic whole-response replay would
+    // violate their contract. The published OpenAPI already omits the parameter for them;
+    // ignore the header here too, otherwise a client that sends it anyway still gets the
+    // replay the spec says it cannot.
     let idempotency: IdempotencyOutcome | null = null;
-    const hasIdempotencyKey = request.method === 'POST' && request.headers.has(IDEMPOTENCY_HEADER);
+    const hasIdempotencyKey = request.method === 'POST'
+      && request.headers.has(IDEMPOTENCY_HEADER)
+      && !IDEMPOTENCY_EXEMPT_RPC_PATHS.has(pathname);
     const idScope = identityForScope.principal_id ?? identityForScope.customer_id;
     const idempotencyScope = idScope ? `${identityForScope.auth_kind}:${idScope}` : null;
 
@@ -1448,24 +2031,46 @@ export function createDomainGateway(
       }
     }
 
-    // IP-based rate limiting — two-phase: endpoint-specific first, then global fallback.
+    // Gateway rate limiting — two-phase: endpoint-specific first, then global fallback.
+    // Confirmed paid principals use per-user buckets; other traffic uses IP.
     //
-    // Internal-MCP verified path skips IP rate limiting: the MCP edge
+    // Google searches need their tighter upstream budget even after MCP admission.
+    if (internalMcpVerified && (pathname === '/api/aviation/v1/search-google-flights'
+      || pathname === '/api/aviation/v1/search-google-dates')) {
+      const endpointRlResponse = await checkEndpointRateLimit(request, pathname, corsHeaders, {
+        principalUserId: request.headers.get(TRUSTED_USER_ID_HEADER)!,
+        principalScope: 'session',
+      });
+      if (endpointRlResponse) {
+        const reason = getRateLimitTelemetryReason(endpointRlResponse, 'rate_limit_429_endpoint');
+        emitRequest(endpointRlResponse.status, reason, null);
+        return endpointRlResponse;
+      }
+    }
+
+    // Internal-MCP verified requests skip the remaining gateway layer: the MCP edge
     // already enforced 50/day + 60/min per userId in api/mcp.ts. A second
     // limiter here would create misleading double-counting and could 429
     // legitimate Pro tool fetches that pass the upstream cap.
     if (!internalMcpVerified) {
-      const endpointRlResponse = endpointRateLimitPrincipalUserId
+      // These local provider lookups use the sidecar cache without Upstash.
+      // Keep these exceptions exact-path; cloud requests retain the provider cap.
+      const isSidecarProviderLookup = process.env.LOCAL_API_MODE === 'tauri-sidecar'
+        && (pathname === '/api/aviation/v1/track-aircraft'
+          || pathname === '/api/military/v1/get-wingbits-live-flight'
+          || pathname === '/api/imagery/v1/search-imagery'
+          || pathname === '/api/webcam/v1/get-webcam-image');
+      const endpointRlResponse = isSidecarProviderLookup ? null : rateLimitPrincipalUserId
         ? await checkEndpointRateLimit(request, pathname, corsHeaders, {
-            principalUserId: endpointRateLimitPrincipalUserId,
+            principalUserId: rateLimitPrincipalUserId,
+            principalScope: isUserApiKey ? 'api_key' : 'session',
           })
         : await checkEndpointRateLimit(request, pathname, corsHeaders);
       if (endpointRlResponse) {
-        const reason =
-          endpointRlResponse.status === 503 &&
-          endpointRlResponse.headers.get('X-RateLimit-Mode') === 'degraded'
-            ? 'rate_limit_degraded'
-            : 'rate_limit_429';
+        const reason = getRateLimitTelemetryReason(
+          endpointRlResponse,
+          'rate_limit_429_endpoint',
+        );
         emitRequest(endpointRlResponse.status, reason, null);
         return endpointRlResponse;
       }
@@ -1473,10 +2078,11 @@ export function createDomainGateway(
       // ── Per-account API rate limit (#3199) ──────────────────────────────
       // Eligible authenticated keys — a valid user key (which carries NO
       // keyCheck.kind, so `isUserApiKey` is the discriminator) or an enterprise
-      // env key — are governed by a per-account burst + daily meter + 10×
-      // safety ceiling instead of the global per-IP cap. In ENFORCE they bypass
-      // the per-IP fallback below; in SHADOW they only record telemetry and
-      // still fall through to per-IP, so protection never drops below today.
+      // env key — are governed by a per-account burst + daily meter (enforced
+      // at the sold allowance, #4635) instead of the global fallback. In ENFORCE
+      // they bypass that fallback below; in SHADOW they only record telemetry
+      // and still fall through to it. Validated user keys use their trusted
+      // principal there, while enterprise keys retain IP attribution.
       // Limits are NOT in scope here (checkEntitlement discards `features`), so
       // user keys resolve getEntitlements explicitly (cached); enterprise keys
       // carry no entitlement and use hardcoded limits.
@@ -1486,9 +2092,11 @@ export function createDomainGateway(
         let perMinute = 0;
         let allowance = -1;
         let identity = '';
+        let planKey = ''; // #4635 — hoisted for the informative 429 (ent is block-scoped below)
         if (isEnterpriseAuth) {
           perMinute = ENTERPRISE_API_RATE_LIMIT; // hardcoded — no entitlement row
           allowance = -1; // unlimited daily / no ceiling
+          planKey = 'enterprise'; // top tier — named in the 429, but no upgrade_url
           usage.tier = 3; // enterprise tier — no entitlement row to read it from
           // (plan_key defaults to 'enterprise' in buildUsageIdentity)
           // Enterprise burst is keyed PER KEY (not per account) by design:
@@ -1497,7 +2105,7 @@ export function createDomainGateway(
           // minting keys, and each operator key gets its own 1,000/min budget
           // rather than contending for one shared bucket. (User keys below key
           // on userId so a customer can't multiply their allowance.)
-          identity = wmKey ? hashKeySync(wmKey) : '';
+          identity = hashKeySync(enterpriseCredential);
         } else if (sessionUserId) {
           // Reuse the entitlement the #4611 gate above already resolved for this
           // same user key (undefined ⇒ the gate didn't run, e.g. a Clerk-session
@@ -1520,6 +2128,7 @@ export function createDomainGateway(
               typeof ent.features.apiDailyAllowance === 'number'
                 ? ent.features.apiDailyAllowance
                 : -1;
+            planKey = ent.planKey;
             identity = sessionUserId;
           }
           // else: downgraded / null entitlement ⇒ not eligible (perMinute = 0),
@@ -1527,13 +2136,23 @@ export function createDomainGateway(
         }
 
         if (perMinute > 0 && identity) {
+          // #4635 — informative 429 upgrade link; omitted for enterprise/top tier.
+          const upgradeUrl =
+            planKey && planKey !== 'enterprise' ? 'https://worldmonitor.app/' : undefined;
           // 1. Per-minute burst (hard limit).
           const burst = await checkBurst(perMinute, identity);
           if (!burst.ok) {
             if (enforce) {
               const retryAfterSec = Math.max(1, Math.ceil((burst.reset - Date.now()) / 1000));
               emitRequest(429, 'rl_min_429', null);
-              return new Response(JSON.stringify({ error: 'Too many requests' }), {
+              return new Response(JSON.stringify({
+                error: 'Too many requests',
+                plan: planKey || undefined,
+                limit: burst.limit,
+                limit_type: 'per_minute',
+                reset: new Date(burst.reset).toISOString(),
+                upgrade_url: upgradeUrl,
+              }), {
                 status: 429,
                 headers: {
                   'Content-Type': 'application/json',
@@ -1545,23 +2164,31 @@ export function createDomainGateway(
             }
             pendingShadowReason = 'rl_min_shadow';
           } else if (allowance >= 0) {
-            // 2. Daily meter + 10× ceiling (skipped for unlimited allowance).
+            // 2. Daily meter — hard-rejects at the sold allowance (#4635).
+            //    Skipped for unlimited (-1); reserveDailyMeter fail-opens on <=0.
             const meter = await reserveDailyMeter({
               userId: identity,
               allowance,
               pipeline: (cmds) => runRedisPipeline(cmds),
             });
-            if (meter.overCeiling) {
+            if (meter.overLimit) {
               if (enforce) {
                 await meter.rollback();
                 emitRequest(429, 'rl_ceiling_429', null);
-                return new Response(JSON.stringify({ error: 'Daily request ceiling exceeded' }), {
+                return new Response(JSON.stringify({
+                  error: 'Daily request limit reached',
+                  plan: planKey || undefined,
+                  limit: allowance,
+                  limit_type: 'daily',
+                  reset: new Date(Date.now() + meter.retryAfterSec * 1000).toISOString(),
+                  upgrade_url: upgradeUrl,
+                }), {
                   status: 429,
                   headers: {
                     'Content-Type': 'application/json',
                     'Cache-Control': 'no-store',
                     ...rateLimitHeaders({
-                      limit: allowance * CEILING_MULTIPLIER,
+                      limit: allowance,
                       remaining: 0,
                       resetMs: Date.now() + meter.retryAfterSec * 1000,
                       retryAfterSec: meter.retryAfterSec,
@@ -1576,39 +2203,94 @@ export function createDomainGateway(
             }
           }
           // Eligible + enforce + not rejected ⇒ the per-account layer governs
-          // this request; skip the per-IP fallback. In shadow, keep per-IP on.
+          // this request and skips the global fallback. In shadow, keep that
+          // fallback active: validated user keys use their trusted principal,
+          // while enterprise keys retain IP attribution.
           if (enforce) governedByApiKeyLayer = true;
         }
       }
 
       if (!governedByApiKeyLayer && !hasEndpointRatePolicy(pathname)) {
-        const rateLimitResponse = await checkRateLimit(request, corsHeaders);
+        // WORLDMONITOR-12A: scope the bucket to the credential, not just the
+        // user. An API key and a browser session resolve to the same Clerk id,
+        // so without this a customer's own scraper drains the 600/min budget
+        // and their dashboard 429s. In production on 2026-09-11 that was 598
+        // scraper successes against 2 for the same person's browser.
+        const rateLimitResponse = rateLimitPrincipalUserId
+          ? await checkRateLimit(request, corsHeaders, {
+              principalUserId: rateLimitPrincipalUserId,
+              principalScope: isUserApiKey ? 'api_key' : 'session',
+            })
+          : await checkRateLimit(request, corsHeaders);
         if (rateLimitResponse) {
-          const reason =
-            rateLimitResponse.status === 503 &&
-            rateLimitResponse.headers.get('X-RateLimit-Mode') === 'degraded'
-              ? 'rate_limit_degraded'
-              : 'rate_limit_429';
+          const reason = getRateLimitTelemetryReason(
+            rateLimitResponse,
+            'rate_limit_429_global',
+          );
           emitRequest(rateLimitResponse.status, reason, null);
           return rateLimitResponse;
         }
       }
     }
 
+    if (pendingPostToGetCompatError) {
+      emitRequest(400, 'malformed_request', null);
+      return pendingPostToGetCompatError;
+    }
+
     if (requiresDirectLlmQuota && !isEnterpriseAuth) {
-      if (!sessionUserId) {
+      // The Docker principal is deliberately derived from nginx's trusted
+      // X-Real-IP value (docker/nginx.conf stamps $remote_addr), not from the
+      // freely mintable token: rotating sessions must not reset spend.
+      // Hashing keeps the raw address out of Redis keys.
+      const dockerQuotaUserId = dockerSelfHostSessionAuthorized
+        ? `docker:${hashKeySync(deriveIp(request) ?? 'unknown')}`
+        : null;
+      const quotaUserId = sessionUserId ?? dockerQuotaUserId;
+      if (!quotaUserId) {
         emitRequest(401, 'auth_401', null);
         return createGatewayAuthErrorResponse(401, 'Pro authentication required', corsHeaders);
       }
 
-      const reservation = await reserveDirectLlmQuota({
-        userId: sessionUserId,
-        pipeline: (cmds) => runRedisPipeline(cmds, true),
-      });
-      if (!reservation.ok) {
-        const response = createDirectLlmQuotaFailureResponse(reservation, corsHeaders);
-        emitRequest(response.status, response.status === 429 ? 'rate_limit_429' : 'rate_limit_degraded', null);
-        return response;
+      // Tier-1 legacy Clerk-role grants intentionally bypass the ordinary
+      // entitlement lookup. Re-read the cached row when available so Pro
+      // Business/API plans still receive their catalog-specific dashboard-AI
+      // allowance.
+      const ent = quotaEntitlements ?? (
+        sessionUserId
+          ? userKeyEntitlement !== undefined
+            ? userKeyEntitlement
+            : await getEntitlements(sessionUserId)
+          : null
+      );
+      if (ent) recordUsageEntitlement(ent);
+      // resolveActiveDirectLlmLimit — NOT the raw catalog read — decides this.
+      // A caller we cannot confirm as actively paid (free tier, lapsed row, no
+      // row, or a verification outage) must land on the unverified floor, never
+      // on the paid default: this endpoint spends real provider budget, and
+      // two of the DIRECT_LLM_GATEWAY_QUOTA_PATHS carry no tier gate at all.
+      directLlmDailyLimit = sessionUserId
+        ? resolveActiveDirectLlmLimit(ent)
+        : DIRECT_LLM_UNVERIFIED_DAILY_QUOTA_LIMIT;
+
+      // Enterprise subscription rows carry an explicit null allowance. Do not
+      // hit Redis for those unlimited callers; static enterprise keys already
+      // bypass this block above.
+      if (directLlmDailyLimit !== null) {
+        const reservation = await reserveDirectLlmQuota({
+          userId: quotaUserId,
+          limit: directLlmDailyLimit,
+          pipeline: (cmds) => runRedisPipeline(cmds, true),
+        });
+        if (!reservation.ok) {
+          const response = createDirectLlmQuotaFailureResponse(reservation, corsHeaders);
+          emitRequest(
+            response.status,
+            response.status === 429 ? 'rate_limit_429_direct_llm' : 'rate_limit_degraded',
+            null,
+          );
+          return response;
+        }
       }
     }
 
@@ -1678,6 +2360,8 @@ export function createDomainGateway(
         mergedHeaders.set(key, value);
       }
     }
+    appendDeprecationPolicyLink(mergedHeaders);
+    const retryableResponse = drainRetryableResponse(request);
     attachRequiredBboxDiagnosticHeaders(mergedHeaders, pathname, requiredBboxDiagnostic);
 
     // Handler side-channel status override (setSuccessStatusOverride): applied
@@ -1694,34 +2378,58 @@ export function createDomainGateway(
 
     // For GET 200 responses: read body once for cache-header decisions + ETag
     let resolvedCacheTier: CacheTier | null = null;
-    if (response.status === 200 && request.method === 'GET' && response.body) {
+    if (response.status === 200 && (request.method === 'GET' || request.method === 'HEAD') && response.body) {
       const bodyBytes = await response.arrayBuffer();
 
       const bodyStr = new TextDecoder().decode(bodyBytes);
       const noStoreReason = getRpcNoStoreReasonFromJson(bodyStr, { pathname });
 
-      if (mergedHeaders.get('X-No-Cache') || noStoreReason) {
+      const rpcName = pathname.split('/').pop() ?? '';
+      const envOverride = process.env[`CACHE_TIER_OVERRIDE_${rpcName.replace(/-/g, '_').toUpperCase()}`] as CacheTier | undefined;
+      const mapTier = RPC_CACHE_TIER[pathname];
+      // The route's own declared tier (an env override wins over the map for
+      // normal tiers). A route declared no-store is a hard freshness/privacy
+      // floor: the audience overwrite below must never upgrade it to a
+      // browser-cacheable tier for a credentialed caller — and a map-declared
+      // no-store (account-private company-monitoring reads, live feeds) is not
+      // even an env override may downgrade (#6771).
+      const declaredTier = (envOverride && envOverride in TIER_HEADERS ? envOverride : null) ?? mapTier;
+
+      if (mergedHeaders.get('X-No-Cache') || noStoreReason || declaredTier === 'no-store' || mapTier === 'no-store') {
         mergedHeaders.set('Cache-Control', 'no-store');
         mergedHeaders.delete('CDN-Cache-Control');
         mergedHeaders.delete('Vercel-CDN-Cache-Control');
         mergedHeaders.set('X-Cache-Tier', 'no-store');
         resolvedCacheTier = 'no-store';
       } else {
-        const rpcName = pathname.split('/').pop() ?? '';
-        const envOverride = process.env[`CACHE_TIER_OVERRIDE_${rpcName.replace(/-/g, '_').toUpperCase()}`] as CacheTier | undefined;
         const isPremium = PREMIUM_RPC_PATHS.has(pathname) || getRequiredTier(pathname) !== null;
         const hasCredentialedNonPublicGet = !isPublicNoAuthRpc && hasCredentialBearingHeader(request);
-        const tier = isPremium || hasCredentialedNonPublicGet ? 'slow-browser' as CacheTier
-          : (envOverride && envOverride in TIER_HEADERS ? envOverride : null) ?? RPC_CACHE_TIER[pathname] ?? 'medium';
+        const tier = hasProFreshCacheAccess ? 'live-browser' as CacheTier
+          : isPremium || hasCredentialedNonPublicGet ? 'slow-browser' as CacheTier
+          : declaredTier ?? 'medium';
         resolvedCacheTier = tier;
-        mergedHeaders.set('Cache-Control', TIER_HEADERS[tier]);
+        // A credentialed non-public response must never be stored by a shared
+        // cache, even at a browser tier — mark it private so only the caller's
+        // own browser retains it. Vary is Origin-only, so without this a shared
+        // proxy could serve one principal's body to another (#6771). Covers the
+        // standard credential headers and premium/internal-MCP callers (whose
+        // HMAC auth headers are not in hasCredentialBearingHeader but still
+        // carry per-principal bodies). (live-browser is already private;
+        // no-store handled above; anonymous public routes keep their CDN tier.)
+        const isPrivateResponse = hasCredentialedNonPublicGet || (isPremium && !isPublicNoAuthRpc);
+        const cacheControl = isPrivateResponse && !TIER_HEADERS[tier].includes('private')
+          ? `private, ${TIER_HEADERS[tier]}`
+          : TIER_HEADERS[tier];
+        mergedHeaders.set('Cache-Control', cacheControl);
         // Only allow Vercel CDN caching for trusted origins (worldmonitor.app, Vercel previews,
         // Tauri). No-origin server-side requests (external scrapers) must always reach the edge
         // function so the auth check in validateApiKey() can run. Without this guard, a cached
         // 200 from a trusted-origin browser request could be served to a no-origin scraper,
         // bypassing auth entirely.
         const reqOrigin = request.headers.get('origin') || '';
-        const cdnCache = !isPremium && !hasCredentialedNonPublicGet && isAllowedOrigin(reqOrigin) ? TIER_CDN_CACHE[tier] : null;
+        const cdnCache = !hasProFreshCacheAccess && !isPremium && !hasCredentialedNonPublicGet && isAllowedOrigin(reqOrigin)
+          ? TIER_CDN_CACHE[tier]
+          : null;
         mergedHeaders.delete('CDN-Cache-Control');
         mergedHeaders.delete('Vercel-CDN-Cache-Control');
         if (cdnCache) mergedHeaders.set('CDN-Cache-Control', cdnCache);
@@ -1747,7 +2455,34 @@ export function createDomainGateway(
       let responseView = new Uint8Array(bodyBytes);
       const jmespathExpr = new URL(request.url).searchParams.get('jmespath');
       if (jmespathExpr && (mergedHeaders.get('Content-Type') ?? '').includes('application/json')) {
-        const projection = projectJsonResponse(bodyStr, jmespathExpr);
+        let projection = projectJsonResponse(bodyStr, jmespathExpr);
+        if (projection.ok) {
+          // Attribution accompaniment — REST parity with the MCP dispatch rider
+          // (shared/attribution-rider.ts). These paths were refused outright
+          // before; refusal protected two supply-chain paths that carry no
+          // licence field at all while `/api/safety/v1/get-toronto-safety`, which
+          // does, was never on the list. The rider replaces the roster: the
+          // sources are extracted from the UNPROJECTED body and merged AROUND
+          // the projected document, so no expression can reach or remove them.
+          //
+          // Merged BEFORE the ETag hash below, so the ETag covers the rider.
+          // Only the success path carries it: a failed projection is an HTTP 400
+          // that serves no data, so there is nothing to accompany.
+          const attributionExpr = REST_ATTRIBUTION_EXPRESSIONS[pathname];
+          if (attributionExpr !== undefined) {
+            let unprojected: unknown;
+            try {
+              unprojected = JSON.parse(bodyStr);
+            } catch {
+              unprojected = null;
+            }
+            const rider = buildAttributionRider(unprojected, attributionExpr);
+            if (rider !== null) {
+              const projectedBody = mergeAttributionRider(projection.body, rider);
+              projection = enforceRestProjectionOutputLimit(projectedBody, unprojected);
+            }
+          }
+        }
         if (!projection.ok) {
           const errorBody = JSON.stringify(projection.envelope);
           emitRequest(400, 'malformed_request', null, errorBody.length);
@@ -1795,7 +2530,7 @@ export function createDomainGateway(
       });
     }
 
-    if (response.status === 200 && request.method === 'GET') {
+    if (response.status === 200 && (request.method === 'GET' || request.method === 'HEAD')) {
       if (mergedHeaders.get('X-No-Cache')) {
         mergedHeaders.set('Cache-Control', 'no-store');
       }
@@ -1814,7 +2549,14 @@ export function createDomainGateway(
       // record rather than a lingering 'processing' lock → 409. store() is
       // best-effort/fail-open, so a Redis blip degrades to a re-executable
       // retry, never a failed response.
-      await idempotency.store(finalStatus, bodyBytes, response.headers.get('content-type'));
+      // Generated response-envelope RPCs can report a retryable ServiceError
+      // inside HTTP 200. Feed store() a retryable status only for its
+      // persist-vs-release decision; the client still receives finalStatus.
+      await idempotency.store(
+        retryableResponse ? 503 : finalStatus,
+        bodyBytes,
+        response.headers.get('content-type'),
+      );
       emitRequest(finalStatus, 'ok', resolvedCacheTier, bodyBytes.byteLength);
       maybeAttachDevHealthHeader(mergedHeaders);
       return new Response(bodyBytes, {
@@ -1835,5 +2577,10 @@ export function createDomainGateway(
       statusText: response.statusText,
       headers: mergedHeaders,
     });
+  }
+
+  return async function handler(originalRequest: Request, ctx?: GatewayCtx): Promise<Response> {
+    const response = await dispatch(originalRequest, ctx);
+    return originalRequest.method === 'HEAD' ? toHeadResponse(response) : response;
   };
 }

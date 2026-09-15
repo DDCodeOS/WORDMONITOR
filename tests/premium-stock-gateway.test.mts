@@ -7,6 +7,18 @@ import { createDomainGateway } from '../server/gateway.ts';
 import { issueSessionToken } from '../api/_session.js';
 import { createRedisFetch } from './helpers/fake-upstash-redis.mts';
 
+// User API keys must be canonical `wm_` + 40 lowercase hex — that is the only
+// shape generateKey() (src/services/api-keys.ts) ever mints, and since #5379
+// validateUserApiKey rejects anything else BEFORE hashing so a malformed key
+// cannot burn a SHA-256 + Redis + Convex round-trip. These fixtures previously
+// used readable placeholders ('wm_free_test_key') that production could never
+// produce, so they exercised the gateway with an impossible input. The Convex
+// mocks below match on URL, not on the key or its hash, so the values here are
+// arbitrary as long as they are well-shaped.
+const FREE_USER_KEY = `wm_${'a'.repeat(40)}`;
+const PRO_USER_KEY = `wm_${'b'.repeat(40)}`;
+const OWNER_PRO_USER_KEY = `wm_${'c'.repeat(40)}`;
+
 const originalKeys = process.env.WORLDMONITOR_VALID_KEYS;
 const originalSessionSecret = process.env.WM_SESSION_SECRET;
 const originalRedisUrl = process.env.UPSTASH_REDIS_REST_URL;
@@ -224,7 +236,7 @@ describe('premium gateway API key enforcement', () => {
           method,
           headers: {
             Origin: 'https://worldmonitor.app',
-            'X-Api-Key': 'wm_free_test_key',
+            'X-Api-Key': FREE_USER_KEY,
           },
         }));
         assert.equal(res.status, 403, `${method} ${path} should fail at the entitlement gate`);
@@ -294,7 +306,7 @@ describe('premium gateway API key enforcement', () => {
           method,
           headers: {
             Origin: 'https://worldmonitor.app',
-            'X-Api-Key': 'wm_pro_test_key',
+            'X-Api-Key': PRO_USER_KEY,
           },
         }));
         assert.equal(res.status, 200, `${method} ${path} should allow tier-1 Pro entitlements`);
@@ -422,7 +434,7 @@ describe('premium gateway API key enforcement', () => {
         new Request('https://worldmonitor.app/api/market/v1/analyze-stock?symbol=AAPL', {
           headers: {
             Origin: 'https://worldmonitor.app',
-            'X-WorldMonitor-Key': 'wm_owner_pro_test',
+            'X-WorldMonitor-Key': OWNER_PRO_USER_KEY,
             'x-user-id': 'victim-user',
           },
         }),
@@ -442,6 +454,30 @@ describe('premium gateway API key enforcement', () => {
 });
 
 describe('POST-to-GET compatibility hardening', () => {
+  async function captureRedisCalls(run: () => Promise<Response>) {
+    const delegateFetch = globalThis.fetch;
+    const redisCalls: Array<{ url: string; body: string }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
+      if (url.startsWith(process.env.UPSTASH_REDIS_REST_URL || '')) {
+        redisCalls.push({
+          url,
+          body: typeof init?.body === 'string' ? init.body : '',
+        });
+      }
+      return delegateFetch(input, init);
+    }) as typeof fetch;
+    try {
+      return { response: await run(), redisCalls };
+    } finally {
+      globalThis.fetch = delegateFetch;
+    }
+  }
+
   function makePublicMarketHandler() {
     let seenUrl: URL | null = null;
     const handler = createDomainGateway([
@@ -520,14 +556,165 @@ describe('POST-to-GET compatibility hardening', () => {
     assert.equal(oversized.status, 405);
   });
 
-  it('preserves malformed JSON compatibility by falling back to matching GET without query params', async () => {
+  it('rejects malformed JSON instead of falling back to an unfiltered GET', async () => {
     const { handler, seenUrl } = makePublicMarketHandler();
     const body = '{not json';
+
+    const { response: res, redisCalls } = await captureRedisCalls(
+      () => handler(compatPost(body, { 'Content-Length': String(Buffer.byteLength(body)) })),
+    );
+
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), { error: 'Invalid JSON body for POST compatibility' });
+    assert.equal(seenUrl(), null);
+    assert.ok(
+      redisCalls.some(({ body }) => body.includes('rl:ep') && body.includes('/api/market/v1/list-market-quotes')),
+      'malformed compatibility requests must traverse endpoint abuse limiting',
+    );
+  });
+
+  it('rejects a JSON array body instead of encoding index keys as query params', async () => {
+    const { handler, seenUrl } = makePublicMarketHandler();
+    const body = JSON.stringify(['AAPL', 'MSFT']);
+
+    const res = await handler(compatPost(body, { 'Content-Length': String(Buffer.byteLength(body)) }));
+
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), { error: 'Unsupported POST compatibility body' });
+    assert.equal(seenUrl(), null);
+  });
+
+  it('rejects object values without applying sibling scalars', async () => {
+    const { handler, seenUrl } = makePublicMarketHandler();
+    const body = JSON.stringify({
+      symbols: ['AAPL'],
+      filter: { sector: 'tech' },
+    });
+
+    const res = await handler(compatPost(body, { 'Content-Length': String(Buffer.byteLength(body)) }));
+
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), {
+      error: 'Unsupported value for POST compatibility parameter',
+      parameter: 'filter',
+    });
+    assert.equal(seenUrl(), null);
+  });
+
+  it('rejects non-scalar array members without applying sibling scalars', async () => {
+    const { handler, seenUrl } = makePublicMarketHandler();
+    const body = JSON.stringify({
+      includeExtended: true,
+      symbols: ['AAPL', { nested: true }],
+    });
+
+    const res = await handler(compatPost(body, { 'Content-Length': String(Buffer.byteLength(body)) }));
+
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), {
+      error: 'Unsupported value for POST compatibility parameter',
+      parameter: 'symbols',
+    });
+    assert.equal(seenUrl(), null);
+  });
+
+  it('rejects null values without applying sibling scalars', async () => {
+    const { handler, seenUrl } = makePublicMarketHandler();
+    const body = JSON.stringify({
+      includeExtended: true,
+      symbols: null,
+    });
+
+    const res = await handler(compatPost(body, { 'Content-Length': String(Buffer.byteLength(body)) }));
+
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), {
+      error: 'Unsupported value for POST compatibility parameter',
+      parameter: 'symbols',
+    });
+    assert.equal(seenUrl(), null);
+  });
+
+  it('converts empty POST bodies to GET without query params', async () => {
+    const { handler, seenUrl } = makePublicMarketHandler();
+
+    const res = await handler(compatPost('', { 'Content-Length': '0' }));
+
+    assert.equal(res.status, 200);
+    assert.equal(seenUrl()?.search, '');
+  });
+
+  it('converts whitespace-only POST bodies to GET without query params', async () => {
+    const { handler, seenUrl } = makePublicMarketHandler();
+    const body = ' \n\t ';
 
     const res = await handler(compatPost(body, { 'Content-Length': String(Buffer.byteLength(body)) }));
 
     assert.equal(res.status, 200);
     assert.equal(seenUrl()?.search, '');
+  });
+
+  it('rejects a JSON null body', async () => {
+    const { handler, seenUrl } = makePublicMarketHandler();
+    const body = 'null';
+
+    const res = await handler(compatPost(body, { 'Content-Length': String(Buffer.byteLength(body)) }));
+
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), { error: 'Unsupported POST compatibility body' });
+    assert.equal(seenUrl(), null);
+  });
+
+  it('does not reject an unsupported body when no GET fallback route exists', async () => {
+    const { handler, seenUrl } = makePublicMarketHandler();
+    const body = JSON.stringify({ filter: { nested: true } });
+
+    const res = await handler(new Request('https://worldmonitor.app/api/market/v1/does-not-exist', {
+      method: 'POST',
+      headers: {
+        Origin: 'https://worldmonitor.app',
+        'X-WorldMonitor-Key': SESSION_TOKEN,
+        'Content-Type': 'application/json',
+        'Content-Length': String(Buffer.byteLength(body)),
+      },
+      body,
+    }));
+
+    assert.equal(res.status, 404);
+    assert.equal(seenUrl(), null);
+  });
+
+  it('returns 400 when the POST compatibility body cannot be read', async () => {
+    const { handler, seenUrl } = makePublicMarketHandler();
+    const body = JSON.stringify({ symbols: ['AAPL'] });
+    const req = compatPost(body, { 'Content-Length': String(Buffer.byteLength(body)) });
+    req.clone = () => ({
+      text: async () => {
+        throw new Error('stream reset');
+      },
+    }) as Request;
+
+    const { response: res, redisCalls } = await captureRedisCalls(() => handler(req));
+
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), { error: 'malformed_request' });
+    assert.equal(seenUrl(), null);
+    assert.ok(
+      redisCalls.some(({ body }) => body.includes('rl:ep') && body.includes('/api/market/v1/list-market-quotes')),
+      'unreadable compatibility requests must traverse endpoint abuse limiting',
+    );
+  });
+
+  it('enforces the actual-byte backstop when Content-Length understates a multibyte body', async () => {
+    const { handler, seenUrl } = makePublicMarketHandler();
+    const body = JSON.stringify({ symbols: ['é'.repeat(524_288)] });
+    assert.ok(Buffer.byteLength(body) >= 1_048_576);
+
+    const res = await handler(compatPost(body, { 'Content-Length': '128' }));
+
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), { error: 'malformed_request' });
+    assert.equal(seenUrl(), null);
   });
 });
 
@@ -674,7 +861,7 @@ describe('premium gateway bearer token auth', () => {
         headers: {
           Origin: 'https://worldmonitor.app',
           Authorization: `Bearer ${token}`,
-          'X-Api-Key': 'wm_free_test_key',
+          'X-Api-Key': FREE_USER_KEY,
         },
       }));
       assert.equal(res.status, 403);
@@ -691,14 +878,87 @@ describe('premium gateway bearer token auth', () => {
   });
 
   it('free bearer token on premium endpoint → 403', async () => {
+    // This used to pass on an UNCONFIGURED backend: getEntitlements returned
+    // null without a lookup and the gate rendered its terminal "unable to
+    // verify" 403, so the assertion held for a reason that had nothing to do
+    // with the user's plan. A null now distinguishes "no lookup attempted" from
+    // "Convex confirmed no row", and only the second is an upsell — so pin the
+    // backend as configured and serve a real tier-0 row to test what the name
+    // claims: a confirmed free user is denied with the upgrade verdict.
     const token = await signToken({ sub: 'user_free', plan: 'free' });
-    const res = await handler(new Request('https://worldmonitor.app/api/market/v1/analyze-stock?symbol=AAPL', {
-      headers: {
-        Origin: 'https://worldmonitor.app',
-        Authorization: `Bearer ${token}`,
-      },
-    }));
-    assert.equal(res.status, 403);
+    const originalSiteUrl = process.env.CONVEX_SITE_URL;
+    const originalSecret = process.env.CONVEX_SERVER_SHARED_SECRET;
+    const originalFetch = globalThis.fetch;
+    process.env.CONVEX_SITE_URL = 'https://test.convex.site';
+    process.env.CONVEX_SERVER_SHARED_SECRET = 'test-secret';
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url =
+        typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.endsWith('/api/internal-entitlements')) {
+        return new Response(
+          JSON.stringify({
+            planKey: 'free',
+            validUntil: Date.now() + 86_400_000,
+            features: {
+              tier: 0,
+              apiAccess: false,
+              apiRateLimit: 0,
+              maxDashboards: 3,
+              prioritySupport: false,
+              exportFormats: [],
+              mcpAccess: false,
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    try {
+      const res = await handler(new Request('https://worldmonitor.app/api/market/v1/analyze-stock?symbol=AAPL', {
+        headers: {
+          Origin: 'https://worldmonitor.app',
+          Authorization: `Bearer ${token}`,
+        },
+      }));
+      assert.equal(res.status, 403);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalSiteUrl === undefined) delete process.env.CONVEX_SITE_URL;
+      else process.env.CONVEX_SITE_URL = originalSiteUrl;
+      if (originalSecret === undefined) delete process.env.CONVEX_SERVER_SHARED_SECRET;
+      else process.env.CONVEX_SERVER_SHARED_SECRET = originalSecret;
+    }
+  });
+
+  it('a free bearer with an UNCONFIGURED backend is retryable, not an upsell', async () => {
+    // The other half. A missing env var is our deploy defect, and on this gate
+    // it previously told every caller — subscribers included — that their
+    // entitlement could not be verified, with a terminal 403.
+    const token = await signToken({ sub: 'user_free_unconfigured', plan: 'free' });
+    const originalSiteUrl = process.env.CONVEX_SITE_URL;
+    const originalSecret = process.env.CONVEX_SERVER_SHARED_SECRET;
+    delete process.env.CONVEX_SITE_URL;
+    delete process.env.CONVEX_SERVER_SHARED_SECRET;
+    try {
+      const res = await handler(new Request('https://worldmonitor.app/api/market/v1/analyze-stock?symbol=AAPL', {
+        headers: {
+          Origin: 'https://worldmonitor.app',
+          Authorization: `Bearer ${token}`,
+        },
+      }));
+      assert.equal(res.status, 503);
+      assert.equal(
+        res.headers.get('X-Billing-Verification'),
+        'entitlement_verification_unavailable',
+      );
+    } finally {
+      if (originalSiteUrl === undefined) delete process.env.CONVEX_SITE_URL;
+      else process.env.CONVEX_SITE_URL = originalSiteUrl;
+      if (originalSecret === undefined) delete process.env.CONVEX_SERVER_SHARED_SECRET;
+      else process.env.CONVEX_SERVER_SHARED_SECRET = originalSecret;
+    }
   });
 
   it('rejects invalid/expired bearer token on premium endpoint → 401', async () => {

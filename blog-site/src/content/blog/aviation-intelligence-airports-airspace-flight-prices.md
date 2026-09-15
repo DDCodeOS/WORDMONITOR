@@ -1,11 +1,12 @@
 ---
 title: "Aviation Intelligence: Airports, Airspace, and Flight Prices as Signals"
-description: "WorldMonitor tracks 115 airports, FAA delays, NOTAM closures, military aircraft, GPS jamming, and live Google Flights prices — because aviation reacts to risk first."
+description: "Track global airports, FAA delays, NOTAM closures, military aircraft, GPS jamming, and live flight prices with WorldMonitor."
 metaTitle: "Aviation Intelligence Dashboard | WorldMonitor"
 keywords: "aviation intelligence dashboard, airport delay monitoring, NOTAM airspace closures, military aircraft tracking, flight prices API, GPS jamming map"
 audience: "Airline and ops teams, travel security managers, OSINT analysts, journalists, frequent travelers"
-heroImage: "/blog/og/aviation-intelligence-airports-airspace-flight-prices.png"
+heroImage: "/blog/images/blog/aviation-intelligence-airports-airspace-flight-prices.jpg"
 pubDate: "2026-07-21"
+modifiedDate: "2026-07-22"
 ---
 
 Aviation is the most reactive layer in the global system. Airlines reroute around risk hours before governments issue statements; insurers reprice overflight before analysts publish; evacuation demand hits booking engines before it hits the news. If you can read the aviation layer, you often get the earliest civilian-visible signal that something changed.
@@ -14,7 +15,7 @@ WorldMonitor gives that layer a dedicated panel — and wires it into the same m
 
 ## The six-tab Aviation Intelligence panel
 
-The **Aviation Intelligence panel** covers 115 monitored airports worldwide across six tabs:
+The **Aviation Intelligence panel** covers the registered worldwide airport watchlist across six tabs:
 
 - **Ops** — operational status and delay conditions, including FAA delay programs for US hubs.
 - **Flights** — flight activity for the airports you care about.
@@ -44,6 +45,10 @@ All of it is queryable: `get_aviation_status` and `get_airspace` for the intelli
 ## Limits
 
 ADS-B and OpenSky coverage degrades exactly where things get interesting — conflict zones, jamming areas, and regions with sparse receiver networks — and military aircraft that don't want to be tracked aren't. Flight-price data reflects what Google Flights serves at query time; it's a live search, not a booked-fare archive. Delay data is strongest for FAA-covered US airports. Treat every aviation signal as one witness among several, which is how the verification workflow uses it.
+
+## Primary Aviation Sources
+
+Operational context is cross-checked against sources such as the [FAA National Airspace System status](https://nasstatus.faa.gov/) and the [OpenSky Network](https://opensky-network.org/). Source timestamps and coverage limitations matter: an absent transponder observation is not proof that an aircraft is absent.
 
 ## Frequently Asked Questions
 

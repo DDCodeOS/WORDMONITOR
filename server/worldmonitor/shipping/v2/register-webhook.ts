@@ -9,8 +9,12 @@ import {
 } from '../../../../src/generated/server/worldmonitor/shipping/v2/service_server';
 
 // @ts-expect-error — JS module, no declaration file
-import { validateApiKey } from '../../../../api/_api-key.js';
-import { isCallerPremium } from '../../../_shared/premium-check';
+import { getHeaderApiKey, USER_API_KEY_GATEWAY_VALIDATION_ERROR, validateApiKey } from '../../../../api/_api-key.js';
+import { validateUserApiKey } from '../../../_shared/user-api-key';
+import {
+  requirePremiumRpcAccess,
+} from '../../../_shared/premium-check';
+import { pruneOwnerWebhookIndex } from './webhook-owner-index';
 import { runRedisPipeline } from '../../../_shared/redis';
 import {
   WEBHOOK_TTL,
@@ -37,16 +41,26 @@ export async function registerWebhook(
   // gate and the documented "X-WorldMonitor-Key required" contract in
   // docs/api-shipping-v2.mdx.
   const apiKeyResult = (await validateApiKey(ctx.request, { forceKey: true })) as {
-    valid: boolean; required: boolean; error?: string;
+    valid: boolean; required: boolean; error?: string; credential?: string;
   };
+  if (apiKeyResult.error === USER_API_KEY_GATEWAY_VALIDATION_ERROR) {
+    const credential = getHeaderApiKey(ctx.request) as string;
+    let userKey;
+    try {
+      userKey = credential ? await validateUserApiKey(credential) : null;
+    } catch {
+      throw new ApiError(503, 'Service temporarily unavailable', '');
+    }
+    if (!userKey) throw new ApiError(401, 'Invalid API key', '');
+    // Revalidate the credential rather than trusting a caller-supplied user ID.
+    apiKeyResult.valid = true;
+    apiKeyResult.credential = credential;
+  }
   if (apiKeyResult.required && !apiKeyResult.valid) {
     throw new ApiError(401, apiKeyResult.error ?? 'API key required', '');
   }
 
-  const isPro = await isCallerPremium(ctx.request);
-  if (!isPro) {
-    throw new ApiError(403, 'PRO subscription required', '');
-  }
+  await requirePremiumRpcAccess(ctx.request, ApiError, 'PRO subscription required');
 
   const callbackUrl = (req.callbackUrl ?? '').trim();
   if (!callbackUrl) {
@@ -81,7 +95,8 @@ export async function registerWebhook(
     ]);
   }
 
-  const ownerTag = await callerFingerprint(ctx.request);
+  const ownerTag = await callerFingerprint(ctx.request, apiKeyResult.credential);
+  await pruneOwnerWebhookIndex(ownerTag);
   const newSubscriberId = generateSubscriberId();
   const secret = await generateSecret();
 
@@ -96,11 +111,18 @@ export async function registerWebhook(
     secret,
   };
 
-  await runRedisPipeline([
+  const results = await runRedisPipeline([
     ['SET', webhookKey(newSubscriberId), JSON.stringify(record), 'EX', String(WEBHOOK_TTL)],
     ['SADD', ownerIndexKey(ownerTag), newSubscriberId],
     ['EXPIRE', ownerIndexKey(ownerTag), String(WEBHOOK_TTL)],
   ]);
+
+  if (!Array.isArray(results) || results.length !== 3 || results.some(result => !result || result.error)
+    || results[0]?.result !== 'OK'
+    || ![0, 1, '0', '1'].includes(results[1]?.result as number | string)
+    || (results[2]?.result !== 1 && results[2]?.result !== '1')) {
+    throw new ApiError(503, 'Webhook registration could not be confirmed', '');
+  }
 
   return { subscriberId: newSubscriberId, secret };
 }

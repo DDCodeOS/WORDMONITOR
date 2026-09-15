@@ -18,9 +18,21 @@ const repoRoot = resolve(__dirname, '..');
 // mirrored files, append them to MIRRORED_FILES.
 
 const MIRRORED_FILES = [
+  'china-corporate-disclosure-policy.js',
+  'correlation-runtime-mode.js',
   'geography.js',
+  'hapi-app-identifier.json',
   'iso2-to-region.json',
   'iso3-to-iso2.json',
+  'publisher-families.js',
+  'physical-divergence-contract.js',
+  'physical-divergence-contract.d.ts',
+  'physical-divergence-staleness.js',
+  'physical-divergence-staleness.d.ts',
+  'stablecoin-classifier.cjs',
+  // The classifier's default thresholds come from its SIBLING stablecoins.json
+  // (both homes), so a drift in the JSON mirror silently changes classification.
+  'stablecoins.json',
   'story-identity.js',
   'un-to-iso2.json',
 ];

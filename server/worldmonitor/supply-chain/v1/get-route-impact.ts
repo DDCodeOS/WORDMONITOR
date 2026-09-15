@@ -1,3 +1,4 @@
+import { normalizeComtradeProducts } from '../../../../scripts/shared/comtrade';
 /**
  * GET /api/supply-chain/v1/get-route-impact
  *
@@ -24,7 +25,7 @@ import { lazyFetchBilateralHs4 } from './_bilateral-hs4-lazy';
 import { ROUTE_IMPACT_KEY } from '../../../_shared/cache-keys';
 import { CHOKEPOINT_REGISTRY } from '../../../_shared/chokepoint-registry';
 import { BYPASS_CORRIDORS_BY_CHOKEPOINT } from '../../../_shared/bypass-corridors';
-import { RESILIENCE_SCORE_CACHE_PREFIX, getCurrentCacheFormula } from '../../resilience/v1/_shared';
+import { getCachedResilienceScores } from '../../resilience/v1/_shared';
 import COUNTRY_PORT_CLUSTERS from '../../../../scripts/shared/country-port-clusters.json';
 
 const CACHE_TTL_SECONDS = 86400; // 24h
@@ -126,23 +127,10 @@ function emptyResponse(_req: GetRouteImpactRequest, comtradeSource: string): Get
   };
 }
 
-async function readResilienceScore(iso2: string): Promise<number> {
+export async function readResilienceScore(iso2: string): Promise<number> {
   try {
-    const raw = await getCachedJson(`${RESILIENCE_SCORE_CACHE_PREFIX}${iso2}`, true);
-    if (!raw || typeof raw !== 'object' || !('overallScore' in (raw as object))) {
-      return 0;
-    }
-    // Cross-formula gate: score cache entries written under a different
-    // formula than the current one are stale and must not be served
-    // downstream. Returning 0 here mirrors the not-found case — the
-    // caller (computeImpact) treats 0 as "no resilience signal" and
-    // renders the lane without a resilience modifier. A fresh
-    // per-country rescoring is triggered naturally on the next call
-    // to the resilience handler, so the staleness is self-healing.
-    const tag = (raw as { _formula?: unknown })._formula;
-    const current = getCurrentCacheFormula();
-    if (tag !== current) return 0;
-    return (raw as { overallScore: number }).overallScore;
+    const score = Number((await getCachedResilienceScores([iso2])).get(iso2)?.overallScore);
+    return Number.isFinite(score) && score >= 0 && score <= 100 ? score : 0;
   } catch {
     return 0;
   }
@@ -182,7 +170,8 @@ async function computeImpact(req: GetRouteImpactRequest): Promise<GetRouteImpact
   if (!payload.products?.length) return emptyResponse(req, 'empty');
 
   const normalizedHs2 = String(Number.parseInt(hs2, 10));
-  const matchingHs4s = payload.products.filter((p) => hs4ToHs2(p.hs4) === normalizedHs2);
+  const products = normalizeComtradeProducts(payload.products);
+  const matchingHs4s = products.filter((p) => hs4ToHs2(p.hs4) === normalizedHs2);
   const hs2InSeededUniverse = matchingHs4s.length > 0;
 
   let laneValueUsd = 0;
@@ -202,7 +191,7 @@ async function computeImpact(req: GetRouteImpactRequest): Promise<GetRouteImpact
     }
   }
 
-  const sortedProducts = [...payload.products].sort((a, b) => b.totalValue - a.totalValue);
+  const sortedProducts = [...products].sort((a, b) => b.totalValue - a.totalValue);
   const top5 = sortedProducts.slice(0, 5);
   const topStrategicProducts: StrategicProduct[] = top5.map((p) => ({
     hs4: p.hs4,
@@ -213,8 +202,6 @@ async function computeImpact(req: GetRouteImpactRequest): Promise<GetRouteImpact
     primaryChokepointId: computePrimaryChokepointId(toIso2, hs4ToHs2(p.hs4)),
   }));
 
-  const resilienceScore = await readResilienceScore(toIso2);
-
   const dependencyFlags = computeDependencyFlags(toIso2, hs2, primaryExporterShare);
 
   return {
@@ -222,7 +209,10 @@ async function computeImpact(req: GetRouteImpactRequest): Promise<GetRouteImpact
     primaryExporterIso2,
     primaryExporterShare,
     topStrategicProducts,
-    resilienceScore,
+    // The 24-hour outer cache stores slow-changing bilateral trade fields.
+    // getRouteImpact overlays the current construct-tagged resilience score on
+    // every return so activation/rollback never waits for this TTL.
+    resilienceScore: 0,
     dependencyFlags,
     hs2InSeededUniverse,
     comtradeSource: 'bilateral-hs4',
@@ -246,10 +236,14 @@ export async function getRouteImpact(
   }
 
   const cacheKey = ROUTE_IMPACT_KEY(fromIso2, toIso2, hs2);
-  const result = await cachedFetchJson<GetRouteImpactResponse>(
-    cacheKey,
-    CACHE_TTL_SECONDS,
-    async () => computeImpact({ fromIso2, toIso2, hs2 }),
-  );
-  return result ?? emptyResponse(req, 'lazy');
+  const [result, resilienceScore] = await Promise.all([
+    cachedFetchJson<GetRouteImpactResponse>(
+      cacheKey,
+      CACHE_TTL_SECONDS,
+      async () => computeImpact({ fromIso2, toIso2, hs2 }),
+    ),
+    readResilienceScore(toIso2),
+  ]);
+  if (!result) return emptyResponse(req, 'lazy');
+  return { ...result, resilienceScore };
 }

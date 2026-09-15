@@ -3,6 +3,7 @@ import { Panel } from './Panel';
 import { t } from '@/services/i18n';
 import { escapeHtml, unsafeRawHtml } from '@/utils/sanitize';
 import { formatChange, getChangeClass } from '@/utils';
+import { proFreshRpcFetch } from '@/services/premium-fetch';
 
 let _client: MarketServiceClient | null = null;
 
@@ -10,7 +11,7 @@ async function getMarketClient(): Promise<MarketServiceClient> {
   if (!_client) {
     const { MarketServiceClient } = await import('@/generated/client/worldmonitor/market/v1/service_client');
     const { getRpcBaseUrl } = await import('@/services/rpc-client');
-    _client = new MarketServiceClient(getRpcBaseUrl(), { fetch: (...args: Parameters<typeof fetch>) => globalThis.fetch(...args) });
+    _client = new MarketServiceClient(getRpcBaseUrl(), { fetch: proFreshRpcFetch });
   }
   return _client;
 }
@@ -84,6 +85,8 @@ export class LiquidityShiftsPanel extends Panel {
         const net = pct(longPos, shortPos);
         const levLong = toNum(row.leveragedFundsLong ?? 0);
         const levShort = toNum(row.leveragedFundsShort ?? 0);
+        const smallLong = toNum(row.smallTraderLong ?? 0);
+        const smallShort = toNum(row.smallTraderShort ?? 0);
         // CFTC Disaggregated report (GC/SI/CL) has no Leveraged Funds
         // category — only TFF report (ES/NQ) does. Skip the sub-line entirely
         // rather than render a misleading "Lev +0.0%" for commodity rows.
@@ -94,6 +97,11 @@ export class LiquidityShiftsPanel extends Panel {
         const levLine = hasLev
           ? `<div class="market-symbol">${t('components.liquidityShifts.lev')} ${escapeHtml(formatLevShift(levNet))}</div>`
           : '';
+        const hasSmall = row.smallTraderAvailable === true;
+        const smallNet = hasSmall ? pct(smallLong, smallShort) : null;
+        const smallLine = hasSmall
+          ? `<div class="market-symbol">Small traders ${escapeHtml(formatLevShift(smallNet))}</div>`
+          : '';
 
         return `<div class="liquidity-row">
           <div class="liquidity-row__info">
@@ -103,6 +111,7 @@ export class LiquidityShiftsPanel extends Panel {
           <div class="liquidity-row__values">
             <div>${renderShiftPill(net)}</div>
             ${levLine}
+            ${smallLine}
           </div>
         </div>`;
       }).join('');

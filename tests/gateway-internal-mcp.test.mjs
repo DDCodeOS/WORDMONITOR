@@ -41,6 +41,12 @@ const HMAC_SECRET = 'test-internal-hmac-secret-32bytes-padding-xxxxxxxxxxxxxxxxx
 const PRO_USER_ID = 'user_pro_abc';
 const FREE_USER_ID = 'user_free_xyz';
 const TIER1_NO_MCP_USER_ID = 'user_pro_legacy';
+// Positive control for the internal-MCP meter exemption: an API-tier owner
+// whose raw dashboard key DOES enter the per-account daily meter. Without it
+// the exemption assertion passes with the exemption deleted, because the Pro
+// fixture above has `apiAccess: false` and never reaches that layer at all.
+const API_KEY_OWNER_ID = 'user_api_starter_meter';
+const USER_API_KEY = `wm_${'ab12cd34'.repeat(5)}`;
 
 const CONVEX_SITE = 'https://fake.convex.site';
 const CONVEX_SECRET = 'fake-convex-shared-secret';
@@ -56,6 +62,7 @@ let lastHandlerRequest = null;
 // Map<key, expiryMs> — models Redis EX-based expiry so tests can exercise
 // TTL-vs-acceptance-window interactions, not just presence/absence.
 let replayCacheKeys = new Map();
+let axiomEvents = [];
 
 function makeGateway() {
   return createDomainGateway([
@@ -111,6 +118,31 @@ function entitlementForUser(userId) {
       validUntil: Date.now() + 86_400_000,
     };
   }
+  if (userId === API_KEY_OWNER_ID) {
+    // apiAccess + a positive burst and daily allowance are what admit a caller
+    // to the per-account meter at all (`server/gateway.ts` gates on
+    // `apiAccess && apiRateLimit > 0`).
+    return {
+      planKey: 'api_starter',
+      features: {
+        tier: 2,
+        apiAccess: true,
+        apiRateLimit: 60,
+        apiDailyAllowance: 1000,
+        maxDashboards: 25,
+        prioritySupport: false,
+        exportFormats: ['csv', 'json', 'pdf'],
+        mcpAccess: true,
+        planLimits: {
+          apiRequestsPerDay: 1000,
+          apiBurstRequestsPerMinute: 60,
+          mcpCallsPerDay: 'shared-api-budget',
+          mcpBurstRequestsPerMinute: 60,
+        },
+      },
+      validUntil: Date.now() + 86_400_000,
+    };
+  }
   return null;
 }
 
@@ -147,6 +179,13 @@ function installFetchStub(opts = {}) {
           replayCacheKeys.set(key, nowMs + ttlSeconds * 1000);
           return { result: 'OK' };
         }
+        // @upstash/ratelimit auto-pipelines, so its sliding-window decision
+        // arrives here rather than on the single-command endpoint. It reads
+        // `[remaining, limit]` back; a bare 0 is not iterable and surfaces as a
+        // limiter outage, which the FAIL-CLOSED guards answer with a 503 before
+        // the request ever reaches the per-account meter.
+        const verb = String(cmd?.[0] ?? '').toUpperCase();
+        if (verb === 'EVALSHA' || verb === 'EVAL') return { result: [1, 1] };
         return { result: 0 };
       });
       return new Response(JSON.stringify(results), {
@@ -155,7 +194,21 @@ function installFetchStub(opts = {}) {
       });
     }
     if (typeof url === 'string' && url === 'https://redis.test/') {
-      return new Response(JSON.stringify({ result: 'OK' }), {
+      // Single-command endpoint. @upstash/ratelimit's sliding window runs its
+      // decision as one EVALSHA/EVAL and reads `[remaining, limit]` back; every
+      // other single command in this suite only needs an OK. Without the array
+      // the limiter throws, and the FAIL-CLOSED guards (the wm_ pre-auth IP
+      // budget, for one) answer 503 before the request reaches the meter.
+      const command = init?.body ? JSON.parse(String(init.body)) : [];
+      const verb = String(command?.[0] ?? '').toUpperCase();
+      return new Response(
+        JSON.stringify({ result: verb === 'EVALSHA' || verb === 'EVAL' ? [1, 1] : 'OK' }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    }
+    if (typeof url === 'string' && url.includes('/api/internal-validate-api-key')) {
+      // One dashboard key, owned by the API-tier fixture above.
+      return new Response(JSON.stringify({ userId: API_KEY_OWNER_ID }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       });
@@ -164,6 +217,11 @@ function installFetchStub(opts = {}) {
       const body = JSON.parse(init?.body ?? '{}');
       const ent = overrideEntitlement ? overrideEntitlement(body.userId) : entitlementForUser(body.userId);
       return new Response(JSON.stringify(ent), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    if (typeof url === 'string' && url.includes('api.axiom.co')) {
+      const body = init?.body ? JSON.parse(String(init.body)) : [];
+      for (const ev of body) axiomEvents.push(ev);
+      return new Response('{}', { status: 200 });
     }
     // Anything else — fail loudly so tests can't silently depend on the network.
     throw new Error(`unexpected fetch in test: ${url}`);
@@ -182,9 +240,28 @@ function disableRedisForLegacyGatewayCheck() {
   delete process.env.UPSTASH_REDIS_REST_TOKEN;
 }
 
+function makeRecordingCtx() {
+  const pending = [];
+  const ctx = { waitUntil: (p) => { pending.push(p); } };
+  async function settled() {
+    let prev = -1;
+    while (pending.length !== prev) {
+      prev = pending.length;
+      await Promise.allSettled(pending.slice(0, prev));
+    }
+  }
+  return { ctx, settled };
+}
+
+function enableGatewayTelemetry() {
+  process.env.USAGE_TELEMETRY = '1';
+  process.env.AXIOM_API_TOKEN = 'test-token';
+}
+
 beforeEach(() => {
   lastHandlerRequest = null;
   replayCacheKeys = new Map();
+  axiomEvents = [];
   process.env.MCP_INTERNAL_HMAC_SECRET = HMAC_SECRET;
   process.env.CONVEX_SITE_URL = CONVEX_SITE;
   process.env.CONVEX_SERVER_SHARED_SECRET = CONVEX_SECRET;
@@ -304,6 +381,91 @@ describe('gateway internal-MCP HMAC verify — happy paths', () => {
       lastHandlerRequest.headers.get(TRUSTED_USER_ID_HEADER),
       PRO_USER_ID,
       'trusted user id propagated',
+    );
+  });
+
+  /** Record every `rl:apikey:day` INCR the gateway sends while `fn` runs. */
+  async function withDailyMeterRecorder(fn) {
+    const dailyIncrements = [];
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input?.url;
+      if (typeof url === 'string' && url.includes('redis.test/pipeline')) {
+        const commands = JSON.parse(String(init?.body ?? '[]'));
+        for (const cmd of commands) {
+          if (cmd?.[0] === 'INCR' && String(cmd[1] ?? '').includes('rl:apikey:day')) {
+            dailyIncrements.push(cmd[1]);
+          }
+        }
+      }
+      return previousFetch(input, init);
+    };
+    try {
+      return { result: await fn(), dailyIncrements };
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  }
+
+  it('HMAC-signed user_key request cannot increment rl:apikey:day even when REST enforcement is on', async () => {
+    process.env.API_RATE_LIMIT_ENFORCE = 'true';
+    const { buildAuthHeaders } = await import(`../api/mcp/auth.ts?t=${Date.now()}`);
+    const url = 'https://example.test/api/news/v1/summarize-article';
+    const body = JSON.stringify({ provider: 'auto', mode: 'brief' });
+    const headers = await buildAuthHeaders(
+      { kind: 'user_key', apiKey: 'wm_must_not_reach_gateway_meter', userId: PRO_USER_ID },
+      'POST',
+      url,
+      body,
+    );
+    assert.equal(headers['X-WorldMonitor-Key'], undefined, 'signer must not attach the dashboard key');
+
+    const handler = makeGateway();
+    const { result: res, dailyIncrements } = await withDailyMeterRecorder(() => handler(new Request(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...headers },
+      body,
+    })));
+    assert.equal(res.status, 200, `signed user_key request should pass, body=${await res.clone().text()}`);
+    assert.deepEqual(dailyIncrements, [], 'internal-MCP path must not re-enter the shared daily meter');
+  });
+
+  it('same route, same owner: the raw dashboard key IS metered and the signed one is not', async () => {
+    // The assertion above is vacuous on its own. Its fixture user has
+    // `apiAccess: false`, so the request never reaches the per-account meter
+    // for reasons that have nothing to do with the internal-MCP exemption — it
+    // stays green with that exemption deleted. This runs the SAME route for an
+    // owner who genuinely is metered, so the recorder is proven able to observe
+    // an increment before absence is read as evidence.
+    process.env.API_RATE_LIMIT_ENFORCE = 'true';
+    const url = 'https://example.test/api/news/v1/list-feed-digest';
+    const handler = makeGateway();
+
+    const raw = await withDailyMeterRecorder(() => handler(new Request(url, {
+      method: 'GET',
+      headers: { 'X-WorldMonitor-Key': USER_API_KEY },
+    })));
+    assert.equal(raw.result.status, 200, `raw user_key request should pass, body=${await raw.result.clone().text()}`);
+    assert.equal(
+      raw.dailyIncrements.length,
+      1,
+      `the metered door charges exactly once per request; got ${JSON.stringify(raw.dailyIncrements)}`,
+    );
+    assert.match(raw.dailyIncrements[0], new RegExp(`rl:apikey:day:${API_KEY_OWNER_ID}:`));
+
+    const { buildAuthHeaders } = await import(`../api/mcp/auth.ts?t=${Date.now()}`);
+    const headers = await buildAuthHeaders(
+      { kind: 'user_key', apiKey: USER_API_KEY, userId: API_KEY_OWNER_ID },
+      'GET',
+      url,
+      null,
+    );
+    const signed = await withDailyMeterRecorder(() => handler(new Request(url, { method: 'GET', headers })));
+    assert.equal(signed.result.status, 200, `signed user_key request should pass, body=${await signed.result.clone().text()}`);
+    assert.deepEqual(
+      signed.dailyIncrements,
+      [],
+      'the same owner, the same route, signed instead of raw: the internal-MCP path must not re-enter the meter',
     );
   });
 
@@ -756,6 +918,7 @@ describe('gateway internal-MCP HMAC verify — error paths', () => {
         'Content-Type': 'application/json',
         [INTERNAL_MCP_SIG_HEADER]: 'notanumber.AAAA',
         [INTERNAL_MCP_USER_ID_HEADER]: PRO_USER_ID,
+        [INTERNAL_MCP_NONCE_HEADER]: 'malformed_signature_nonce',
       },
       body: JSON.stringify({ x: 1 }),
     });
@@ -800,6 +963,69 @@ describe('gateway internal-MCP HMAC verify — error paths', () => {
       const j = await res.json().catch(() => ({}));
       assert.notEqual(j.error, 'CONFIGURATION', 'no CONFIGURATION error on legacy path');
     }
+  });
+});
+
+// ===========================================================================
+// TELEMETRY — missing HMAC config vs malformed signature (#7277)
+// ===========================================================================
+describe('gateway internal-MCP — usage telemetry reasons', () => {
+  it('missing MCP_INTERNAL_HMAC_SECRET emits hmac_secret_unconfigured, not auth_401', async () => {
+    delete process.env.MCP_PRO_GRANT_HMAC_SECRET;
+    delete process.env.MCP_INTERNAL_HMAC_SECRET;
+    enableGatewayTelemetry();
+    const handler = makeGateway();
+    const recorder = makeRecordingCtx();
+    const req = new Request('https://example.test/api/news/v1/summarize-article', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        [INTERNAL_MCP_SIG_HEADER]: '1700000000.AAAA',
+        [INTERNAL_MCP_USER_ID_HEADER]: PRO_USER_ID,
+      },
+      body: JSON.stringify({ x: 1 }),
+    });
+    const res = await handler(req, recorder.ctx);
+    assert.equal(res.status, 500);
+    assert.deepEqual(await res.json(), {
+      error: 'CONFIGURATION',
+      detail: 'MCP_INTERNAL_HMAC_SECRET not configured',
+    });
+    await recorder.settled();
+    assert.equal(axiomEvents.length, 1, 'exactly one request event');
+    assert.equal(axiomEvents[0].status, 500);
+    assert.equal(axiomEvents[0].reason, 'hmac_secret_unconfigured');
+    assert.notEqual(axiomEvents[0].reason, 'auth_401');
+    assert.equal(
+      JSON.stringify(axiomEvents[0]).includes(HMAC_SECRET),
+      false,
+      'telemetry must not include the HMAC secret',
+    );
+  });
+
+  // Was `auth_401`. Split so a malformed signature envelope is separable from
+  // clock skew and from a real mismatch — the caller-facing 401 is unchanged.
+  it('malformed signature emits internal_mcp_malformed_sig, not a generic auth_401', async () => {
+    enableGatewayTelemetry();
+    const handler = makeGateway();
+    const recorder = makeRecordingCtx();
+    const req = new Request('https://example.test/api/news/v1/summarize-article', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        [INTERNAL_MCP_SIG_HEADER]: 'notanumber.AAAA',
+        [INTERNAL_MCP_USER_ID_HEADER]: PRO_USER_ID,
+        [INTERNAL_MCP_NONCE_HEADER]: 'malformed_signature_nonce',
+      },
+      body: JSON.stringify({ x: 1 }),
+    });
+    const res = await handler(req, recorder.ctx);
+    assert.equal(res.status, 401);
+    assert.deepEqual(await res.json(), { error: 'invalid_internal_mcp_signature' });
+    await recorder.settled();
+    assert.equal(axiomEvents.length, 1, 'exactly one request event');
+    assert.equal(axiomEvents[0].status, 401);
+    assert.equal(axiomEvents[0].reason, 'internal_mcp_malformed_sig');
   });
 });
 
@@ -1012,6 +1238,80 @@ describe('gateway internal-MCP — F1: validUntil re-check', () => {
   });
 });
 
+describe('gateway internal-MCP — billing renewal verification', () => {
+  for (const billingStatus of ['renewal_verification_pending', 'renewal_verification_failed']) {
+    it(`${billingStatus} → retryable no-store 503`, async () => {
+      installFetchStub({
+        entitlement: () => ({
+          planKey: 'free',
+          features: {
+            tier: 0, apiAccess: false, apiRateLimit: 0, maxDashboards: 1,
+            prioritySupport: false, exportFormats: [], mcpAccess: false,
+          },
+          validUntil: 0,
+          billingStatus,
+          retryAfterSeconds: 17,
+        }),
+      });
+      const handler = makeGateway();
+      const req = await buildSignedRequest();
+      const res = await handler(req);
+
+      assert.equal(res.status, 503);
+      assert.equal(res.headers.get('Cache-Control'), 'no-store');
+      assert.equal(res.headers.get('Retry-After'), '17');
+      assert.equal(res.headers.get('X-Billing-Verification'), billingStatus);
+      assert.equal((await res.json()).code, billingStatus);
+      assert.equal(lastHandlerRequest, null, 'handler must not run while renewal verification is unresolved');
+    });
+  }
+
+  it('current Pro fallback remains usable while stronger renewal verification is pending', async () => {
+    installFetchStub({
+      entitlement: () => ({
+        planKey: 'pro_monthly',
+        features: {
+          tier: 1, apiAccess: false, apiRateLimit: 0, maxDashboards: 10,
+          prioritySupport: false, exportFormats: ['csv'], mcpAccess: true,
+        },
+        validUntil: Date.now() + 86_400_000,
+        billingStatus: 'renewal_verification_pending',
+        retryAfterSeconds: 17,
+      }),
+    });
+    const handler = makeGateway();
+    const req = await buildSignedRequest();
+    const res = await handler(req);
+
+    assert.equal(res.status, 200);
+    assert.notEqual(lastHandlerRequest, null, 'covered MCP request must reach the handler');
+  });
+
+  it('subscription_lapsed → distinct hard denial', async () => {
+    installFetchStub({
+      entitlement: () => ({
+        planKey: 'free',
+        features: {
+          tier: 0, apiAccess: false, apiRateLimit: 0, maxDashboards: 1,
+          prioritySupport: false, exportFormats: [], mcpAccess: false,
+        },
+        validUntil: 0,
+        billingStatus: 'subscription_lapsed',
+      }),
+    });
+    const handler = makeGateway();
+    const req = await buildSignedRequest();
+    const res = await handler(req);
+
+    assert.equal(res.status, 403);
+    assert.equal(res.headers.get('Cache-Control'), 'no-store');
+    assert.equal(res.headers.get('Retry-After'), null);
+    assert.equal(res.headers.get('X-Billing-Verification'), 'subscription_lapsed');
+    assert.equal((await res.json()).code, 'subscription_lapsed');
+    assert.equal(lastHandlerRequest, null, 'handler must not run after a confirmed lapse');
+  });
+});
+
 describe('gateway internal-MCP — F7: HMAC headers stripped before handler sees request', () => {
   it('handler receives no X-WM-MCP-Internal or X-WM-MCP-User-Id; only the trusted-marker pair', async () => {
     const handler = makeGateway();
@@ -1099,5 +1399,142 @@ describe('gateway internal-MCP — F8: body size cap', () => {
     assert.equal(res.status, 413);
     const j = await res.json();
     assert.equal(j.error, 'payload_too_large');
+  });
+});
+
+// ===========================================================================
+// FAILURE-MODE TELEMETRY
+//
+// A rare internal-MCP 401 showed up on three routes with nothing to reproduce
+// from: the gateway collapsed "clock skew", "forged signature" and "already
+// spent nonce" into one opaque reply, so production could not say which had
+// happened. The reply MUST stay opaque — it is the anti-oracle. The telemetry
+// must not.
+// ===========================================================================
+describe('gateway internal-MCP HMAC verify — failure-mode telemetry', () => {
+  const URL_UNDER_TEST = 'https://api.worldmonitor.app/api/news/v1/summarize-article';
+  const BODY = JSON.stringify({ provider: 'auto', mode: 'brief' });
+
+  function lastRequestEvent() {
+    const requests = axiomEvents.filter((e) => e.event_type === 'request');
+    return requests[requests.length - 1] ?? null;
+  }
+
+  async function runMode(mode) {
+    enableGatewayTelemetry();
+    const handler = makeGateway();
+    const recorder = makeRecordingCtx();
+    const send = async (req) => {
+      const res = await handler(req, recorder.ctx);
+      await recorder.settled();
+      return res;
+    };
+    if (mode === 'no_user') {
+      const signedReq = await buildSignedRequest({ url: URL_UNDER_TEST });
+      const headers = new Headers(signedReq.headers);
+      headers.delete(INTERNAL_MCP_USER_ID_HEADER);
+      return send(new Request(URL_UNDER_TEST, { method: 'POST', headers, body: BODY }));
+    }
+    if (mode === 'malformed_sig') {
+      return send(await buildSignedRequest({
+        url: URL_UNDER_TEST,
+        extraHeaders: { [INTERNAL_MCP_SIG_HEADER]: 'not-a-dot-separated-signature' },
+      }));
+    }
+    if (mode === 'missing_nonce' || mode === 'invalid_nonce') {
+      const signedReq = await buildSignedRequest({ url: URL_UNDER_TEST });
+      const headers = new Headers(signedReq.headers);
+      if (mode === 'missing_nonce') headers.delete(INTERNAL_MCP_NONCE_HEADER);
+      else headers.set(INTERNAL_MCP_NONCE_HEADER, 'invalid-nonce!');
+      return send(new Request(URL_UNDER_TEST, { method: 'POST', headers, body: BODY }));
+    }
+    if (mode === 'ts_window') {
+      // Signed well outside the ±30s acceptance span.
+      const staleNow = Math.floor(Date.now() / 1000) - 600;
+      return send(await buildSignedRequest({ url: URL_UNDER_TEST, now: staleNow }));
+    }
+    if (mode === 'sig_mismatch') {
+      return send(await buildSignedRequest({ url: URL_UNDER_TEST, secret: `${HMAC_SECRET}-WRONG` }));
+    }
+    if (mode === 'bad_request') {
+      const signedReq = await buildSignedRequest({ url: URL_UNDER_TEST });
+      const body = new ReadableStream({
+        start(controller) { controller.error(new Error('synthetic body read failure')); },
+      });
+      return send(new Request(URL_UNDER_TEST, {
+        method: 'POST', headers: signedReq.headers, body, duplex: 'half',
+      }));
+    }
+    if (mode === 'replay') {
+      const signed = await signInternalMcpRequest({
+        method: 'POST', url: URL_UNDER_TEST, body: BODY,
+        userId: PRO_USER_ID, secret: HMAC_SECRET, nonce: 'telemetry_replay_nonce_01',
+      });
+      const headers = {
+        'Content-Type': 'application/json',
+        [INTERNAL_MCP_SIG_HEADER]: signed.signature,
+        [INTERNAL_MCP_USER_ID_HEADER]: signed.userId,
+        [INTERNAL_MCP_NONCE_HEADER]: signed.nonce,
+      };
+      const first = await send(new Request(URL_UNDER_TEST, { method: 'POST', headers, body: BODY }));
+      assert.equal(first.status, 200, 'the nonce must be spent by a real success first');
+      return send(new Request(URL_UNDER_TEST, { method: 'POST', headers, body: BODY }));
+    }
+    throw new Error(`unknown mode: ${mode}`);
+  }
+
+  const MODES = [
+    ['no_user', 'internal_mcp_no_user'],
+    ['malformed_sig', 'internal_mcp_malformed_sig'],
+    ['missing_nonce', 'internal_mcp_bad_nonce'],
+    ['invalid_nonce', 'internal_mcp_bad_nonce'],
+    ['ts_window', 'internal_mcp_ts_window'],
+    ['sig_mismatch', 'internal_mcp_sig_mismatch'],
+    ['bad_request', 'internal_mcp_bad_request'],
+    ['replay', 'internal_mcp_replay'],
+  ];
+
+  for (const [mode, expectedReason] of MODES) {
+    it(`reports ${expectedReason} to telemetry for the ${mode} rejection`, async () => {
+      const res = await runMode(mode);
+      assert.equal(res.status, 401);
+      const event = lastRequestEvent();
+      assert.ok(event, 'a request event must be emitted for a rejected call');
+      assert.equal(event.reason, expectedReason);
+    });
+  }
+
+  it('returns a byte-identical 401 for every rejection mode', async () => {
+    const seen = [];
+    for (const [mode] of MODES) {
+      const res = await runMode(mode);
+      seen.push({
+        mode,
+        status: res.status,
+        body: await res.text(),
+        contentType: res.headers.get('Content-Type'),
+        // Anything that varies per mode would be the oracle, including a
+        // header a future branch adds only to one path.
+        headers: [...res.headers.entries()].sort(([a], [b]) => a.localeCompare(b)),
+      });
+    }
+    const [first, ...rest] = seen;
+    assert.equal(first.body, '{"error":"invalid_internal_mcp_signature"}');
+    for (const other of rest) {
+      assert.equal(other.status, first.status, `${other.mode} status must match ${first.mode}`);
+      assert.equal(other.body, first.body, `${other.mode} body must match ${first.mode}`);
+      assert.equal(other.contentType, first.contentType, `${other.mode} content-type must match ${first.mode}`);
+      assert.deepEqual(other.headers, first.headers, `${other.mode} headers must match ${first.mode}`);
+    }
+  });
+
+  it('keeps every emitted reason distinct so the modes stay separable in Axiom', async () => {
+    const reasons = [];
+    for (const [mode] of MODES) {
+      await runMode(mode);
+      reasons.push(lastRequestEvent()?.reason);
+    }
+    const expectedReasons = new Set(MODES.map(([, reason]) => reason));
+    assert.equal(new Set(reasons).size, expectedReasons.size, `reasons collapsed: ${reasons.join(', ')}`);
   });
 });

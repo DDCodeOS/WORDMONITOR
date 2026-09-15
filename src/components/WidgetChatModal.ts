@@ -6,6 +6,11 @@ import { escapeHtml } from '@/utils/sanitize';
 import { widgetAgentHealthUrl, widgetAgentUrl } from '@/utils/proxy';
 import { wrapWidgetHtml, wrapProWidgetHtml } from '@/utils/widget-sanitizer';
 import { track } from '@/services/analytics';
+import { createFocusTrap, type FocusTrap } from '@/utils/focus-trap';
+import { reportEntitlementDesync } from '@/services/entitlement-desync-telemetry';
+import { classifyPremiumDenial, type ClientEntitlementBelief } from '@/services/premium-denial';
+import { readClientEntitlementBelief } from '@/services/panel-gating';
+import { getAuthState } from '@/services/auth-state';
 import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
 
 
@@ -43,6 +48,7 @@ const PRO_EXAMPLE_PROMPT_KEYS = [
 ] as const;
 
 let overlay: HTMLElement | null = null;
+let focusTrap: FocusTrap | null = null;
 let abortController: AbortController | null = null;
 let clientTimeout: ReturnType<typeof setTimeout> | null = null;
 
@@ -53,6 +59,22 @@ interface BuiltAuthHeaders {
    *  the right 403 error message — the "Update wm-pro-key" hint is misleading
    *  for normal paying users who have no tester key. */
   usedTesterKey: boolean;
+}
+
+function reportWidgetEntitlementDesync(
+  status: number,
+  payload: WidgetAgentHealth | null,
+  usedTesterKey: boolean,
+  requestBelief: ClientEntitlementBelief,
+  requestUserId: string | null,
+): void {
+  if (usedTesterKey || (getAuthState().user?.id ?? null) !== requestUserId) return;
+  const verdict = classifyPremiumDenial({
+    status,
+    errorCode: payload?.error ?? null,
+    belief: requestBelief,
+  });
+  if (verdict === 'entitlement_desync') reportEntitlementDesync('widget-chat');
 }
 
 async function buildWidgetAuthHeaders(isPro: boolean): Promise<BuiltAuthHeaders> {
@@ -80,6 +102,9 @@ export function openWidgetChatModal(options: WidgetChatOptions): void {
 
   overlay = document.createElement('div');
   overlay.className = 'modal-overlay active';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
+  overlay.setAttribute('aria-label', options.mode === 'modify' ? t('widgets.modifyTitle') : t('widgets.chatTitle'));
 
   const modal = document.createElement('div');
   modal.className = 'modal widget-chat-modal';
@@ -160,6 +185,8 @@ export function openWidgetChatModal(options: WidgetChatOptions): void {
 
   const escHandler = (e: KeyboardEvent) => { if (e.key === 'Escape') closeWidgetChatModal(); };
   document.addEventListener('keydown', escHandler);
+  focusTrap = createFocusTrap(overlay);
+  focusTrap.activate();
 
   actionBtn.addEventListener('click', () => {
     if (!pendingSaveSpec) return;
@@ -171,12 +198,22 @@ export function openWidgetChatModal(options: WidgetChatOptions): void {
     setReadinessState(readinessEl, 'checking', t('widgets.checkingConnection'));
     try {
       const auth = await buildWidgetAuthHeaders(isPro);
+      const requestAuthState = getAuthState();
+      const requestUserId = requestAuthState.user?.id ?? null;
+      const requestBelief = readClientEntitlementBelief(requestAuthState);
       const res = await fetch(widgetAgentHealthUrl(), { headers: auth.headers });
       let payload: WidgetAgentHealth | null = null;
       try { payload = await res.json() as WidgetAgentHealth; } catch { /* ignore */ }
 
       if (!res.ok) {
-        const message = resolvePreflightMessage(res.status, payload, isPro, auth.usedTesterKey);
+        const message = resolvePreflightMessage(
+          res.status,
+          payload,
+          isPro,
+          auth.usedTesterKey,
+          requestBelief,
+          requestUserId,
+        );
         preflightReady = false;
         setReadinessState(readinessEl, 'error', message);
         setFooterStatus(footerStatusEl, message, 'error');
@@ -252,6 +289,9 @@ export function openWidgetChatModal(options: WidgetChatOptions): void {
 
     try {
       const auth = await buildWidgetAuthHeaders(isPro);
+      const requestAuthState = getAuthState();
+      const requestUserId = requestAuthState.user?.id ?? null;
+      const requestBelief = readClientEntitlementBelief(requestAuthState);
       const reqHeaders: Record<string, string> = {
         'Content-Type': 'application/json',
         ...auth.headers,
@@ -264,7 +304,19 @@ export function openWidgetChatModal(options: WidgetChatOptions): void {
         body,
       });
 
-      if (!res.ok || !res.body) {
+      if (!res.ok) {
+        let payload: WidgetAgentHealth | null = null;
+        try { payload = await res.json() as WidgetAgentHealth; } catch { /* ignore */ }
+        reportWidgetEntitlementDesync(
+          res.status,
+          payload,
+          auth.usedTesterKey,
+          requestBelief,
+          requestUserId,
+        );
+        throw new Error(t('widgets.serverError', { status: res.status }));
+      }
+      if (!res.body) {
         throw new Error(t('widgets.serverError', { status: res.status }));
       }
 
@@ -377,6 +429,8 @@ export function closeWidgetChatModal(): void {
   if (overlay) {
     const o = overlay as HTMLElement & { _escHandler?: (e: KeyboardEvent) => void };
     if (o._escHandler) document.removeEventListener('keydown', o._escHandler);
+    focusTrap?.deactivate();
+    focusTrap = null;
     overlay.remove();
     overlay = null;
   }
@@ -403,12 +457,17 @@ function resolvePreflightMessage(
   payload: WidgetAgentHealth | null,
   isPro: boolean,
   usedTesterKey: boolean,
+  requestBelief: ClientEntitlementBelief,
+  requestUserId: string | null,
 ): string {
   if (status === 403) {
     // Tester-key path: tell the operator to update the wm-*-key they actually have.
     if (usedTesterKey) return isPro ? t('widgets.preflightInvalidProKey') : t('widgets.preflightInvalidKey');
-    // Clerk-auth path: split on isPro.
-    //   isPro=true  — the modal believes the user is Pro; a 403 means either
+    reportWidgetEntitlementDesync(status, payload, usedTesterKey, requestBelief, requestUserId);
+    // Clerk-auth copy stays keyed to the requested widget tier. Telemetry above
+    // separately classifies the account belief so the two concepts cannot be
+    // conflated.
+    //   isPro=true  — the modal requested a Pro widget; a 403 means either
     //                 (a) they just upgraded (entitlement still propagating)
     //                 or (b) the entitlement service is degraded. Tell them to
     //                 refresh / contact support.

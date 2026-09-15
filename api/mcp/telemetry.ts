@@ -30,7 +30,7 @@ export function emitTelemetry(event: string, payload: Record<string, unknown>): 
   }
 }
 
-// Closed-key allowlists for the two telemetry events. Locking the schema at
+// Closed-key allowlists for MCP telemetry events. Locking the schema at
 // the module boundary makes "while-I'm-here" additions visible at code
 // review: any new top-level key on an emitted line requires updating the
 // matching allowlist below, and `tests/mcp-telemetry-schema.test.mjs`
@@ -39,8 +39,8 @@ export function emitTelemetry(event: string, payload: Record<string, unknown>): 
 // `result` ever appear here — those are request/response body fields and
 // MUST NOT be logged.
 //
-// Both sets include `tag` + `ts` because `emitTelemetry` adds them to every
-// line; the per-event payload keys follow the literal call-sites in
+// Every allowlist includes `tag` + `ts` because `emitTelemetry` adds them to
+// each line; the per-event payload keys follow the literal call-sites in
 // dispatchToolsCall (both success + error path) and the `initialize`
 // handler. Keep this in sync with those call-sites — the schema test will
 // fail by name if you don't.
@@ -81,6 +81,20 @@ export const MCP_RATE_LIMIT_HIT_TELEMETRY_KEYS = Object.freeze([
   'window_seconds',
 ] as const);
 
+export const MCP_DOWNSTREAM_TELEMETRY_KEYS = Object.freeze([
+  'tag',
+  'ts',
+  'tool',
+  'auth_kind',
+  'inbound_host_class',
+  'downstream_origin',
+  'downstream_operation',
+  'status',
+  'ok',
+  'error_code',
+  'response_marker',
+] as const);
+
 // Log-safe principal id derived from the resolved auth context:
 //   - Pro / user_key: raw Clerk `userId` (internal ID, not a secret; matches
 //              the REST gateway's `customer_id` convention — user_key carries
@@ -89,7 +103,13 @@ export const MCP_RATE_LIMIT_HIT_TELEMETRY_KEYS = Object.freeze([
 //              material; mirrors `principal_id` in
 //              server/_shared/usage-identity.ts).
 export function principalIdForLog(context: McpAuthContext): string {
-  return context.kind === 'env_key' ? hashKeySync(context.apiKey) : context.userId;
+  if (context.kind === 'env_key') return hashKeySync(context.apiKey);
+  // U7: a free-tier caller has no principal to attribute. 'anon' matches the
+  // value the anonymous discovery path already logs, so free-tier tool calls
+  // aggregate with the rest of the unauthenticated traffic instead of
+  // appearing as a distinct phantom principal.
+  if (context.kind === 'free') return 'anon';
+  return context.userId;
 }
 
 export function emitMcpRateLimitHit(

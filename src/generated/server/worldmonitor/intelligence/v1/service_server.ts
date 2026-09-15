@@ -144,6 +144,51 @@ export interface BriefSource {
   publishedAt: string;
 }
 
+export interface GetCountryCoverageRequest {
+  countryCode: string;
+  windowHours: number;
+  limit: number;
+}
+
+export interface GetCountryCoverageResponse {
+  countryCode: string;
+  countryName: string;
+  windowHours: number;
+  generatedAt: string;
+  headlines: CountryCoverageHeadline[];
+  events: CountryCoverageEvent[];
+  sources: CountryCoverageSourceStatus[];
+  degraded: boolean;
+  containment: string;
+}
+
+export interface CountryCoverageHeadline {
+  title: string;
+  url: string;
+  source: string;
+  publishedAt: string;
+  publishedAtMs: number;
+}
+
+export interface CountryCoverageEvent {
+  timestampMs: number;
+  occurredAt: string;
+  lane: string;
+  label: string;
+  severity: string;
+  origin: string;
+  source: string;
+}
+
+export interface CountryCoverageSourceStatus {
+  source: string;
+  state: string;
+  detail: string;
+  fetchedAt: string;
+  ageSeconds: number;
+  contributed: number;
+}
+
 export interface SearchGdeltDocumentsRequest {
   query: string;
   maxRecords: number;
@@ -279,19 +324,55 @@ export interface TelegramMessage {
   topic: string;
 }
 
+export interface ListXFeedRequest {
+  limit: number;
+  topic: string;
+  account: string;
+}
+
+export interface ListXFeedResponse {
+  enabled: boolean;
+  posts: XFeedItem[];
+  count: number;
+  error: string;
+}
+
+export interface XFeedItem {
+  id: string;
+  accountId: string;
+  accountName: string;
+  handle: string;
+  topic: string;
+  timestampMs: number;
+  permalink: string;
+  facts: string[];
+  hasMedia: boolean;
+  lang: string;
+  contentState: string;
+}
+
 export interface GetCompanyEnrichmentRequest {
+  /** @deprecated */
   domain: string;
   name: string;
+  ticker: string;
 }
 
 export interface GetCompanyEnrichmentResponse {
   company?: EnrichedCompany;
+  /** @deprecated */
   github?: EnrichedGithub;
+  /** @deprecated */
   techStack: TechStackItem[];
   secFilings?: SecFilings;
+  /** @deprecated */
   hackerNewsMentions: HNMention[];
   enrichedAtMs: number;
   sources: string[];
+  market?: CompanyMarketProfile;
+  earningsSurprises: EarningsSurprise[];
+  newsMentions: CompanyNewsMention[];
+  unavailable: boolean;
 }
 
 export interface EnrichedCompany {
@@ -300,7 +381,10 @@ export interface EnrichedCompany {
   description: string;
   location: string;
   website: string;
+  /** @deprecated */
   founded: number;
+  cik: string;
+  ticker: string;
 }
 
 export interface EnrichedGithub {
@@ -324,6 +408,8 @@ export interface SecFiling {
   form: string;
   fileDate: string;
   description: string;
+  url: string;
+  items: string[];
 }
 
 export interface HNMention {
@@ -334,17 +420,49 @@ export interface HNMention {
   createdAtMs: number;
 }
 
+export interface CompanyMarketProfile {
+  exchange: string;
+  industry: string;
+  marketCapMusd: number;
+  ipoDate: string;
+  logoUrl: string;
+  country: string;
+  currency: string;
+}
+
+export interface EarningsSurprise {
+  period: string;
+  actualEps: number;
+  estimateEps: number;
+  surprise: number;
+  surprisePercent: number;
+  year: number;
+  quarter: number;
+}
+
+export interface CompanyNewsMention {
+  title: string;
+  url: string;
+  source: string;
+  publishedAtMs: number;
+}
+
 export interface ListCompanySignalsRequest {
   company: string;
+  /** @deprecated */
   domain: string;
+  ticker: string;
 }
 
 export interface ListCompanySignalsResponse {
   company: string;
+  /** @deprecated */
   domain: string;
   signals: CompanySignal[];
   summary?: SignalSummary;
   discoveredAtMs: number;
+  cik: string;
+  unavailable: boolean;
 }
 
 export interface CompanySignal {
@@ -371,6 +489,57 @@ export interface SignalSummary {
   byType: Record<string, number>;
   strongestSignal?: CompanySignal;
   signalDiversity: number;
+}
+
+export interface SearchSecFilingsRequest {
+  query: string;
+  forms: string;
+  startDate: string;
+  endDate: string;
+  limit: number;
+}
+
+export interface SearchSecFilingsResponse {
+  results: SecFilingSearchResult[];
+  total: number;
+  unavailable: boolean;
+  fetchedAtMs: number;
+}
+
+export interface SecFilingSearchResult {
+  company: string;
+  cik: string;
+  form: string;
+  fileDate: string;
+  items: string[];
+  url: string;
+  accession: string;
+}
+
+export interface ListMaterialEventsRequest {
+  itemCode: string;
+  limit: number;
+}
+
+export interface ListMaterialEventsResponse {
+  events: MaterialEvent[];
+  unavailable: boolean;
+  fetchedAtMs: number;
+}
+
+export interface MaterialEvent {
+  company: string;
+  cik: string;
+  form: string;
+  accession: string;
+  filedAtMs: number;
+  items: MaterialEventItem[];
+  url: string;
+}
+
+export interface MaterialEventItem {
+  code: string;
+  description: string;
 }
 
 export interface GetCountryFactsRequest {
@@ -476,6 +645,21 @@ export interface TransmissionNode {
   logic: string;
 }
 
+export interface ListWsbTickersRequest {
+}
+
+export interface ListWsbTickersResponse {
+  tickers: WsbTicker[];
+}
+
+export interface WsbTicker {
+  symbol: string;
+  mentionCount: number;
+  totalScore: number;
+  subreddits: string[];
+  velocityScore: number;
+}
+
 export interface GetSocialVelocityRequest {
 }
 
@@ -562,6 +746,9 @@ export interface GetCountryEnergyProfileResponse {
   sprAvailable: boolean;
   jodiOilObservedMeasurements: string[];
   jodiGasObservedMeasurements: string[];
+  importShareAvailable: boolean;
+  importShareYear: number;
+  importShareSource: string;
 }
 
 export interface ComputeEnergyShockScenarioRequest {
@@ -590,7 +777,9 @@ export interface ComputeEnergyShockScenarioResponse {
   degraded: boolean;
   chokepointConfidence: string;
   liveFlowRatio?: number;
+  /** @deprecated */
   gasImpact?: GasImpact;
+  gasSensitivity?: GasSensitivity;
 }
 
 export interface ProductImpact {
@@ -621,6 +810,28 @@ export interface GasStorageBuffer {
   scope: string;
 }
 
+export interface GasSensitivity {
+  lngShareOfImports?: number;
+  lngImportsTj: number;
+  lngDisruptionTj: number;
+  totalDemandTj: number;
+  deficitPct: number;
+  dataAvailable: boolean;
+  assessment: string;
+  storage?: GasStorageObservation;
+  dataSource: string;
+  dataMonth: string;
+  modelBasis: string;
+}
+
+export interface GasStorageObservation {
+  fillPct: number;
+  gasTwh: number;
+  trend: string;
+  date: string;
+  scope: string;
+}
+
 export interface GetCountryPortActivityRequest {
   countryCode: string;
 }
@@ -641,6 +852,15 @@ export interface PortActivityEntry {
   importTankerDwt: number;
   exportTankerDwt: number;
   anomalySignal: boolean;
+}
+
+export interface GetChinaDecisionSignalsRequest {
+}
+
+export interface GetChinaDecisionSignalsResponse {
+  payloadJson: string;
+  generatedAt: string;
+  upstreamUnavailable: boolean;
 }
 
 export interface GetRegionalSnapshotRequest {
@@ -872,13 +1092,71 @@ export interface RegionalBrief {
   model: string;
 }
 
+export interface SearchIntelHistoryRequest {
+  query: string;
+  domain: string;
+  country: string;
+  from: number;
+  to: number;
+  limit: number;
+}
+
+export interface SearchIntelHistoryResponse {
+  records: IntelHistoryRecord[];
+  query: string;
+  partial: boolean;
+  upstreamUnavailable: boolean;
+}
+
+export interface IntelHistoryRecord {
+  id: string;
+  domain: string;
+  resource: string;
+  country: string;
+  category: string;
+  title: string;
+  summary: string;
+  sourceUrl: string;
+  occurredAt: number;
+  ingestedAt: number;
+  score: number;
+}
+
+export interface GetIntelTimelineRequest {
+  domain: string;
+  country: string;
+  from: number;
+  to: number;
+  limit: number;
+}
+
+export interface GetIntelTimelineResponse {
+  records: IntelHistoryRecord[];
+  partial: boolean;
+  upstreamUnavailable: boolean;
+}
+
+export interface GetSimilarEventsRequest {
+  situation: string;
+  domain: string;
+  country: string;
+  limit: number;
+}
+
+export interface GetSimilarEventsResponse {
+  records: IntelHistoryRecord[];
+  situation: string;
+  partial: boolean;
+  upstreamUnavailable: boolean;
+}
+
 export type SeverityLevel = "SEVERITY_LEVEL_UNSPECIFIED" | "SEVERITY_LEVEL_LOW" | "SEVERITY_LEVEL_MEDIUM" | "SEVERITY_LEVEL_HIGH";
 
 export type TrendDirection = "TREND_DIRECTION_UNSPECIFIED" | "TREND_DIRECTION_RISING" | "TREND_DIRECTION_STABLE" | "TREND_DIRECTION_FALLING";
 
 export type CrossSourceSignalSeverity = "CROSS_SOURCE_SIGNAL_SEVERITY_UNSPECIFIED" | "CROSS_SOURCE_SIGNAL_SEVERITY_LOW" | "CROSS_SOURCE_SIGNAL_SEVERITY_MEDIUM" | "CROSS_SOURCE_SIGNAL_SEVERITY_HIGH" | "CROSS_SOURCE_SIGNAL_SEVERITY_CRITICAL";
 
-export type CrossSourceSignalType = "CROSS_SOURCE_SIGNAL_TYPE_UNSPECIFIED" | "CROSS_SOURCE_SIGNAL_TYPE_COMPOSITE_ESCALATION" | "CROSS_SOURCE_SIGNAL_TYPE_THERMAL_SPIKE" | "CROSS_SOURCE_SIGNAL_TYPE_GPS_JAMMING" | "CROSS_SOURCE_SIGNAL_TYPE_MILITARY_FLIGHT_SURGE" | "CROSS_SOURCE_SIGNAL_TYPE_UNREST_SURGE" | "CROSS_SOURCE_SIGNAL_TYPE_OREF_ALERT_CLUSTER" | "CROSS_SOURCE_SIGNAL_TYPE_VIX_SPIKE" | "CROSS_SOURCE_SIGNAL_TYPE_COMMODITY_SHOCK" | "CROSS_SOURCE_SIGNAL_TYPE_CYBER_ESCALATION" | "CROSS_SOURCE_SIGNAL_TYPE_SHIPPING_DISRUPTION" | "CROSS_SOURCE_SIGNAL_TYPE_SANCTIONS_SURGE" | "CROSS_SOURCE_SIGNAL_TYPE_EARTHQUAKE_SIGNIFICANT" | "CROSS_SOURCE_SIGNAL_TYPE_RADIATION_ANOMALY" | "CROSS_SOURCE_SIGNAL_TYPE_INFRASTRUCTURE_OUTAGE" | "CROSS_SOURCE_SIGNAL_TYPE_WILDFIRE_ESCALATION" | "CROSS_SOURCE_SIGNAL_TYPE_DISPLACEMENT_SURGE" | "CROSS_SOURCE_SIGNAL_TYPE_FORECAST_DETERIORATION" | "CROSS_SOURCE_SIGNAL_TYPE_MARKET_STRESS" | "CROSS_SOURCE_SIGNAL_TYPE_WEATHER_EXTREME" | "CROSS_SOURCE_SIGNAL_TYPE_MEDIA_TONE_DETERIORATION" | "CROSS_SOURCE_SIGNAL_TYPE_RISK_SCORE_SPIKE";
+export type CrossSourceSignalType = "CROSS_SOURCE_SIGNAL_TYPE_UNSPECIFIED" | "CROSS_SOURCE_SIGNAL_TYPE_COMPOSITE_ESCALATION" | "CROSS_SOURCE_SIGNAL_TYPE_THERMAL_SPIKE" | "CROSS_SOURCE_SIGNAL_TYPE_GPS_JAMMING" | "CROSS_SOURCE_SIGNAL_TYPE_MILITARY_FLIGHT_SURGE" | "CROSS_SOURCE_SIGNAL_TYPE_UNREST_SURGE" | "CROSS_SOURCE_SIGNAL_TYPE_OREF_ALERT_CLUSTER" | "CROSS_SOURCE_SIGNAL_TYPE_VIX_SPIKE" | "CROSS_SOURCE_SIGNAL_TYPE_COMMODITY_SHOCK" | "CROSS_SOURCE_SIGNAL_TYPE_CYBER_ESCALATION" | "CROSS_SOURCE_SIGNAL_TYPE_SHIPPING_DISRUPTION" | "CROSS_SOURCE_SIGNAL_TYPE_SANCTIONS_SURGE" | "CROSS_SOURCE_SIGNAL_TYPE_EARTHQUAKE_SIGNIFICANT" | "CROSS_SOURCE_SIGNAL_TYPE_RADIATION_ANOMALY" | "CROSS_SOURCE_SIGNAL_TYPE_INFRASTRUCTURE_OUTAGE" | "CROSS_SOURCE_SIGNAL_TYPE_WILDFIRE_ESCALATION" | "CROSS_SOURCE_SIGNAL_TYPE_DISPLACEMENT_SURGE" | "CROSS_SOURCE_SIGNAL_TYPE_FORECAST_DETERIORATION" | "CROSS_SOURCE_SIGNAL_TYPE_MARKET_STRESS" | "CROSS_SOURCE_SIGNAL_TYPE_WEATHER_EXTREME" | "CROSS_SOURCE_SIGNAL_TYPE_MEDIA_TONE_DETERIORATION" | "CROSS_SOURCE_SIGNAL_TYPE_RISK_SCORE_SPIKE" | "CROSS_SOURCE_SIGNAL_TYPE_PHYSICAL_PREMIUM_REGIME_TRANSITION" | "CROSS_SOURCE_SIGNAL_TYPE_REGULATORY_ACTION";
 
 export type DataFreshness = "DATA_FRESHNESS_UNSPECIFIED" | "DATA_FRESHNESS_FRESH" | "DATA_FRESHNESS_STALE";
 
@@ -936,26 +1214,35 @@ export interface IntelligenceServiceHandler {
   classifyEvent(ctx: ServerContext, req: ClassifyEventRequest): Promise<ClassifyEventResponse>;
   getCountryRisk(ctx: ServerContext, req: GetCountryRiskRequest): Promise<GetCountryRiskResponse>;
   getCountryIntelBrief(ctx: ServerContext, req: GetCountryIntelBriefRequest): Promise<GetCountryIntelBriefResponse>;
+  getCountryCoverage(ctx: ServerContext, req: GetCountryCoverageRequest): Promise<GetCountryCoverageResponse>;
   searchGdeltDocuments(ctx: ServerContext, req: SearchGdeltDocumentsRequest): Promise<SearchGdeltDocumentsResponse>;
   deductSituation(ctx: ServerContext, req: DeductSituationRequest): Promise<DeductSituationResponse>;
   listSatellites(ctx: ServerContext, req: ListSatellitesRequest): Promise<ListSatellitesResponse>;
   listGpsInterference(ctx: ServerContext, req: ListGpsInterferenceRequest): Promise<ListGpsInterferenceResponse>;
   listOrefAlerts(ctx: ServerContext, req: ListOrefAlertsRequest): Promise<ListOrefAlertsResponse>;
   listTelegramFeed(ctx: ServerContext, req: ListTelegramFeedRequest): Promise<ListTelegramFeedResponse>;
+  listXFeed(ctx: ServerContext, req: ListXFeedRequest): Promise<ListXFeedResponse>;
   getCompanyEnrichment(ctx: ServerContext, req: GetCompanyEnrichmentRequest): Promise<GetCompanyEnrichmentResponse>;
   listCompanySignals(ctx: ServerContext, req: ListCompanySignalsRequest): Promise<ListCompanySignalsResponse>;
+  searchSecFilings(ctx: ServerContext, req: SearchSecFilingsRequest): Promise<SearchSecFilingsResponse>;
+  listMaterialEvents(ctx: ServerContext, req: ListMaterialEventsRequest): Promise<ListMaterialEventsResponse>;
   getCountryFacts(ctx: ServerContext, req: GetCountryFactsRequest): Promise<GetCountryFactsResponse>;
   listSecurityAdvisories(ctx: ServerContext, req: ListSecurityAdvisoriesRequest): Promise<ListSecurityAdvisoriesResponse>;
   getGdeltTopicTimeline(ctx: ServerContext, req: GetGdeltTopicTimelineRequest): Promise<GetGdeltTopicTimelineResponse>;
   listCrossSourceSignals(ctx: ServerContext, req: ListCrossSourceSignalsRequest): Promise<ListCrossSourceSignalsResponse>;
   listMarketImplications(ctx: ServerContext, req: ListMarketImplicationsRequest): Promise<ListMarketImplicationsResponse>;
+  listWsbTickers(ctx: ServerContext, req: ListWsbTickersRequest): Promise<ListWsbTickersResponse>;
   getSocialVelocity(ctx: ServerContext, req: GetSocialVelocityRequest): Promise<GetSocialVelocityResponse>;
   getCountryEnergyProfile(ctx: ServerContext, req: GetCountryEnergyProfileRequest): Promise<GetCountryEnergyProfileResponse>;
   computeEnergyShockScenario(ctx: ServerContext, req: ComputeEnergyShockScenarioRequest): Promise<ComputeEnergyShockScenarioResponse>;
   getCountryPortActivity(ctx: ServerContext, req: GetCountryPortActivityRequest): Promise<CountryPortActivityResponse>;
+  getChinaDecisionSignals(ctx: ServerContext, req: GetChinaDecisionSignalsRequest): Promise<GetChinaDecisionSignalsResponse>;
   getRegionalSnapshot(ctx: ServerContext, req: GetRegionalSnapshotRequest): Promise<GetRegionalSnapshotResponse>;
   getRegimeHistory(ctx: ServerContext, req: GetRegimeHistoryRequest): Promise<GetRegimeHistoryResponse>;
   getRegionalBrief(ctx: ServerContext, req: GetRegionalBriefRequest): Promise<GetRegionalBriefResponse>;
+  searchIntelHistory(ctx: ServerContext, req: SearchIntelHistoryRequest): Promise<SearchIntelHistoryResponse>;
+  getIntelTimeline(ctx: ServerContext, req: GetIntelTimelineRequest): Promise<GetIntelTimelineResponse>;
+  getSimilarEvents(ctx: ServerContext, req: GetSimilarEventsRequest): Promise<GetSimilarEventsResponse>;
 }
 
 export function createIntelligenceServiceRoutes(
@@ -1181,6 +1468,55 @@ export function createIntelligenceServiceRoutes(
 
           const result = await handler.getCountryIntelBrief(ctx, body);
           return new Response(JSON.stringify(result as GetCountryIntelBriefResponse), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch (err: unknown) {
+          if (err instanceof ValidationError) {
+            return new Response(JSON.stringify({ violations: err.violations }), {
+              status: 400,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          if (options?.onError) {
+            return options.onError(err, req);
+          }
+          const message = err instanceof Error ? err.message : String(err);
+          return new Response(JSON.stringify({ message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      },
+    },
+    {
+      method: "GET",
+      path: "/api/intelligence/v1/get-country-coverage",
+      handler: async (req: Request): Promise<Response> => {
+        try {
+          const pathParams: Record<string, string> = {};
+          const url = new URL(req.url, "http://localhost");
+          const params = url.searchParams;
+          const body: GetCountryCoverageRequest = {
+            countryCode: params.get("country_code") ?? "",
+            windowHours: Number(params.get("window_hours") ?? "0"),
+            limit: Number(params.get("limit") ?? "0"),
+          };
+          if (options?.validateRequest) {
+            const bodyViolations = options.validateRequest("getCountryCoverage", body);
+            if (bodyViolations) {
+              throw new ValidationError(bodyViolations);
+            }
+          }
+
+          const ctx: ServerContext = {
+            request: req,
+            pathParams,
+            headers: Object.fromEntries(req.headers.entries()),
+          };
+
+          const result = await handler.getCountryCoverage(ctx, body);
+          return new Response(JSON.stringify(result as GetCountryCoverageResponse), {
             status: 200,
             headers: { "Content-Type": "application/json" },
           });
@@ -1488,6 +1824,55 @@ export function createIntelligenceServiceRoutes(
     },
     {
       method: "GET",
+      path: "/api/intelligence/v1/list-x-feed",
+      handler: async (req: Request): Promise<Response> => {
+        try {
+          const pathParams: Record<string, string> = {};
+          const url = new URL(req.url, "http://localhost");
+          const params = url.searchParams;
+          const body: ListXFeedRequest = {
+            limit: Number(params.get("limit") ?? "0"),
+            topic: params.get("topic") ?? "",
+            account: params.get("account") ?? "",
+          };
+          if (options?.validateRequest) {
+            const bodyViolations = options.validateRequest("listXFeed", body);
+            if (bodyViolations) {
+              throw new ValidationError(bodyViolations);
+            }
+          }
+
+          const ctx: ServerContext = {
+            request: req,
+            pathParams,
+            headers: Object.fromEntries(req.headers.entries()),
+          };
+
+          const result = await handler.listXFeed(ctx, body);
+          return new Response(JSON.stringify(result as ListXFeedResponse), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch (err: unknown) {
+          if (err instanceof ValidationError) {
+            return new Response(JSON.stringify({ violations: err.violations }), {
+              status: 400,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          if (options?.onError) {
+            return options.onError(err, req);
+          }
+          const message = err instanceof Error ? err.message : String(err);
+          return new Response(JSON.stringify({ message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      },
+    },
+    {
+      method: "GET",
       path: "/api/intelligence/v1/get-company-enrichment",
       handler: async (req: Request): Promise<Response> => {
         try {
@@ -1497,6 +1882,7 @@ export function createIntelligenceServiceRoutes(
           const body: GetCompanyEnrichmentRequest = {
             domain: params.get("domain") ?? "",
             name: params.get("name") ?? "",
+            ticker: params.get("ticker") ?? "",
           };
           if (options?.validateRequest) {
             const bodyViolations = options.validateRequest("getCompanyEnrichment", body);
@@ -1545,6 +1931,7 @@ export function createIntelligenceServiceRoutes(
           const body: ListCompanySignalsRequest = {
             company: params.get("company") ?? "",
             domain: params.get("domain") ?? "",
+            ticker: params.get("ticker") ?? "",
           };
           if (options?.validateRequest) {
             const bodyViolations = options.validateRequest("listCompanySignals", body);
@@ -1561,6 +1948,105 @@ export function createIntelligenceServiceRoutes(
 
           const result = await handler.listCompanySignals(ctx, body);
           return new Response(JSON.stringify(result as ListCompanySignalsResponse), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch (err: unknown) {
+          if (err instanceof ValidationError) {
+            return new Response(JSON.stringify({ violations: err.violations }), {
+              status: 400,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          if (options?.onError) {
+            return options.onError(err, req);
+          }
+          const message = err instanceof Error ? err.message : String(err);
+          return new Response(JSON.stringify({ message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      },
+    },
+    {
+      method: "GET",
+      path: "/api/intelligence/v1/search-sec-filings",
+      handler: async (req: Request): Promise<Response> => {
+        try {
+          const pathParams: Record<string, string> = {};
+          const url = new URL(req.url, "http://localhost");
+          const params = url.searchParams;
+          const body: SearchSecFilingsRequest = {
+            query: params.get("query") ?? "",
+            forms: params.get("forms") ?? "",
+            startDate: params.get("start_date") ?? "",
+            endDate: params.get("end_date") ?? "",
+            limit: Number(params.get("limit") ?? "0"),
+          };
+          if (options?.validateRequest) {
+            const bodyViolations = options.validateRequest("searchSecFilings", body);
+            if (bodyViolations) {
+              throw new ValidationError(bodyViolations);
+            }
+          }
+
+          const ctx: ServerContext = {
+            request: req,
+            pathParams,
+            headers: Object.fromEntries(req.headers.entries()),
+          };
+
+          const result = await handler.searchSecFilings(ctx, body);
+          return new Response(JSON.stringify(result as SearchSecFilingsResponse), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch (err: unknown) {
+          if (err instanceof ValidationError) {
+            return new Response(JSON.stringify({ violations: err.violations }), {
+              status: 400,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          if (options?.onError) {
+            return options.onError(err, req);
+          }
+          const message = err instanceof Error ? err.message : String(err);
+          return new Response(JSON.stringify({ message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      },
+    },
+    {
+      method: "GET",
+      path: "/api/intelligence/v1/list-material-events",
+      handler: async (req: Request): Promise<Response> => {
+        try {
+          const pathParams: Record<string, string> = {};
+          const url = new URL(req.url, "http://localhost");
+          const params = url.searchParams;
+          const body: ListMaterialEventsRequest = {
+            itemCode: params.get("item_code") ?? "",
+            limit: Number(params.get("limit") ?? "0"),
+          };
+          if (options?.validateRequest) {
+            const bodyViolations = options.validateRequest("listMaterialEvents", body);
+            if (bodyViolations) {
+              throw new ValidationError(bodyViolations);
+            }
+          }
+
+          const ctx: ServerContext = {
+            request: req,
+            pathParams,
+            headers: Object.fromEntries(req.headers.entries()),
+          };
+
+          const result = await handler.listMaterialEvents(ctx, body);
+          return new Response(JSON.stringify(result as ListMaterialEventsResponse), {
             status: 200,
             headers: { "Content-Type": "application/json" },
           });
@@ -1799,6 +2285,43 @@ export function createIntelligenceServiceRoutes(
     },
     {
       method: "GET",
+      path: "/api/intelligence/v1/list-wsb-tickers",
+      handler: async (req: Request): Promise<Response> => {
+        try {
+          const pathParams: Record<string, string> = {};
+          const body = {} as ListWsbTickersRequest;
+
+          const ctx: ServerContext = {
+            request: req,
+            pathParams,
+            headers: Object.fromEntries(req.headers.entries()),
+          };
+
+          const result = await handler.listWsbTickers(ctx, body);
+          return new Response(JSON.stringify(result as ListWsbTickersResponse), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch (err: unknown) {
+          if (err instanceof ValidationError) {
+            return new Response(JSON.stringify({ violations: err.violations }), {
+              status: 400,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          if (options?.onError) {
+            return options.onError(err, req);
+          }
+          const message = err instanceof Error ? err.message : String(err);
+          return new Response(JSON.stringify({ message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      },
+    },
+    {
+      method: "GET",
       path: "/api/intelligence/v1/get-social-velocity",
       handler: async (req: Request): Promise<Response> => {
         try {
@@ -1980,6 +2503,43 @@ export function createIntelligenceServiceRoutes(
     },
     {
       method: "GET",
+      path: "/api/intelligence/v1/get-china-decision-signals",
+      handler: async (req: Request): Promise<Response> => {
+        try {
+          const pathParams: Record<string, string> = {};
+          const body = {} as GetChinaDecisionSignalsRequest;
+
+          const ctx: ServerContext = {
+            request: req,
+            pathParams,
+            headers: Object.fromEntries(req.headers.entries()),
+          };
+
+          const result = await handler.getChinaDecisionSignals(ctx, body);
+          return new Response(JSON.stringify(result as GetChinaDecisionSignalsResponse), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch (err: unknown) {
+          if (err instanceof ValidationError) {
+            return new Response(JSON.stringify({ violations: err.violations }), {
+              status: 400,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          if (options?.onError) {
+            return options.onError(err, req);
+          }
+          const message = err instanceof Error ? err.message : String(err);
+          return new Response(JSON.stringify({ message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      },
+    },
+    {
+      method: "GET",
       path: "/api/intelligence/v1/get-regional-snapshot",
       handler: async (req: Request): Promise<Response> => {
         try {
@@ -2099,6 +2659,143 @@ export function createIntelligenceServiceRoutes(
 
           const result = await handler.getRegionalBrief(ctx, body);
           return new Response(JSON.stringify(result as GetRegionalBriefResponse), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch (err: unknown) {
+          if (err instanceof ValidationError) {
+            return new Response(JSON.stringify({ violations: err.violations }), {
+              status: 400,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          if (options?.onError) {
+            return options.onError(err, req);
+          }
+          const message = err instanceof Error ? err.message : String(err);
+          return new Response(JSON.stringify({ message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      },
+    },
+    {
+      method: "POST",
+      path: "/api/intelligence/v1/search-intel-history",
+      handler: async (req: Request): Promise<Response> => {
+        try {
+          const pathParams: Record<string, string> = {};
+          const body = await req.json() as SearchIntelHistoryRequest;
+          if (options?.validateRequest) {
+            const bodyViolations = options.validateRequest("searchIntelHistory", body);
+            if (bodyViolations) {
+              throw new ValidationError(bodyViolations);
+            }
+          }
+
+          const ctx: ServerContext = {
+            request: req,
+            pathParams,
+            headers: Object.fromEntries(req.headers.entries()),
+          };
+
+          const result = await handler.searchIntelHistory(ctx, body);
+          return new Response(JSON.stringify(result as SearchIntelHistoryResponse), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch (err: unknown) {
+          if (err instanceof ValidationError) {
+            return new Response(JSON.stringify({ violations: err.violations }), {
+              status: 400,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          if (options?.onError) {
+            return options.onError(err, req);
+          }
+          const message = err instanceof Error ? err.message : String(err);
+          return new Response(JSON.stringify({ message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      },
+    },
+    {
+      method: "GET",
+      path: "/api/intelligence/v1/get-intel-timeline",
+      handler: async (req: Request): Promise<Response> => {
+        try {
+          const pathParams: Record<string, string> = {};
+          const url = new URL(req.url, "http://localhost");
+          const params = url.searchParams;
+          const body: GetIntelTimelineRequest = {
+            domain: params.get("domain") ?? "",
+            country: params.get("country") ?? "",
+            from: Number(params.get("from") ?? "0"),
+            to: Number(params.get("to") ?? "0"),
+            limit: Number(params.get("limit") ?? "0"),
+          };
+          if (options?.validateRequest) {
+            const bodyViolations = options.validateRequest("getIntelTimeline", body);
+            if (bodyViolations) {
+              throw new ValidationError(bodyViolations);
+            }
+          }
+
+          const ctx: ServerContext = {
+            request: req,
+            pathParams,
+            headers: Object.fromEntries(req.headers.entries()),
+          };
+
+          const result = await handler.getIntelTimeline(ctx, body);
+          return new Response(JSON.stringify(result as GetIntelTimelineResponse), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch (err: unknown) {
+          if (err instanceof ValidationError) {
+            return new Response(JSON.stringify({ violations: err.violations }), {
+              status: 400,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          if (options?.onError) {
+            return options.onError(err, req);
+          }
+          const message = err instanceof Error ? err.message : String(err);
+          return new Response(JSON.stringify({ message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      },
+    },
+    {
+      method: "POST",
+      path: "/api/intelligence/v1/get-similar-events",
+      handler: async (req: Request): Promise<Response> => {
+        try {
+          const pathParams: Record<string, string> = {};
+          const body = await req.json() as GetSimilarEventsRequest;
+          if (options?.validateRequest) {
+            const bodyViolations = options.validateRequest("getSimilarEvents", body);
+            if (bodyViolations) {
+              throw new ValidationError(bodyViolations);
+            }
+          }
+
+          const ctx: ServerContext = {
+            request: req,
+            pathParams,
+            headers: Object.fromEntries(req.headers.entries()),
+          };
+
+          const result = await handler.getSimilarEvents(ctx, body);
+          return new Response(JSON.stringify(result as GetSimilarEventsResponse), {
             status: 200,
             headers: { "Content-Type": "application/json" },
           });

@@ -16,6 +16,10 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
+import Anthropic from '@anthropic-ai/sdk';
+import widgetResponseParser from '../scripts/_widget-response-parser.cjs';
+
+const { parseWidgetAgentResponse } = widgetResponseParser;
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, '..');
@@ -23,6 +27,434 @@ const root = resolve(__dirname, '..');
 function src(relPath) {
   return readFileSync(resolve(root, relPath), 'utf-8');
 }
+
+// Execute the production handler without the relay's unconditional server startup.
+// Only the SDK import is substituted; requests, tool results and SSE use real code.
+async function runWidgetAgent(responses, { tier = 'basic', failFetch = false, failSearch = false, sdkTransport = false, expireDuringFetch = false } = {}) {
+  const relay = src('scripts/ais-relay.cjs');
+  const extract = name => {
+    const match = relay.match(new RegExp(`(?:async )?function ${name}\\([^]*?\\n\\}`));
+    assert.ok(match, `Missing relay function ${name}`);
+    return match[0];
+  };
+  const requests = [], effects = [], logs = [], frames = [];
+  let ended = 0;
+  let expire;
+  const nextResponse = request => {
+    requests.push(structuredClone(request));
+    const response = responses[requests.length - 1];
+    assert.ok(response, 'Unexpected extra model request');
+    if (response instanceof Error) throw response;
+    return structuredClone(response);
+  };
+  const context = {
+    URL, AbortSignal, clearTimeout, parseWidgetAgentResponse,
+    setTimeout: (callback, ms) => { expire = callback; return setTimeout(callback, ms); },
+    console: { error: (...args) => logs.push(args) },
+    requireWidgetAgentAccess: () => ({ anthropicConfigured: true, admittedAs: tier }),
+    readRequestBody: async () => JSON.stringify({ prompt: 'Show earthquake data', tier }),
+    checkProWidgetRateLimit: () => false, checkWidgetRateLimit: () => false,
+    isWidgetInjectionAttempt: () => false,
+    PRO_WIDGET_KEY: 'test', WIDGET_ANTHROPIC_KEY: 'test',
+    WIDGET_PRO_MAX_HTML: 100000, WIDGET_MAX_HTML: 50000,
+    WIDGET_PRO_SYSTEM_PROMPT: 'test', WIDGET_SYSTEM_PROMPT: 'test',
+    isWidgetEndpointAllowed: endpoint => endpoint === '/api/test',
+    performWidgetWebSearch: async query => {
+      effects.push(`search:${query}`);
+      if (failSearch) throw new Error('Search fixture failure');
+      return { results: [{ title: 'Fixture' }] };
+    },
+    fetch: async url => {
+      effects.push(url);
+      if (expireDuringFetch) expire();
+      if (failFetch) throw new Error('Fetch fixture failure');
+      return { text: async () => '{"value":42}' };
+    },
+    importAnthropic: async () => ({ default: sdkTransport ? class extends Anthropic {
+      constructor(options) {
+        super({ ...options, maxRetries: 0, fetch: async (_url, init) => {
+          const request = JSON.parse(init.body);
+          // The SDK serializes requests but does not enforce provider validation.
+          // A tool exchange in history must retain its tool definitions.
+          const hasToolHistory = request.messages.some(m => Array.isArray(m.content)
+            && m.content.some(b => b.type === 'tool_use' || b.type === 'tool_result'));
+          if (hasToolHistory && !request.tools?.length) {
+            requests.push(request);
+            return new Response(JSON.stringify({ type: 'error', error: {
+              type: 'invalid_request_error', message: 'Tools must be defined when including tool_use or tool_result blocks.',
+            } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+          }
+          return new Response(JSON.stringify({
+            id: 'msg_fixture', type: 'message', role: 'assistant', model: 'fixture',
+            usage: { input_tokens: 1, output_tokens: 1 }, stop_sequence: null,
+            ...nextResponse(request),
+          }), { headers: { 'Content-Type': 'application/json' } });
+        } });
+      }
+    } : class {
+      messages = { create: async request => {
+        return nextResponse(request);
+      } };
+    } }),
+  };
+  // Include production constants when present, so tests also run against the old loop.
+  const limit = relay.match(/const WIDGET_MAX_TOOL_CALLS = \d+;/)?.[0] ?? '';
+  const toolDefinitions = ['WIDGET_FETCH_TOOL', 'WIDGET_SEARCH_TOOL'].map(name => {
+    const match = relay.match(new RegExp(`const ${name} = \\{[^]*?\\n\\};`));
+    assert.ok(match, `Missing ${name}`);
+    return match[0];
+  }).join('\n');
+  const handler = extract('handleWidgetAgentRequest').replace("import('@anthropic-ai/sdk')", 'importAnthropic()');
+  const run = vm.runInNewContext(`${limit}\n${toolDefinitions}\n${extract('sendWidgetSSE')}\n${extract('sanitizeToolContent')}\n${extract('classifyWidgetAgentError')}\n${handler}\nhandleWidgetAgentRequest`, context);
+  const res = {
+    writableEnded: false, writeHead() {},
+    write(frame) { frames.push(frame); },
+    end() { ended++; this.writableEnded = true; },
+  };
+  await run({ headers: {}, on() {}, socket: {} }, res);
+  const events = frames.map(frame => JSON.parse(frame.match(/data: (.*)/)[1]));
+  return { requests, effects, logs, events, ended };
+}
+
+const widgetText = '<!-- title: Quakes --><!-- widget-html --><div>42</div><!-- /widget-html -->';
+const widgetResponse = (stop_reason, content = [{ type: 'text', text: widgetText }]) => ({ stop_reason, content });
+const widgetTool = (id, name = 'fetch_worldmonitor_data', input = { endpoint: '/api/test' }) => ({ type: 'tool_use', id, name, input });
+const toolResultsFor = request => request.messages.flatMap(m => Array.isArray(m.content) ? m.content.filter(b => b.type === 'tool_result') : []);
+function assertWidgetSuccess(result) {
+  assert.deepEqual(result.events.filter(e => ['html_complete', 'done', 'error'].includes(e.type)).map(e => e.type), ['html_complete', 'done']);
+  assert.equal(result.ended, 1);
+}
+function assertWidgetError(result, pattern) {
+  const terminal = result.events.filter(e => ['html_complete', 'done', 'error'].includes(e.type));
+  assert.equal(terminal.length, 1);
+  assert.equal(terminal[0].type, 'error');
+  assert.match(terminal[0].message, pattern);
+  assert.equal(result.ended, 1);
+}
+
+describe('widget-agent relay — runtime tool budget and finalization', () => {
+  it('executes only three of four calls in one response and returns every tool result', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('tool_use', [1, 2, 3, 4].map(n => widgetTool(String(n)))), widgetResponse('end_turn'),
+    ]);
+    assert.equal(result.effects.length, 3);
+    const results = toolResultsFor(result.requests[1]);
+    assert.deepEqual(results.map(r => r.tool_use_id), ['1', '2', '3', '4']);
+    assert.equal(results[3].is_error, true);
+    assert.match(results[3].content, /budget.*exhausted/i);
+    assert.equal(result.requests[1].tool_choice.type, 'none');
+    assertWidgetSuccess(result);
+  });
+
+  it('shares the budget across responses and both tools', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('tool_use', [widgetTool('1'), widgetTool('2', 'search_web', { query: 'quakes' })]),
+      widgetResponse('tool_use', [widgetTool('3', 'search_web', { query: 'today' }), widgetTool('4')]),
+      widgetResponse('end_turn'),
+    ]);
+    assert.equal(result.effects.length, 3);
+    assert.equal(result.effects.filter(e => e.startsWith('search:')).length, 2);
+    assert.equal(toolResultsFor(result.requests[2]).at(-1).is_error, true);
+    assertWidgetSuccess(result);
+  });
+
+  it('counts rejected, failed and unknown attempts without allowing extra probing', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('tool_use', [widgetTool('1', 'fetch_worldmonitor_data', { endpoint: '/blocked' }), widgetTool('2'), widgetTool('3', 'search_web', { query: 'fail' }), widgetTool('4', 'unknown'), widgetTool('5')]),
+      widgetResponse('end_turn'),
+    ], { failFetch: true, failSearch: true });
+    assert.equal(result.effects.length, 2);
+    const results = toolResultsFor(result.requests[1]);
+    assert.equal(results.length, 5);
+    assert.ok(results.every(r => r.is_error === true));
+    assertWidgetSuccess(result);
+  });
+
+  it('returns an error result for unknown tools and counts their attempts', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('tool_use', [widgetTool('1', 'unknown'), widgetTool('2'), widgetTool('3'), widgetTool('4')]), widgetResponse('end_turn'),
+    ]);
+    assert.equal(result.effects.length, 2);
+    assert.match(toolResultsFor(result.requests[1])[0].content, /unknown tool/i);
+    assertWidgetSuccess(result);
+  });
+
+  for (const tier of ['basic', 'pro']) {
+    const maxTurns = tier === 'pro' ? 10 : 6;
+    it(`${tier}: penultimate truncation preserves partial output and never restores tools`, async () => {
+      const partial = [{ type: 'text', text: '<!-- widget-html --><div>partial' }];
+      const result = await runWidgetAgent([
+        ...Array.from({ length: maxTurns - 2 }, () => widgetResponse('pause_turn')),
+        widgetResponse('max_tokens', partial), widgetResponse('end_turn'),
+      ], { tier });
+      assert.deepEqual(result.requests.slice(-2).map(r => r.tool_choice.type), ['none', 'none']);
+      assert.ok(result.requests.at(-1).messages.some(m => m.role === 'assistant' && Array.isArray(m.content) && m.content[0]?.text === partial[0].text));
+      assertWidgetSuccess(result);
+    });
+    it(`${tier}: pause_turn stays bounded and exhaustion cannot recover old history as success`, async () => {
+      const result = await runWidgetAgent(Array.from({ length: maxTurns }, () => widgetResponse('pause_turn')), { tier });
+      assert.equal(result.requests.length, maxTurns);
+      assert.ok(result.requests.slice(1).every(r => r.tool_choice.type === 'none'));
+      assertWidgetError(result, /exhausted/i);
+    });
+  }
+
+  it('does not execute tool requests after entering finalization', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('pause_turn'), widgetResponse('tool_use', [widgetTool('1')]), widgetResponse('end_turn'),
+    ]);
+    assert.equal(result.effects.length, 0);
+    assert.ok(result.requests.slice(1).every(r => r.tool_choice.type === 'none'));
+    assert.equal(toolResultsFor(result.requests[2])[0].is_error, true);
+    assertWidgetSuccess(result);
+  });
+
+  it('rejects a second truncation with one terminal error', async () => {
+    const result = await runWidgetAgent([widgetResponse('max_tokens'), widgetResponse('max_tokens')]);
+    assert.equal(result.requests.length, 2);
+    assertWidgetError(result, /truncat|token limit/i);
+  });
+
+  it('returns errors for truncated tool blocks without executing them', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('max_tokens', [widgetTool('partial', 'fetch_worldmonitor_data', {})]), widgetResponse('end_turn'),
+    ]);
+    assert.equal(result.effects.length, 0);
+    assert.equal(toolResultsFor(result.requests[1])[0].is_error, true);
+    assertWidgetSuccess(result);
+  });
+
+  it('malformed input still consumes an attempt and receives a result', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('tool_use', [widgetTool('1', 'search_web', null), widgetTool('2'), widgetTool('3'), widgetTool('4')]), widgetResponse('end_turn'),
+    ]);
+    assert.equal(result.effects.length, 2);
+    const results = toolResultsFor(result.requests[1]);
+    assert.equal(results.length, 4);
+    assert.equal(results[0].is_error, true);
+    assert.equal(results[3].is_error, true);
+    assertWidgetSuccess(result);
+  });
+
+  it('invalid search query cannot interrupt results for later tool blocks', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('tool_use', [widgetTool('1', 'search_web', { query: { toString: 'invalid' } }), widgetTool('2')]), widgetResponse('end_turn'),
+    ]);
+    assert.equal(result.effects.length, 1);
+    assert.equal(toolResultsFor(result.requests[1]).length, 2);
+    assert.equal(toolResultsFor(result.requests[1])[0].is_error, true);
+    assertWidgetSuccess(result);
+  });
+
+  it('rejects a tool_use stop without any tool blocks', async () => {
+    const result = await runWidgetAgent([widgetResponse('tool_use', [])]);
+    assert.equal(result.requests.length, 1);
+    assertWidgetError(result, /incomplete.*tool/i);
+  });
+
+  it('records requested and executed counts without logging SDK response bodies or secrets', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('tool_use', [1, 2, 3, 4].map(n => widgetTool(String(n)))),
+      new Error('private prompt and sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'),
+    ]);
+    const log = JSON.parse(result.logs.find(args => args[0] === '[widget-agent] Error:')[1]);
+    assert.equal(log.toolCallCount, 4);
+    assert.equal(log.toolExecutionCount, 3);
+    assert.doesNotMatch(JSON.stringify(result.logs), /private prompt|sk-ant-api03/);
+    assertWidgetError(result, /private prompt/);
+  });
+
+  it('stops side effects at the deadline and emits exactly one terminal error', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('tool_use', [widgetTool('1'), widgetTool('2')]),
+    ], { expireDuringFetch: true });
+    assert.equal(result.effects.length, 1);
+    assert.equal(result.requests.length, 1);
+    assertWidgetError(result, /timeout/i);
+  });
+
+  it('serializes the capped tool exchange and finalization through the installed SDK', async () => {
+    const result = await runWidgetAgent([
+      widgetResponse('tool_use', [1, 2, 3, 4].map(n => widgetTool(String(n)))), widgetResponse('end_turn'),
+    ], { sdkTransport: true });
+    assertWidgetSuccess(result);
+    assert.equal(result.effects.length, 3);
+    assert.equal(result.requests[1].tool_choice?.type, 'none');
+    assert.deepEqual(result.requests[1].tools, result.requests[0].tools);
+    assert.ok(result.requests[1].tools.every(tool => tool.input_schema?.type === 'object'));
+    assert.equal(toolResultsFor(result.requests[1]).length, 4);
+    assert.equal(toolResultsFor(result.requests[1])[3].is_error, true);
+  });
+
+  for (const reason of ['refusal', 'stop_sequence', null, 'unexpected']) {
+    it(`terminates explicitly on ${reason}`, async () => {
+      const result = await runWidgetAgent([widgetResponse(reason)]);
+      assert.equal(result.requests.length, 1);
+      assertWidgetError(result, /refus|stop|incomplete/i);
+    });
+  }
+  for (const calls of [[], [widgetTool('1')]]) {
+    it(`preserves successful ${calls.length}-call generation`, async () => {
+      const result = await runWidgetAgent([...(calls.length ? [widgetResponse('tool_use', calls)] : []), widgetResponse('end_turn')]);
+      assertWidgetSuccess(result);
+      assert.equal(result.effects.length, calls.length);
+      assert.equal(result.events.find(e => e.type === 'html_complete').html, '<div>42</div>');
+    });
+  }
+});
+
+describe('widget data-tool contracts', () => {
+  const relay = src('scripts/ais-relay.cjs');
+  function constant(name) {
+    const match = relay.match(new RegExp('^const ' + name + ' = (`[\\s\\S]*?`|\\{[\\s\\S]*?^\\});$', 'm'));
+    assert.ok(match, `${name} must exist`);
+    return vm.runInNewContext(`(${match[1]})`);
+  }
+  const fetchTool = constant('WIDGET_FETCH_TOOL');
+  const searchTool = constant('WIDGET_SEARCH_TOOL');
+  const prompts = [constant('WIDGET_SYSTEM_PROMPT'), constant('WIDGET_PRO_SYSTEM_PROMPT')];
+
+  it('describes catalog paths, query strings, seeded history, and response text', () => {
+    const description = fetchTool.description;
+    for (const term of ['/api/bootstrap', '/api/<service>/v1/<method>', 'GET', 'params', 'string',
+      'data', 'missing', 'RPC', 'historical', 'FRED', 'sanitized', '20,000']) {
+      assert.ok(description.includes(term), `fetch contract must explain ${term}`);
+    }
+    assert.match(description, /catalog/i);
+    assert.match(fetchTool.input_schema.properties.endpoint.description, /path.*not.*URL/i);
+    assert.equal(fetchTool.input_schema.properties.params.additionalProperties.type, 'string');
+    assert.match(description, /Endpoint not allowed\./);
+    assert.match(description, /HTML.*error/i);
+    assert.match(description, /Fetch failed:/);
+    assert.match(description, /credentials.*not.*send/);
+    assert.match(description, /authorization error.*text/);
+    assert.doesNotMatch(description, /only pre-approved|allowlist/i);
+    assert.doesNotMatch([...prompts, description, searchTool.description].join('\n'),
+      /list_bootstrap_keys|(?:no|cannot return|lacks) historical series/i);
+  });
+
+  it('describes the model-visible search array without promising uniform freshness', () => {
+    assert.match(searchTool.description, /8/);
+    assert.match(searchTool.description, /array/);
+    for (const field of ['title', 'url', 'snippet', 'publishedDate']) {
+      assert.ok(searchTool.description.includes(field), `search contract must name ${field}`);
+    }
+    assert.match(searchTool.description, /snippets/);
+    assert.match(searchTool.description, /freshness.*var/i);
+    assert.match(searchTool.description, /publishedDate.*empty/i);
+  });
+
+  // Fixed routing expectations for static contract review, not simulated model choices.
+  const routingCases = [
+    ['Show dashboard stock market quotes', 'marketQuotes'],
+    ['Chart the historical FRED unemployment series UNRATE', 'get-fred-series'],
+    ['Show dashboard weather alerts', 'weatherAlerts'],
+    ['Show tomorrow\'s hourly local weather forecast for Dubai Marina', null, /local weather forecast/i],
+    ['Show the WorldMonitor news feed digest', 'list-feed-digest'],
+    ['Build a breaking-news widget for a local power outage in Dubai Marina that is not yet in WorldMonitor news feeds', null, /breaking event.*not.*feeds/i],
+    ['Show the current UAE retail price of Sony WH-1000XM6 headphones, which is not in the WorldMonitor catalog', null, /price.*not.*catalog/i],
+  ];
+  for (const [request, capability, gapExample] of routingCases) {
+    it(`routing contract: ${request}`, () => {
+      for (const prompt of prompts) {
+        assert.match(prompt, /fetch_worldmonitor_data — ALWAYS use first/);
+        assert.match(prompt, /Only fall back to search_web if no bootstrap key or RPC matches/);
+        if (capability) assert.ok(prompt.includes(capability), `catalog must cover ${capability}`);
+      }
+      assert.match(searchTool.description, /only when no.*bootstrap key or RPC.*supplies/i);
+      if (capability) {
+        assert.match(fetchTool.description, /Prefer.*bootstrap.*RPC/s);
+      } else {
+        assert.match(searchTool.description, gapExample);
+      }
+    });
+  }
+
+  it('keeps the basic and Pro data-embedding contracts distinct', () => {
+    assert.match(prompts[0], /Embed this data directly into the widget HTML/);
+    assert.match(prompts[0], /display-only HTML\. No <script>/);
+    assert.match(prompts[1], /Embed as const DATA = \[\.\.\.\] in your inline script/);
+    assert.match(prompts[1], /Inline <script> tags are allowed/);
+  });
+
+  async function toolResult(block, fetch) {
+    // Execute the real dispatch and result insertion without starting the relay server.
+    const start = relay.indexOf('        const toolResults = [];', relay.indexOf('async function handleWidgetAgentRequest'));
+    const resultInsertion = "        messages.push({ role: 'user', content: toolResults });";
+    const resultStart = relay.indexOf(resultInsertion, start);
+    assert.ok(start > 0 && resultStart > start);
+    const end = resultStart + resultInsertion.length;
+    const helpers = relay.slice(relay.indexOf('function sanitizeToolContent('), relay.indexOf('const WIDGET_FETCH_TOOL'));
+    const context = vm.createContext({
+      URL, AbortSignal, fetch, response: { stop_reason: 'tool_use', content: [block] }, messages: [], res: {},
+      cancelled: false, finalizing: false, toolCallCount: 0, toolExecutionCount: 0,
+      WIDGET_MAX_TOOL_CALLS: 3,
+      sendWidgetSSE() {}, WIDGET_EXA_KEY: 'fixture', WIDGET_BRAVE_KEY: 'fixture', console,
+    });
+    const searchStart = relay.indexOf('async function performWidgetWebSearch(');
+    const searchEnd = relay.indexOf('const WIDGET_RATE_LIMIT', searchStart);
+    vm.runInContext(helpers + relay.slice(searchStart, searchEnd), context);
+    await vm.runInContext(`(async () => { ${relay.slice(start, end)} })()`, context);
+    return context.messages.at(-1).content[0].content;
+  }
+  const fetchBlock = (endpoint, params = {}) => ({ type: 'tool_use', id: 'fixture', name: fetchTool.name, input: { endpoint, params } });
+
+  it('returns bootstrap response text and sends params as GET query strings', async () => {
+    const body = JSON.stringify({ data: { marketQuotes: [{ symbol: 'SPY', price: 600 }] }, missing: ['cryptoQuotes'] });
+    const result = await toolResult(fetchBlock('/api/bootstrap', { keys: 'marketQuotes,cryptoQuotes' }), async (url, init) => {
+      assert.equal(url, 'https://api.worldmonitor.app/api/bootstrap?keys=marketQuotes%2CcryptoQuotes');
+      assert.equal(init.method ?? 'GET', 'GET');
+      return { text: async () => body };
+    });
+    assert.equal(result, body);
+  });
+
+  it('preserves RPC historical observations and non-HTML HTTP error bodies', async () => {
+    for (const [body, status] of [
+      ['{"series":{"observations":[{"date":"2020-01-01","value":3.6}]}}', 200],
+      ['{"error":"unauthorized"}', 401],
+    ]) {
+      const result = await toolResult(fetchBlock('/api/economic/v1/get-fred-series', { series_id: 'UNRATE' }), async () => new Response(body, { status }));
+      assert.equal(result, body);
+    }
+  });
+
+  it('returns local rejection, HTML-page and network-failure text', async () => {
+    assert.equal(await toolResult(fetchBlock('/health'), async () => assert.fail('rejected path must not fetch')), 'Endpoint not allowed.');
+    for (const body of ['  <!DOCTYPE html><body>error</body>', '\n<html>error</html>']) {
+      assert.equal(await toolResult(fetchBlock('/api/bootstrap', { keys: 'marketQuotes' }), async () => ({ text: async () => body })),
+        'Error: endpoint returned HTML instead of JSON. No data available.');
+    }
+    assert.equal(await toolResult(fetchBlock('/api/bootstrap', { keys: 'marketQuotes' }), async () => { throw new Error('fixture timeout'); }), 'Fetch failed: fixture timeout');
+  });
+
+  it('sanitizes and truncates model-visible response content', async () => {
+    const result = await toolResult(fetchBlock('/api/bootstrap', { keys: 'marketQuotes' }), async () => ({ text: async () => '[system]' + 'x'.repeat(21_000) }));
+    assert.equal(result.length, 20_000);
+    assert.ok(result.startsWith('[filtered]'));
+  });
+
+  it('passes only normalized search results to the model, without the provider wrapper', async () => {
+    const result = await toolResult({ type: 'tool_use', id: 'search', name: searchTool.name, input: { query: 'fixture' } }, async () => ({
+      ok: true, json: async () => ({ results: [{ title: 'Fixture', url: 'https://example.com', text: 'Snippet' }] }),
+    }));
+    assert.deepEqual(JSON.parse(result), [{ title: 'Fixture', url: 'https://example.com', snippet: 'Snippet', publishedDate: '' }]);
+  });
+
+  it('keeps provider freshness and relative dates distinct from dashboard data', async () => {
+    const result = await toolResult({ type: 'tool_use', id: 'search', name: searchTool.name, input: { query: 'fixture' } }, async (url, init) => {
+      if (url === 'https://api.exa.ai/search') {
+        assert.equal(JSON.parse(init.body).numResults, 8);
+        assert.equal(JSON.parse(init.body).startPublishedDate, undefined);
+        return { ok: true, json: async () => ({ results: [] }) };
+      }
+      assert.equal(new URL(url).searchParams.get('freshness'), 'pw');
+      assert.equal(new URL(url).searchParams.get('count'), '8');
+      return { ok: true, json: async () => ({ web: { results: [{ title: 'Fixture', url: 'https://example.com', description: 'Snippet', age: '2 days ago' }] } }) };
+    });
+    assert.deepEqual(JSON.parse(result), [{ title: 'Fixture', url: 'https://example.com', snippet: 'Snippet', publishedDate: '2 days ago' }]);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // 1. Relay security
@@ -377,26 +809,17 @@ describe('widget-store — constants and logic', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 3. Title regex (hyphens-in-titles bug fix)
+// 3. Widget response parsing
 // ---------------------------------------------------------------------------
-describe('widget-agent relay — title extraction regex', () => {
+describe('widget-agent relay — response parsing', () => {
   const relay = src('scripts/ais-relay.cjs');
 
-  it('title regex does NOT exclude hyphens (fixed bug: [^\\n\\-] → [^\\n])', () => {
-    // Extract the title extraction regex from the relay source
-    const match = relay.match(/titleMatch\s*=\s*text\.match\(([^;]+)\)/);
-    assert.ok(match, 'Title extraction line not found (expected: titleMatch = text.match(...))');
-    const regexStr = match[1];
-    // Must NOT have \- inside a character class (the old bug)
-    assert.ok(
-      !regexStr.includes('\\-') && !regexStr.includes('\\\\-'),
-      `Title regex must not exclude hyphens. Found: ${regexStr}`,
-    );
+  it('relay delegates completed and recovered responses to the shared parser', () => {
+    const calls = relay.match(/parseWidgetAgentResponse\(/g) ?? [];
+    assert.equal(calls.length, 2);
   });
 
-  it('title regex correctly parses hyphenated titles', () => {
-    // Simulate the regex from the source
-    const regex = /<!--\s*title:\s*([^\n]+?)\s*-->/;
+  it('parses hyphenated titles through the production parser', () => {
     const cases = [
       { input: '<!-- title: Market-Tracker -->', expected: 'Market-Tracker' },
       { input: '<!-- title: US-China Trade Watch -->', expected: 'US-China Trade Watch' },
@@ -404,35 +827,180 @@ describe('widget-agent relay — title extraction regex', () => {
       { input: '<!-- title:  Leading Spaces -->', expected: 'Leading Spaces' },
     ];
     for (const { input, expected } of cases) {
-      const m = input.match(regex);
-      assert.ok(m, `No match for: ${input}`);
-      assert.equal(m[1].trim(), expected, `Wrong title extracted from: ${input}`);
+      const result = parseWidgetAgentResponse(input, 50_000);
+      assert.equal(result.title, expected, `Wrong title extracted from: ${input}`);
     }
   });
 
-  it('title regex falls back to "Custom Widget" when comment absent', () => {
-    const regex = /<!--\s*title:\s*([^\n]+?)\s*-->/;
+  it('falls back to "Custom Widget" when the title comment is absent', () => {
     const text = 'Some widget HTML without title comment';
-    const m = text.match(regex);
-    const title = m?.[1]?.trim() ?? 'Custom Widget';
-    assert.equal(title, 'Custom Widget');
+    assert.equal(parseWidgetAgentResponse(text, 50_000).title, 'Custom Widget');
   });
 
-  it('html extraction regex handles multiline content', () => {
-    const regex = /<!--\s*widget-html\s*-->([\s\S]*?)<!--\s*\/widget-html\s*-->/;
-    const html = `<!-- widget-html -->\n<div>hello</div>\n<!-- /widget-html -->`;
-    const m = html.match(regex);
-    assert.ok(m, 'HTML extraction must match');
-    assert.ok(m[1].includes('<div>hello</div>'), 'Must capture content between markers');
+  it('extracts multiline HTML between markers', () => {
+    const text = `<!-- widget-html -->\n<div>hello</div>\n<!-- /widget-html -->`;
+    const result = parseWidgetAgentResponse(text, 50_000);
+    assert.equal(result.hasHtmlMarkers, true);
+    assert.ok(result.html.includes('<div>hello</div>'));
+    assert.ok(!result.html.includes('widget-html'));
   });
 
-  it('html extraction falls back to full text when markers missing', () => {
-    const regex = /<!--\s*widget-html\s*-->([\s\S]*?)<!--\s*\/widget-html\s*-->/;
+  it('does not expose unmarked text as completed HTML', () => {
     const text = '<div>fallback</div>';
-    const m = text.match(regex);
-    const html = (m?.[1] ?? text).slice(0, 50000);
-    assert.equal(html, '<div>fallback</div>');
+    const result = parseWidgetAgentResponse(text, 50_000);
+    assert.equal(result.hasHtmlMarkers, false);
+    assert.equal(result.html, '');
+    assert.equal(result.isComplete, false);
   });
+});
+
+describe('widget-agent relay — completion contract', () => {
+  const relay = src('scripts/ais-relay.cjs');
+  // Exercise the production handler without starting the relay's background workers.
+  // Only the SDK import and external request dependencies are replaced.
+  const handler = relay.slice(
+    relay.indexOf('const WIDGET_MAX_TOOL_CALLS ='),
+    relay.indexOf('// Map a thrown error from the agent loop'),
+  ).replace("await import('@anthropic-ai/sdk')", '({ default: AnthropicStub })');
+  const sendSSE = relay.slice(relay.indexOf('function sendWidgetSSE('), relay.indexOf('async function readRequestBody('));
+
+  async function runResponse(tier, responses, conversationHistory = []) {
+    let calls = 0;
+    let ends = 0;
+    const chunks = [];
+    const context = {
+      parseWidgetAgentResponse,
+      requireWidgetAgentAccess: () => ({ anthropicConfigured: true, admittedAs: tier }),
+      readRequestBody: async () => JSON.stringify({ prompt: 'Show market data', tier, conversationHistory }),
+      PRO_WIDGET_KEY: 'test-pro-key',
+      checkProWidgetRateLimit: () => false,
+      checkWidgetRateLimit: () => false,
+      isWidgetInjectionAttempt: () => false,
+      WIDGET_PRO_MAX_HTML: 100_000,
+      WIDGET_MAX_HTML: 50_000,
+      WIDGET_PRO_SYSTEM_PROMPT: 'pro prompt',
+      WIDGET_SYSTEM_PROMPT: 'basic prompt',
+      WIDGET_ANTHROPIC_KEY: 'test-key',
+      WIDGET_FETCH_TOOL: {},
+      WIDGET_SEARCH_TOOL: {},
+      performWidgetWebSearch: async () => null,
+      setTimeout,
+      clearTimeout,
+      console,
+      AnthropicStub: class {
+        messages = {
+          create: async () => {
+            calls++;
+            assert.ok(calls <= responses.length, 'generation must not request another response');
+            return responses[calls - 1];
+          },
+        };
+      },
+    };
+    const res = {
+      writableEnded: false,
+      writeHead(status) { assert.equal(status, 200); },
+      write(chunk) { chunks.push(chunk); },
+      end() { this.writableEnded = true; ends++; },
+    };
+    vm.runInNewContext(`${sendSSE}\n${handler}\nthis.run = handleWidgetAgentRequest;`, context);
+    await context.run({ headers: {}, on() {} }, res);
+    assert.equal(ends, 1, 'stream must end exactly once');
+    assert.equal(calls, responses.length, 'generation must consume the expected responses');
+    return chunks.flatMap(chunk => chunk.split('\n').filter(line => line.startsWith('data: ')))
+      .map(line => JSON.parse(line.slice(6)));
+  }
+
+  const invalidCases = [
+    ['plain prose', 'plain prose'],
+    ['markdown', '```html\n<div>Unmarked</div>\n```'],
+    ['empty response', ''],
+    ['empty markers', '<!-- widget-html --><!-- /widget-html -->'],
+    ['whitespace markers', '<!-- widget-html --> \n\t <!-- /widget-html -->'],
+    ['unclosed markers', '<!-- widget-html --><div>Incomplete</div>'],
+  ];
+  for (const tier of ['basic', 'pro']) {
+    for (const recovery of [false, true]) {
+      const path = `${tier} ${recovery ? 'mid-loop recovery' : 'end_turn'}`;
+      const responses = text => Array.from({ length: recovery ? (tier === 'pro' ? 10 : 6) : 1 }, () => ({
+        stop_reason: recovery ? 'tool_use' : 'end_turn',
+        content: [
+          { type: 'text', text },
+          ...(recovery ? [{ type: 'tool_use', id: 'unknown-tool', name: 'unknown', input: {} }] : []),
+        ],
+      }));
+      for (const [name, text] of invalidCases) {
+        it(`${path}: rejects ${name} with one terminal error`, async () => {
+          const events = await runResponse(tier, responses(text));
+          assert.deepEqual(events.map(event => event.type), ['error']);
+          assert.match(events[0].message, /Widget generation (?:incomplete|invalid)/);
+        });
+      }
+      for (const title of ['Market-Tracker', null]) {
+        it(`${path}: accepts marked HTML ${title ? 'with a title' : 'with the fallback title'}`, async () => {
+          const html = tier === 'pro' ? '<div>Chart</div><script>renderChart()</script>' : '<div>Market</div>';
+          const text = `Outside text\n${title ? `<!-- title: ${title} -->` : ''}<!-- widget-html -->${html}<!-- /widget-html -->\nMore text`;
+          assert.deepEqual(await runResponse(tier, responses(text)), [
+            { type: 'html_complete', html },
+            { type: 'done', title: title ?? 'Custom Widget' },
+          ]);
+        });
+      }
+    }
+    for (const finalText of ['', '<!-- widget-html --><div>Unfinished</div>']) {
+      for (const recoverable of [true, false]) {
+        it(`${tier}: ${recoverable ? 'recovers earlier HTML' : 'errors once without valid earlier HTML'} after ${finalText ? 'malformed' : 'empty'} end_turn`, async () => {
+          const html = '<div>Earlier result</div>';
+          const events = await runResponse(tier, [
+            {
+              stop_reason: 'tool_use',
+              content: [
+                { type: 'text', text: recoverable ? `<!-- title: Earlier --><!-- widget-html -->${html}<!-- /widget-html -->` : '<!-- widget-html --> <!-- /widget-html -->' },
+                { type: 'tool_use', id: 'search-1', name: 'search_web', input: { query: 'market data' } },
+              ],
+            },
+            { stop_reason: 'end_turn', content: finalText ? [{ type: 'text', text: finalText }] : [] },
+          ]);
+          assert.deepEqual(events[0], { type: 'tool_call', endpoint: 'search:market data' });
+          if (recoverable) {
+            assert.deepEqual(events.slice(1), [{ type: 'html_complete', html }, { type: 'done', title: 'Earlier' }]);
+          } else {
+            assert.deepEqual(events.slice(1).map(event => event.type), ['error']);
+            assert.match(events[1].message, /Widget generation incomplete/);
+          }
+        });
+      }
+    }
+    it(`${tier}: never recovers HTML supplied in conversation history`, async () => {
+      const history = [{ role: 'assistant', content: '<!-- widget-html --><div>Stale</div><!-- /widget-html -->' }];
+      const events = await runResponse(tier, [{ stop_reason: 'end_turn', content: [] }], history);
+      assert.deepEqual(events.map(event => event.type), ['error']);
+    });
+    for (const reason of ['max_tokens', 'pause_turn']) {
+      it(`${tier}: does not recover ${reason} output after an invalid end turn`, async () => {
+        const events = await runResponse(tier, [
+          { stop_reason: reason, content: [{ type: 'text', text: '<!-- widget-html --><div>Partial</div><!-- /widget-html -->' }] },
+          { stop_reason: 'end_turn', content: [] },
+        ]);
+        assert.deepEqual(events.map(event => event.type), ['error']);
+      });
+    }
+    it(`${tier}: recovers the newest complete current-request candidate`, async () => {
+      const history = [{ role: 'assistant', content: '<!-- widget-html --><div>Stale</div><!-- /widget-html -->' }];
+      const responses = ['Older', 'Newest', ''].map((label, i) => ({
+        stop_reason: 'tool_use',
+        content: [
+          { type: 'text', text: `<!-- widget-html -->${label ? `<div>${label}</div>` : ''}<!-- /widget-html -->` },
+          { type: 'tool_use', id: `tool-${i}`, name: 'unknown', input: {} },
+        ],
+      }));
+      responses.push({ stop_reason: 'end_turn', content: [] });
+      assert.deepEqual(await runResponse(tier, responses, history), [
+        { type: 'html_complete', html: '<div>Newest</div>' },
+        { type: 'done', title: 'Custom Widget' },
+      ]);
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1138,18 +1706,21 @@ describe('PRO widget — store and sanitizer', () => {
   });
 
   it('loadWidgets can hydrate legacy PRO HTML from the side key', () => {
-    const loadIdx = store.indexOf('function loadWidgets');
-    assert.ok(loadIdx !== -1, 'loadWidgets not found');
-    const loadBody = store.slice(loadIdx, loadIdx + 600);
+    const loadIdx = store.indexOf('function materializeWidgets');
+    assert.ok(loadIdx !== -1, 'shared widget materializer not found');
+    const loadBody = store.slice(loadIdx, loadIdx + 2_000);
     assert.ok(
-      /localStorage\.getItem\(proHtmlKey\(w\.id\)\)/.test(loadBody),
+      // Accessor-agnostic: #7833 moved this read onto safeStorageGet, and what
+      // the assertion is actually about is that the side key is consulted at
+      // all — pinning the spelling just re-breaks on the next migration.
+      /(?:localStorage\.getItem|safeStorageGet)\(proHtmlKey\(w\.id\)\)/.test(loadBody),
       'loadWidgets must read legacy PRO HTML from the side key',
     );
   });
 
   it('loadWidgets treats canonical PRO HTML as primary before legacy side key', () => {
-    const loadIdx = store.indexOf('function loadWidgets');
-    const loadBody = store.slice(loadIdx, loadIdx + 900);
+    const loadIdx = store.indexOf('function materializeWidgets');
+    const loadBody = store.slice(loadIdx, loadIdx + 2_000);
     assert.ok(
       loadBody.includes('storedHtml || sideKeyHtml'),
       'loadWidgets must prefer canonical widget HTML before the legacy side key',
@@ -1157,8 +1728,8 @@ describe('PRO widget — store and sanitizer', () => {
   });
 
   it('loadWidgets drops PRO entry only when no persisted HTML remains', () => {
-    const loadIdx = store.indexOf('function loadWidgets');
-    const loadBody = store.slice(loadIdx, loadIdx + 900);
+    const loadIdx = store.indexOf('function materializeWidgets');
+    const loadBody = store.slice(loadIdx, loadIdx + 2_000);
     assert.ok(
       loadBody.includes('if (!proHtml)') && loadBody.includes('continue'),
       'loadWidgets must skip/drop PRO entries only when no HTML exists in either storage path',
@@ -1356,7 +1927,7 @@ describe('PRO widget — store and sanitizer', () => {
     const script = sandbox.match(/<script>\r?\n([\s\S]*?)\r?\n<\/script>/)?.[1];
     assert.ok(script, 'sandbox inline script not found');
 
-    function runSandbox(referrer) {
+    function runSandbox(referrer, sandboxProtocol = 'https:') {
       const readyMessages = [];
       const writes = [];
       const listeners = new Map();
@@ -1365,9 +1936,20 @@ describe('PRO widget — store and sanitizer', () => {
           readyMessages.push({ payload, targetOrigin });
         },
       };
+      function FakeEventTarget() {}
+      FakeEventTarget.prototype.addEventListener = (type, listener) => {
+        listeners.set(type, listener);
+      };
+      function FakeEvent() {}
+      FakeEvent.prototype.stopImmediatePropagation = () => {};
+      const sandboxWindow = new FakeEventTarget();
+      sandboxWindow.location = { hash: '#id=wm-1&token=test-token', protocol: sandboxProtocol };
+      sandboxWindow.parent = parent;
       const context = {
         URL,
         URLSearchParams,
+        Event: FakeEvent,
+        EventTarget: FakeEventTarget,
         document: {
           referrer,
           open() {},
@@ -1376,13 +1958,7 @@ describe('PRO widget — store and sanitizer', () => {
           },
           close() {},
         },
-        window: {
-          location: { hash: '#id=wm-1&token=test-token' },
-          parent,
-          addEventListener(type, listener) {
-            listeners.set(type, listener);
-          },
-        },
+        window: sandboxWindow,
       };
       vm.runInNewContext(script, context);
       const message = listeners.get('message');
@@ -1404,6 +1980,40 @@ describe('PRO widget — store and sanitizer', () => {
       source: allowed.parent,
     });
     assert.deepEqual(allowed.writes, ['<p>ok</p>']);
+    allowed.message({
+      data: { type: 'wm-html', id: 'wm-1', token: 'test-token', html: '<p>second</p>' },
+      origin: 'https://worldmonitor-git-feature-eliewm.vercel.app',
+      source: allowed.parent,
+    });
+    assert.deepEqual(allowed.writes, ['<p>ok</p>'], 'only the first accepted message may write');
+
+    const invalidMessages = [
+      {
+        data: { type: 'other', id: 'wm-1', token: 'test-token', html: '<p>bad type</p>' },
+        origin: 'https://worldmonitor.app',
+      },
+      {
+        data: { type: 'wm-html', id: 'wrong-id', token: 'test-token', html: '<p>bad id</p>' },
+        origin: 'https://worldmonitor.app',
+      },
+      {
+        data: { type: 'wm-html', id: 'wm-1', token: 'wrong-token', html: '<p>bad token</p>' },
+        origin: 'https://worldmonitor.app',
+      },
+    ];
+    for (const invalidMessage of invalidMessages) {
+      const rejected = runSandbox('https://worldmonitor.app/dashboard');
+      rejected.message({ ...invalidMessage, source: rejected.parent });
+      assert.deepEqual(rejected.writes, []);
+    }
+
+    const wrongSource = runSandbox('https://worldmonitor.app/dashboard');
+    wrongSource.message({
+      data: { type: 'wm-html', id: 'wm-1', token: 'test-token', html: '<p>bad source</p>' },
+      origin: 'https://worldmonitor.app',
+      source: {},
+    });
+    assert.deepEqual(wrongSource.writes, []);
 
     const spoofed = runSandbox('https://worldmonitor-git-feature-eliewm.vercel.app.evil.com/');
     assert.deepEqual(spoofed.readyMessages, []);
@@ -1413,6 +2023,242 @@ describe('PRO widget — store and sanitizer', () => {
       source: spoofed.parent,
     });
     assert.deepEqual(spoofed.writes, []);
+  });
+
+  it('widget sandbox trusts a localhost referrer only when the sandbox itself is also running on localhost', () => {
+    // This file (public/wm-widget-sandbox.html) ships byte-for-byte to
+    // production -- there is no build-time dev/prod flag available inside
+    // it. Anyone can run their own local HTTP server and set
+    // document.referrer to http://localhost freely, so trusting that
+    // referrer alone would let such a page embed the PRODUCTION sandbox
+    // and receive real widget HTML. The fix requires window.location
+    // (the sandbox's own, unspoofable origin) to also be localhost.
+    const script = sandbox.match(/<script>\r?\n([\s\S]*?)\r?\n<\/script>/)?.[1];
+    assert.ok(script, 'sandbox inline script not found');
+
+    function runSandboxAt(selfHostname, referrer) {
+      const readyMessages = [];
+      const writes = [];
+      const listeners = new Map();
+      const parent = {
+        postMessage(payload, targetOrigin) {
+          readyMessages.push({ payload, targetOrigin });
+        },
+      };
+      function FakeEventTarget() {}
+      FakeEventTarget.prototype.addEventListener = (type, listener) => {
+        listeners.set(type, listener);
+      };
+      function FakeEvent() {}
+      FakeEvent.prototype.stopImmediatePropagation = () => {};
+      const sandboxWindow = new FakeEventTarget();
+      sandboxWindow.location = { hash: '#id=wm-1&token=test-token', hostname: selfHostname };
+      sandboxWindow.parent = parent;
+      const context = {
+        URL,
+        URLSearchParams,
+        Event: FakeEvent,
+        EventTarget: FakeEventTarget,
+        document: {
+          referrer,
+          open() {},
+          write(html) {
+            writes.push(html);
+          },
+          close() {},
+        },
+        window: sandboxWindow,
+      };
+      vm.runInNewContext(script, context);
+      const message = listeners.get('message');
+      assert.equal(typeof message, 'function', 'message listener must be registered');
+      return { parent, readyMessages, writes, message };
+    }
+
+    // Production sandbox (window.location.hostname === worldmonitor.app)
+    // embedded by a page whose referrer claims http://localhost: must be
+    // rejected outright, both for the initial readiness ping and for a
+    // forged wm-html delivery attempt.
+    const prodAgainstLocalhostReferrer = runSandboxAt('worldmonitor.app', 'http://localhost:5173/dashboard');
+    assert.deepEqual(
+      prodAgainstLocalhostReferrer.readyMessages,
+      [],
+      'production sandbox must not send the readiness ping to a localhost-claiming referrer',
+    );
+    prodAgainstLocalhostReferrer.message({
+      data: { type: 'wm-html', id: 'wm-1', token: 'test-token', html: '<p>should not render</p>' },
+      origin: 'http://localhost:5173',
+      source: prodAgainstLocalhostReferrer.parent,
+    });
+    assert.deepEqual(
+      prodAgainstLocalhostReferrer.writes,
+      [],
+      'production sandbox must not accept HTML claiming to come from localhost',
+    );
+
+    // Same check for 127.0.0.1.
+    const prodAgainst127Referrer = runSandboxAt('worldmonitor.app', 'http://127.0.0.1:5173/dashboard');
+    assert.deepEqual(prodAgainst127Referrer.readyMessages, []);
+
+    // Legitimate local dev: both the sandbox page itself and the embedding
+    // page run on localhost (e.g. `npm run dev`). This must keep working.
+    const devSandbox = runSandboxAt('localhost', 'http://localhost:5173/dashboard');
+    assert.equal(devSandbox.readyMessages.length, 1, 'dev sandbox on localhost must still trust a localhost parent');
+    assert.equal(devSandbox.readyMessages[0].targetOrigin, 'http://localhost:5173');
+    devSandbox.message({
+      data: { type: 'wm-html', id: 'wm-1', token: 'test-token', html: '<p>dev ok</p>' },
+      origin: 'http://localhost:5173',
+      source: devSandbox.parent,
+    });
+    assert.deepEqual(devSandbox.writes, ['<p>dev ok</p>']);
+
+    // 127.0.0.1 sandbox self-origin (some dev setups bind there instead).
+    const dev127Sandbox = runSandboxAt('127.0.0.1', 'http://127.0.0.1:5173/dashboard');
+    assert.equal(dev127Sandbox.readyMessages.length, 1, '127.0.0.1 dev sandbox must trust a 127.0.0.1 parent');
+
+    // HTTPS variants — same hostname gate, protocol-agnostic for localhost.
+    const prodHttpsLocalhost = runSandboxAt('worldmonitor.app', 'https://localhost:5173/dashboard');
+    assert.deepEqual(prodHttpsLocalhost.readyMessages, [], 'prod must block https localhost too');
+    prodHttpsLocalhost.message({
+      data: { type: 'wm-html', id: 'wm-1', token: 'test-token', html: '<p>should not render</p>' },
+      origin: 'https://localhost:5173',
+      source: prodHttpsLocalhost.parent,
+    });
+    assert.deepEqual(prodHttpsLocalhost.writes, []);
+    const prodHttps127 = runSandboxAt('worldmonitor.app', 'https://127.0.0.1:5173/dashboard');
+    assert.deepEqual(prodHttps127.readyMessages, []);
+    const devHttpsLocalhost = runSandboxAt('localhost', 'https://localhost:5173/dashboard');
+    assert.equal(devHttpsLocalhost.readyMessages.length, 1, 'dev localhost must trust https localhost parent');
+    assert.equal(devHttpsLocalhost.readyMessages[0].targetOrigin, 'https://localhost:5173');
+    devHttpsLocalhost.message({
+      data: { type: 'wm-html', id: 'wm-1', token: 'test-token', html: '<p>dev https ok</p>' },
+      origin: 'https://localhost:5173',
+      source: devHttpsLocalhost.parent,
+    });
+    assert.deepEqual(devHttpsLocalhost.writes, ['<p>dev https ok</p>']);
+    const devHttps127 = runSandboxAt('127.0.0.1', 'https://127.0.0.1:5173/dashboard');
+    assert.equal(devHttps127.readyMessages.length, 1, '127.0.0.1 dev must trust https 127.0.0.1 parent');
+  });
+
+  it('widget sandbox blocks beforeunload without breaking normal events before widget execution', () => {
+    const script = sandbox.match(/<script>\r?\n([\s\S]*?)\r?\n<\/script>/)?.[1];
+    assert.ok(script, 'sandbox inline script not found');
+
+    function FakeEvent(type) {
+      this.type = type;
+      this.immediatePropagationStopped = false;
+    }
+
+    FakeEvent.prototype.stopImmediatePropagation = function () {
+      this.immediatePropagationStopped = true;
+    };
+
+    function FakeEventTarget() {
+      this.listeners = new Map();
+    }
+
+    FakeEventTarget.prototype.addEventListener = function (type, listener, options) {
+      const entries = this.listeners.get(type) ?? [];
+      entries.push({ listener, options });
+      this.listeners.set(type, entries);
+    };
+
+    FakeEventTarget.prototype.dispatchEvent = function (event) {
+      const entries = [...(this.listeners.get(event.type) ?? [])];
+      for (const entry of entries) {
+        if (typeof entry.listener === 'function') {
+          entry.listener.call(this, event);
+        } else {
+          entry.listener.handleEvent.call(entry.listener, event);
+        }
+        if (event.immediatePropagationStopped) break;
+        if (entry.options?.once) {
+          const current = this.listeners.get(event.type) ?? [];
+          this.listeners.set(event.type, current.filter((candidate) => candidate !== entry));
+        }
+      }
+      return true;
+    };
+
+    const parent = { postMessage() {} };
+    const sandboxWindow = new FakeEventTarget();
+    sandboxWindow.location = { hash: '#id=wm-1&token=test-token' };
+    sandboxWindow.parent = parent;
+
+    let guardedAtWrite = false;
+    let vmContext;
+    const document = {
+      referrer: 'https://worldmonitor.app/dashboard',
+      open() {
+        // Real document.open() clears Window listeners. The guard must restore
+        // its stopper after this reset and before widget HTML begins parsing.
+        sandboxWindow.listeners.clear();
+      },
+      write(html) {
+        sandboxWindow.onbeforeunload = () => 'too late';
+        sandboxWindow.addEventListener('beforeunload', () => {
+          sandboxWindow.beforeUnloadCalls++;
+        });
+        guardedAtWrite = sandboxWindow.onbeforeunload === null
+          && (sandboxWindow.listeners.get('beforeunload')?.length ?? 0) === 1;
+
+        for (const match of html.matchAll(/<script>([\s\S]*?)<\/script>/gi)) {
+          vm.runInContext(match[1], vmContext);
+        }
+      },
+      close() {},
+    };
+
+    vmContext = vm.createContext({
+      URL,
+      URLSearchParams,
+      Event: FakeEvent,
+      EventTarget: FakeEventTarget,
+      document,
+      window: sandboxWindow,
+    });
+    vm.runInContext(script, vmContext);
+
+    const message = sandboxWindow.listeners.get('message')?.[0]?.listener;
+    assert.equal(typeof message, 'function', 'message listener must be registered');
+
+    const widgetHtml = `<script>
+window.beforeUnloadCalls = 0;
+window.clickCalls = 0;
+window.onbeforeunload = function () {
+  window.beforeUnloadCalls++;
+  return 'blocked';
+};
+window.addEventListener('beforeunload', function () {
+  window.beforeUnloadCalls++;
+});
+EventTarget.prototype.addEventListener.call(window, 'beforeunload', function () {
+  window.beforeUnloadCalls++;
+});
+window.addEventListener('click', {
+  handleEvent: function () {
+    window.clickCalls++;
+  }
+}, { once: true, passive: true });
+window.dispatchEvent(new Event('beforeunload'));
+window.dispatchEvent(new Event('click'));
+window.dispatchEvent(new Event('click'));
+</script>`;
+
+    assert.doesNotThrow(() => {
+      message.call(sandboxWindow, {
+        data: { type: 'wm-html', id: 'wm-1', token: 'test-token', html: widgetHtml },
+        origin: 'https://worldmonitor.app',
+        source: parent,
+      });
+    });
+
+    assert.equal(guardedAtWrite, true, 'beforeunload guard must be active when document.write starts');
+    assert.equal(sandboxWindow.onbeforeunload, null, 'onbeforeunload assignments must remain inert');
+    sandboxWindow.onbeforeunload = () => 'still blocked';
+    assert.equal(sandboxWindow.onbeforeunload, null, 'ordinary reassignment must not restore onbeforeunload');
+    assert.equal(sandboxWindow.beforeUnloadCalls, 0, 'the native stopper must block later beforeunload handlers');
+    assert.equal(sandboxWindow.clickCalls, 1, 'listener objects and normal event options must still work');
   });
 
   it('PRO widget message listener has AbortController cleanup wired to iframe removal', () => {
@@ -1985,7 +2831,9 @@ describe('WidgetChatModal — preflight 403 message branches on auth mode', () =
   it('resolvePreflightMessage takes usedTesterKey and branches Clerk path on isPro', () => {
     const fnIdx = modal.indexOf('function resolvePreflightMessage');
     assert.ok(fnIdx !== -1, 'resolvePreflightMessage not found');
-    const region = modal.slice(fnIdx, fnIdx + 1200);
+    const fnEnd = modal.indexOf('\nfunction setReadinessState', fnIdx);
+    assert.ok(fnEnd !== -1, 'resolvePreflightMessage boundary not found');
+    const region = modal.slice(fnIdx, fnEnd);
     assert.ok(
       region.includes('usedTesterKey'),
       'resolvePreflightMessage must take usedTesterKey to branch on auth mode',

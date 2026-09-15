@@ -6,7 +6,7 @@ keywords: "supply chain risk API, chokepoint monitoring API, shipping disruption
 audience: "Supply chain engineers, logistics developers, procurement analysts, platform teams, risk managers"
 heroImage: "/blog/images/blog/build-supply-chain-early-warning-system-api.jpg"
 pubDate: "2026-06-08"
-modifiedDate: "2026-06-13"
+modifiedDate: "2026-09-10"
 ---
 
 When the Strait of Hormuz shut down this spring, companies found out in one of two ways. Some read about it in the news and started calling freight forwarders. Others had already received a webhook hours earlier, when the disruption score crossed their alert threshold, and were quoting Cape of Good Hope routings before their competitors knew there was a problem.
@@ -57,13 +57,15 @@ The response tells you everything a routing decision needs:
 }
 ```
 
-Read it like this: this tanker lane is 100% exposed to both Hormuz and Suez, the current disruption score on the primary chokepoint is 68/100, and the documented bypass adds 12 transit days at a 1.35× cost multiplier. `cargoType` matters because bypass options are filtered to corridors suitable for your cargo (`container`, `tanker`, `bulk`, or `roro`), and `hs2` lets you scope by commodity chapter.
+Read it like this: this tanker lane is 100% exposed to both [Hormuz](https://www.worldmonitor.app/chokepoints/strait-of-hormuz/) and [Suez](https://www.worldmonitor.app/chokepoints/suez-canal/), the current disruption score on the primary chokepoint is 68/100, and the documented bypass adds 12 transit days at a 1.35× cost multiplier. `cargoType` matters because bypass options are filtered to corridors suitable for your cargo (`container`, `tanker`, `bulk`, or `roro`), and `hs2` lets you scope by commodity chapter.
 
-Run this once for every lane in your network and you have an exposure matrix: which chokepoints, at what percentage, with what fallback. Most teams discover that 70% of their volume funnels through two or three waterways.
+The [Cape of Good Hope](https://www.worldmonitor.app/chokepoints/cape-of-good-hope/) alternative avoids Suez and Bab el-Mandeb. A vessel leaving the Persian Gulf still has to clear Hormuz.
+
+Run this once for every lane in your network and you have an exposure matrix: which chokepoints, at what percentage, with what fallback. Most teams discover that 70% of their volume funnels through a small set of waterways.
 
 ## Step 2: Subscribe to Disruption Webhooks
 
-Polling is for prototypes. Register a webhook for the chokepoints your matrix surfaced:
+Polling is for prototypes. Register a webhook for the chokepoints your matrix surfaced. The example also includes [Bab el-Mandeb](https://www.worldmonitor.app/chokepoints/bab-el-mandeb/), the southern entrance to the Red Sea:
 
 ```bash
 curl -s -X POST 'https://api.worldmonitor.app/api/v2/shipping/webhooks' \
@@ -76,7 +78,7 @@ curl -s -X POST 'https://api.worldmonitor.app/api/v2/shipping/webhooks' \
   }'
 ```
 
-The `201` response returns a `subscriberId` and a one-time `secret`; persist it, because the server never shows it again. There is a `rotate-secret` endpoint when you need a new one. Omitting `chokepointIds` subscribes you to all 13 monitored chokepoints. Subscriptions expire after 30 days, so re-register on a monthly cron to keep both the record and the owner index alive.
+The `201` response returns a `subscriberId` and a one-time `secret`; persist it, because the server never shows it again. There is a `rotate-secret` endpoint when you need a new one. Omitting `chokepointIds` subscribes you to the complete canonical chokepoint registry. Subscriptions expire after 30 days, so re-register on a monthly cron to keep both the record and the owner index alive.
 
 When a chokepoint's disruption score crosses your threshold, you get:
 
@@ -144,14 +146,14 @@ The `lanesExposedTo()` lookup is your exposure matrix from Step 1. That is what 
 
 ## Step 4: Add Country Context
 
-Chokepoints are not the only failure mode. A supplier country sliding into instability disrupts production before anything reaches a port. Pull structural resilience for your origin countries:
+Chokepoints are not the only failure mode. A supplier country sliding into instability disrupts production before anything reaches a port. Pull structural resilience for your origin countries. For the route example, inspect the [United Arab Emirates](https://www.worldmonitor.app/countries/united-arab-emirates/) and [Netherlands](https://www.worldmonitor.app/countries/netherlands/) profiles. The request below uses [Egypt](https://www.worldmonitor.app/countries/egypt/), the Suez transit country:
 
 ```bash
 curl -s 'https://api.worldmonitor.app/api/resilience/v1/get-resilience-score?countryCode=EG' \
   -H 'X-WorldMonitor-Key: wm_YOUR_KEY'
 ```
 
-You get a 0–100 resilience score with per-domain breakdowns (energy, infrastructure, governance, security and more), a trend, and a 30-day change. It is computed across 196 countries and refreshed every six hours. Combine it with the real-time [Country Instability Index](/blog/posts/country-instability-index-methodology-explained/) and you cover both clocks: CII for what is burning this week, resilience for which countries absorb shocks and which shatter.
+You get a 0–100 resilience score with per-domain breakdowns (energy, infrastructure, governance, security and more), a trend, and a 30-day change. It is computed across the public rankable country universe and refreshed every six hours. Combine it with the real-time [Country Instability Index](/blog/posts/country-instability-index-methodology-explained/) and you cover both clocks: CII for what is burning this week, resilience for which countries absorb shocks and which shatter.
 
 A simple weekly job that flags any origin country whose resilience dropped more than a few points in 30 days catches slow-burn deterioration that no chokepoint webhook will ever see.
 
@@ -164,11 +166,15 @@ A simple weekly job that flags any origin country whose resilience dropped more 
 
 Total code: one webhook receiver and two cron jobs. If you want to stress-test the design, the [scenario engine](https://www.worldmonitor.app/docs/scenario-engine) simulates events like a Taiwan Strait closure or a Panama drought against live trade data. AI agents can run the same checks conversationally through the [MCP server](/blog/posts/worldmonitor-mcp-server-ai-agents-real-time-intelligence/).
 
+## Primary Trade Sources
+
+Validate trade signals against primary datasets such as the [WTO API portal](https://apiportal.wto.org/) and [UN Comtrade](https://comtradeplus.un.org/). World Monitor adds normalization and cross-domain context; the originating institution remains the authority for its underlying series.
+
 ## Frequently Asked Questions
 
 **Which chokepoints can I monitor?**
 
-All 13 strategic waterways World Monitor tracks, including the Strait of Hormuz, Suez Canal, Bab el-Mandeb, Strait of Malacca, Panama Canal, Taiwan Strait, Bosporus, Kerch Strait, and the Cape of Good Hope bypass corridor.
+Every strategic waterway in World Monitor's canonical registry, including the Strait of Hormuz, Suez Canal, Bab el-Mandeb, Strait of Malacca, Panama Canal, Taiwan Strait, Bosporus, Kerch Strait, and the Cape of Good Hope bypass corridor.
 
 **How fresh is the disruption data?**
 

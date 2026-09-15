@@ -10,11 +10,11 @@
  *   node scripts/seed-wb-indicators.mjs [--env production|preview|development] [--sha <sha>]
  */
 
-import { readFileSync, existsSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { loadEnvFile } from './_seed-utils.mjs';
+import wbTechProjection from './_wb-tech-readiness-projection.cjs';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const BOOTSTRAP_KEY = 'economic:worldbank-techreadiness:v1';
 const PROGRESS_KEY = 'economic:worldbank-progress:v1';
@@ -29,11 +29,12 @@ const NORMALIZE_MAX = { internet: 100, mobile: 150, broadband: 50, rdSpend: 5 };
 
 // WB indicators + date ranges matching the RPC handler
 const INDICATORS = [
-  { key: 'internet',  id: 'IT.NET.USER.ZS', dateRange: '2019:2024' },
-  { key: 'mobile',    id: 'IT.CEL.SETS.P2', dateRange: '2019:2024' },
-  { key: 'broadband', id: 'IT.NET.BBND.P2', dateRange: '2019:2024' },
-  { key: 'rdSpend',   id: 'GB.XPD.RSDV.GD.ZS', dateRange: '2018:2024' },
+  { key: 'internet',  id: 'IT.NET.USER.ZS', unit: 'percent', dateRange: '2019:2024' },
+  { key: 'mobile',    id: 'IT.CEL.SETS.P2', unit: 'per 100 people', dateRange: '2019:2024' },
+  { key: 'broadband', id: 'IT.NET.BBND.P2', unit: 'per 100 people', dateRange: '2019:2024' },
+  { key: 'rdSpend',   id: 'GB.XPD.RSDV.GD.ZS', unit: 'percent of GDP', dateRange: '2018:2024' },
 ];
+const { buildWorldBankTechObservations } = wbTechProjection;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -77,27 +78,6 @@ function getKeyPrefix(env, sha) {
 function maskToken(token) {
   if (!token || token.length < 8) return '***';
   return token.slice(0, 4) + '***' + token.slice(-4);
-}
-
-function loadEnvFile() {
-  const envPath = join(__dirname, '..', '.env.local');
-  if (!existsSync(envPath)) return;
-
-  const lines = readFileSync(envPath, 'utf8').split('\n');
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eqIdx = trimmed.indexOf('=');
-    if (eqIdx === -1) continue;
-    const key = trimmed.slice(0, eqIdx).trim();
-    let val = trimmed.slice(eqIdx + 1).trim();
-    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-      val = val.slice(1, -1);
-    }
-    if (!process.env[key]) {
-      process.env[key] = val;
-    }
-  }
 }
 
 function sleep(ms) {
@@ -211,7 +191,7 @@ function normalize(val, max) {
   return Math.min(100, (val / max) * 100);
 }
 
-function computeRankings(indicatorData) {
+export function computeRankings(indicatorData) {
   const allCountries = new Set();
   for (const data of Object.values(indicatorData)) {
     Object.keys(data).forEach(c => allCountries.add(c));
@@ -244,6 +224,7 @@ function computeRankings(indicatorData) {
 
     const score = totalWeight > 0 ? weightedSum / totalWeight : 0;
     const countryName = iData?.name || mData?.name || bData?.name || rData?.name || countryCode;
+    const observations = buildWorldBankTechObservations({ internet: iData, mobile: mData, broadband: bData, rdSpend: rData });
 
     scores.push({
       country: countryCode,
@@ -251,6 +232,7 @@ function computeRankings(indicatorData) {
       score: Math.round(score * 10) / 10,
       rank: 0,
       components,
+      observations,
     });
   }
 
@@ -374,7 +356,7 @@ async function fetchRenewableData() {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  loadEnvFile();
+  loadEnvFile(import.meta.url);
 
   const { env, sha } = parseArgs();
   const prefix = getKeyPrefix(env, sha);
@@ -512,7 +494,9 @@ async function main() {
   console.log(`\n=== Done in ${total}s ===`);
 }
 
-main().catch(err => {
-  console.error('\nFATAL:', err.message || err);
-  process.exit(0); // graceful for cron
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(err => {
+    console.error('\nFATAL:', err.message || err);
+    process.exit(0); // graceful for cron
+  });
+}

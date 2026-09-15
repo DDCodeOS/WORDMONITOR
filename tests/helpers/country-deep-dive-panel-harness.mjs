@@ -1,9 +1,11 @@
 import { build } from 'esbuild';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createBrowserEnvironment } from './runtime-config-panel-harness.mjs';
+import { MiniNode } from './mini-dom.mts';
+import { createTempDir, removeTempDir } from './temp-dir.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, '..', '..');
@@ -38,8 +40,19 @@ function defineGlobal(name, value) {
 
 async function loadCountryDeepDivePanel(options = {}) {
   const resilienceWidgetMode = options.resilienceWidgetMode ?? 'success';
-  const premiumAccess = options.premiumAccess === true;
-  const tempDir = mkdtempSync(join(tmpdir(), 'wm-country-deep-dive-'));
+  const sourceProvenance = JSON.stringify(options.sourceProvenance ?? {});
+  const demographicsResponse = JSON.stringify(options.demographicsResponse ?? {
+    countryCode: '',
+    available: false,
+    fetchedAt: '',
+    stages: [],
+  });
+  const scorecardResponse = JSON.stringify(options.scorecardResponse ?? {
+    unavailable: true,
+    unavailableReason: 'snapshot-unavailable',
+  });
+  const scorecardMode = JSON.stringify(options.scorecardMode ?? 'success');
+  const tempDir = createTempDir('wm-country-deep-dive-');
   const outfile = join(tempDir, 'CountryDeepDivePanel.bundle.mjs');
   const resilienceWidgetStub = resilienceWidgetMode === 'import-reject'
     ? `
@@ -102,11 +115,45 @@ async function loadCountryDeepDivePanel(options = {}) {
 
   const stubModules = new Map([
     ['feeds-stub', `
-      export function getSourcePropagandaRisk() {
-        return { stateAffiliated: '' };
+      const sourceProvenance = ${sourceProvenance};
+      export function getSourcePropagandaRisk(sourceName) {
+        return sourceProvenance[sourceName]?.riskProfile
+          ?? { risk: 'unknown', note: 'Provenance not yet reviewed — do not treat as independent journalism' };
       }
-      export function getSourceTier() {
-        return 2;
+      export function getSourceTier(sourceName) {
+        return sourceProvenance[sourceName]?.tier ?? 4;
+      }
+      export function getSourceType(sourceName) {
+        return sourceProvenance[sourceName]?.type ?? 'unknown';
+      }
+      export function getSourceTierBadgeTitle(sourceType) {
+        if (sourceType === 'wire') return 'Wire Service - Highest reliability';
+        if (sourceType === 'gov') return 'Official Government Source';
+        if (sourceType === 'unknown') return 'Source type not yet reviewed';
+        return 'News source';
+      }
+      export function describePropagandaBadge(profile, sourceType = 'unknown') {
+        if (profile.risk === 'unknown') {
+          return {
+            risk: 'unknown',
+            label: '? Unreviewed',
+            shortLabel: '?',
+            title: profile.note || 'Provenance not yet reviewed',
+          };
+        }
+        const title = profile.note
+          || (profile.stateAffiliated ? 'State-affiliated: ' + profile.stateAffiliated : 'Provenance not yet reviewed');
+        if (sourceType === 'gov') {
+          return { risk: profile.risk, label: 'Official Government Source', shortLabel: 'Gov', title };
+        }
+        if (profile.risk === 'low') return null;
+        if (profile.risk === 'high') {
+          return { risk: 'high', label: '⚠ State Media', shortLabel: '⚠', title };
+        }
+        if (profile.risk === 'medium') {
+          return { risk: 'medium', label: '! Caution', shortLabel: '!', title };
+        }
+        return { risk: 'unknown', label: '? Unreviewed', shortLabel: '?', title };
       }
     `],
     ['country-geometry-stub', `
@@ -135,7 +182,15 @@ async function loadCountryDeepDivePanel(options = {}) {
       }
     `],
     ['sanitize-stub', `
-      export function sanitizeUrl(value) { return value ?? ''; }
+      export function sanitizeUrl(value) {
+        if (!value) return '';
+        try {
+          const parsed = new URL(value, 'https://example.com');
+          return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? value : '';
+        } catch {
+          return '';
+        }
+      }
       export function escapeHtml(value) { return value ?? ''; }
       export function safeHtmlToString(value) { return String(value ?? ''); }
     `],
@@ -148,6 +203,7 @@ async function loadCountryDeepDivePanel(options = {}) {
     `],
     ['utils-stub', `
       export function getCSSColor() { return '#44ff88'; }
+      export function isMobileDevice() { return ${options.mobile === true ? 'true' : 'false'}; }
       export function showToast(msg) { globalThis.__wmCountryDeepDiveTestState.toasts.push(msg); }
       export function createCircuitBreaker() { return { execute: (fn) => fn() }; }
       export function loadFromStorage() { return null; }
@@ -171,7 +227,13 @@ async function loadCountryDeepDivePanel(options = {}) {
       export function fetchBypassOptions() { return Promise.resolve({ corridors: [] }); }
       export function getCountryChokepointIndex() { return null; }
       export function fetchChokepointStatus() { return Promise.resolve({ chokepoints: [], fetchedAt: '', upstreamUnavailable: false }); }
-      export function fetchMultiSectorCostShock() { return Promise.resolve({ iso2: '', chokepointId: '', closureDays: 30, warRiskTier: 'WAR_RISK_TIER_UNSPECIFIED', sectors: [], totalAddedCost: 0, fetchedAt: '', unavailableReason: '' }); }
+      export function fetchMultiSectorCostShock(code, chokepoint, days, options) {
+        const state = globalThis.__wmCountryDeepDiveTestState;
+        return new Promise(resolve => {
+          state.costShockRequests.push({ code, chokepoint, days, signal: options?.signal, resolve });
+          if (!state.deferCostShock) resolve({ iso2: code, chokepointId: chokepoint, closureDays: days, warRiskTier: 'WAR_RISK_TIER_UNSPECIFIED', sectors: [], totalAddedCost: 0, fetchedAt: '', unavailableReason: '' });
+        });
+      }
       export const HS2_SHORT_LABELS = { '27': 'Energy', '84': 'Machinery', '85': 'Electronics', '87': 'Vehicles', '30': 'Pharma', '72': 'Iron & Steel', '39': 'Plastics', '29': 'Chemicals', '10': 'Cereals', '62': 'Apparel' };
     `],
     ['runtime-stub', `
@@ -183,11 +245,72 @@ async function loadCountryDeepDivePanel(options = {}) {
       export class IntelligenceServiceClient {}
     `],
     ['panel-gating-stub', `
-      export function hasPremiumAccess() { return ${premiumAccess ? 'true' : 'false'}; }
+      export function hasPremiumAccess() { return globalThis.__wmCountryDeepDiveTestState.premiumAccess; }
       export function getPanelGateReason() { return 'none'; }
     `],
     ['auth-state-stub', `
+      const state = globalThis.__wmCountryDeepDiveTestState;
       export function getAuthState() { return { user: null }; }
+      export function subscribeAuthState(callback) {
+        state.authListeners.add(callback);
+        callback(getAuthState());
+        return () => state.authListeners.delete(callback);
+      }
+    `],
+    ['entitlements-stub', `
+      const state = globalThis.__wmCountryDeepDiveTestState;
+      export function isEntitled() { return state.premiumAccess; }
+      export function getEntitlementState() { return null; }
+      export function onEntitlementChange(callback) {
+        state.entitlementListeners.add(callback);
+        return () => state.entitlementListeners.delete(callback);
+      }
+    `],
+    ['resilience-service-stub', `
+      const state = globalThis.__wmCountryDeepDiveTestState;
+      const demographicsResponse = ${demographicsResponse};
+      export async function getFoodStocks() {
+        return { commodities: [], unavailable: true };
+      }
+      export async function getDemographicsCapability(options) {
+        state.demographicsCalls.push({
+          countryCode: options.countryCode,
+          hasSignal: options.signal instanceof AbortSignal,
+        });
+        return { ...demographicsResponse, countryCode: options.countryCode };
+      }
+    `],
+    ['scorecard-service-stub', `
+      const state = globalThis.__wmCountryDeepDiveTestState;
+      const scorecardResponse = ${scorecardResponse};
+      const scorecardMode = ${scorecardMode};
+      export async function getFiveFactorScorecard(countryCode, signal) {
+        state.scorecardCalls.push({
+          countryCode,
+          hasSignal: signal instanceof AbortSignal,
+        });
+        if (scorecardMode === 'reject') throw new Error('synthetic scorecard failure');
+        if (scorecardMode === 'timeout') {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          const error = new Error('synthetic scorecard timeout');
+          error.name = 'TimeoutError';
+          throw error;
+        }
+        if (scorecardMode === 'deferred' || scorecardMode === 'deferred-ignore-abort') {
+          return new Promise((resolve, reject) => {
+            const pending = { countryCode, resolve, reject };
+            state.scorecardPending.push(pending);
+            if (scorecardMode === 'deferred') {
+              signal.addEventListener('abort', () => {
+                const error = new Error('synthetic scorecard abort');
+                error.name = 'AbortError';
+                reject(error);
+              }, { once: true });
+            }
+          });
+        }
+        return scorecardResponse;
+      }
     `],
     ['resilience-widget-stub', resilienceWidgetStub],
     ['sentry-defer-stub', `
@@ -208,6 +331,17 @@ async function loadCountryDeepDivePanel(options = {}) {
           },
         });
       }
+    `],
+    ['overlay-history-stub', `
+      const state = globalThis.__wmCountryDeepDiveTestState;
+      export const overlayHistory = {
+        open(id, closeFromHistory) {
+          state.historyEntry = { id, closeFromHistory };
+        },
+        close(id) {
+          if (state.historyEntry?.id === id) state.historyEntry = null;
+        }
+      };
     `],
   ]);
 
@@ -234,7 +368,11 @@ async function loadCountryDeepDivePanel(options = {}) {
     ['@/generated/client/worldmonitor/intelligence/v1/service_client', 'intelligence-client-stub'],
     ['@/services/panel-gating', 'panel-gating-stub'],
     ['@/services/auth-state', 'auth-state-stub'],
+    ['@/services/entitlements', 'entitlements-stub'],
+    ['@/services/resilience', 'resilience-service-stub'],
+    ['@/services/scorecard', 'scorecard-service-stub'],
     ['@/bootstrap/sentry-defer', 'sentry-defer-stub'],
+    ['@/utils/overlay-history', 'overlay-history-stub'],
   ]);
 
   const plugin = {
@@ -259,6 +397,7 @@ async function loadCountryDeepDivePanel(options = {}) {
     platform: 'browser',
     target: 'es2020',
     write: false,
+    loader: { '.css': 'text' },
     plugins: [plugin],
   });
 
@@ -268,7 +407,7 @@ async function loadCountryDeepDivePanel(options = {}) {
   return {
     CountryDeepDivePanel: mod.CountryDeepDivePanel,
     cleanupBundle() {
-      rmSync(tempDir, { recursive: true, force: true });
+      removeTempDir(tempDir);
     },
   };
 }
@@ -281,8 +420,10 @@ export async function createCountryDeepDivePanelHarness(options = {}) {
     requestAnimationFrame: snapshotGlobal('requestAnimationFrame'),
     cancelAnimationFrame: snapshotGlobal('cancelAnimationFrame'),
     navigator: snapshotGlobal('navigator'),
+    location: snapshotGlobal('location'),
     HTMLElement: snapshotGlobal('HTMLElement'),
     HTMLButtonElement: snapshotGlobal('HTMLButtonElement'),
+    Node: snapshotGlobal('Node'),
   };
   const browserEnvironment = createBrowserEnvironment();
   const state = {
@@ -290,10 +431,20 @@ export async function createCountryDeepDivePanelHarness(options = {}) {
     sentryBreadcrumbs: [],
     sentryExceptions: [],
     sentryMessages: [],
+    demographicsCalls: [],
+    scorecardCalls: [],
+    scorecardPending: [],
+    costShockRequests: [],
+    deferCostShock: options.deferCostShock === true,
+    premiumAccess: options.premiumAccess === true,
+    authListeners: new Set(),
+    entitlementListeners: new Set(),
     sentryUser: undefined,
     evidenceExports: [],
     gateHits: [],
     toasts: [],
+    historyEntry: null,
+    forwardHistoryEntry: null,
   };
 
   defineGlobal('document', browserEnvironment.document);
@@ -302,8 +453,10 @@ export async function createCountryDeepDivePanelHarness(options = {}) {
   defineGlobal('requestAnimationFrame', browserEnvironment.requestAnimationFrame);
   defineGlobal('cancelAnimationFrame', browserEnvironment.cancelAnimationFrame);
   defineGlobal('navigator', browserEnvironment.window.navigator);
+  defineGlobal('location', browserEnvironment.window.location);
   defineGlobal('HTMLElement', browserEnvironment.HTMLElement);
   defineGlobal('HTMLButtonElement', browserEnvironment.HTMLButtonElement);
+  defineGlobal('Node', MiniNode);
   globalThis.__wmCountryDeepDiveTestState = state;
 
   let CountryDeepDivePanel;
@@ -318,8 +471,10 @@ export async function createCountryDeepDivePanelHarness(options = {}) {
     restoreGlobal('requestAnimationFrame', originalGlobals.requestAnimationFrame);
     restoreGlobal('cancelAnimationFrame', originalGlobals.cancelAnimationFrame);
     restoreGlobal('navigator', originalGlobals.navigator);
+    restoreGlobal('location', originalGlobals.location);
     restoreGlobal('HTMLElement', originalGlobals.HTMLElement);
     restoreGlobal('HTMLButtonElement', originalGlobals.HTMLButtonElement);
+    restoreGlobal('Node', originalGlobals.Node);
     throw error;
   }
 
@@ -340,8 +495,10 @@ export async function createCountryDeepDivePanelHarness(options = {}) {
     restoreGlobal('requestAnimationFrame', originalGlobals.requestAnimationFrame);
     restoreGlobal('cancelAnimationFrame', originalGlobals.cancelAnimationFrame);
     restoreGlobal('navigator', originalGlobals.navigator);
+    restoreGlobal('location', originalGlobals.location);
     restoreGlobal('HTMLElement', originalGlobals.HTMLElement);
     restoreGlobal('HTMLButtonElement', originalGlobals.HTMLButtonElement);
+    restoreGlobal('Node', originalGlobals.Node);
   }
 
   return {
@@ -357,6 +514,29 @@ export async function createCountryDeepDivePanelHarness(options = {}) {
     getSentryExceptions() {
       return state.sentryExceptions;
     },
+    getDemographicsCalls() {
+      return state.demographicsCalls;
+    },
+    getScorecardCalls() {
+      return state.scorecardCalls;
+    },
+    getCostShockRequests() {
+      return state.costShockRequests;
+    },
+    resolveScorecard(index, response) {
+      state.scorecardPending[index]?.resolve(response);
+    },
+    rejectScorecard(index, error = new Error('synthetic scorecard failure')) {
+      state.scorecardPending[index]?.reject(error);
+    },
+    getPendingScorecards() {
+      return state.scorecardPending;
+    },
+    setPremiumAccess(value, source = 'entitlement') {
+      state.premiumAccess = value === true;
+      const listeners = source === 'auth' ? state.authListeners : state.entitlementListeners;
+      for (const listener of [...listeners]) listener(source === 'auth' ? { user: null } : null);
+    },
     getEvidenceExports() {
       return state.evidenceExports;
     },
@@ -365,6 +545,21 @@ export async function createCountryDeepDivePanelHarness(options = {}) {
     },
     getToasts() {
       return state.toasts;
+    },
+    historyBack() {
+      const entry = state.historyEntry;
+      state.historyEntry = null;
+      state.forwardHistoryEntry = entry;
+      entry?.closeFromHistory('history');
+      return entry?.id ?? null;
+    },
+    historyForward() {
+      const entry = state.forwardHistoryEntry;
+      state.forwardHistoryEntry = null;
+      return entry?.id ?? null;
+    },
+    getHistoryEntry() {
+      return state.historyEntry?.id ?? null;
     },
     cleanup,
   };

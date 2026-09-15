@@ -73,7 +73,13 @@ function setCookies(resp) {
 
 function cookieValue(cookies, name) {
   const prefix = `${name}=`;
-  const found = cookies.find((cookie) => cookie.startsWith(prefix));
+  const found = cookies.find((cookie) => {
+    if (!cookie.startsWith(prefix)) return false;
+    const attrs = cookie.split(';').map((part) => part.trim().toLowerCase());
+    const maxAge = attrs.find((attr) => attr.startsWith('max-age='));
+    if (maxAge && Number(maxAge.slice('max-age='.length)) <= 0) return false;
+    return true;
+  });
   if (!found) return '';
   return decodeURIComponent(found.slice(prefix.length).split(';')[0]);
 }
@@ -110,18 +116,42 @@ function makeWaitUntilCtx() {
   };
 }
 
-test('POST from trusted origin sets a valid HttpOnly wms_ session cookie without exposing token JSON', async () => {
+test('POST sets a valid HttpOnly cookie and returns the anonymous-only fallback token', async () => {
   const resp = await handler(makeReq('POST', { origin: 'https://worldmonitor.app' }));
   assert.equal(resp.status, 200);
   const body = await resp.json();
-  assert.equal(body.token, undefined);
+  assert.match(body.token, /^wms_/);
+  assert.equal(await validateSessionToken(body.token), true);
   assert.equal(typeof body.exp, 'number');
+  assert.equal(resp.headers.get('cache-control'), 'no-store');
   const cookies = setCookies(resp);
   const token = cookieValue(cookies, 'wm-session');
   assert.match(token, /^wms_/);
+  assert.equal(body.token, token, 'cookie and fallback header must carry the same anonymous token');
   assert.equal(await validateSessionToken(token), true);
   assert.match(cookies.join('\n'), /wm-session=.*HttpOnly/);
   assert.match(cookies.join('\n'), /wm-session=.*Domain=\.worldmonitor\.app/);
+});
+
+test('production Set-Cookie tombstones the host-only cookie before the shared-domain cookie', async () => {
+  // An older api.worldmonitor.app host-only wm-session would otherwise shadow
+  // Domain=.worldmonitor.app. Tombstone first, then the live Domain cookie.
+  const resp = await handler(makeReq('POST', { origin: 'https://worldmonitor.app' }));
+  assert.equal(resp.status, 200);
+  const body = await resp.json();
+  const cookies = setCookies(resp);
+  const sessionCookies = cookies.filter((cookie) => cookie.startsWith('wm-session='));
+  assert.equal(sessionCookies.length, 2, 'host-only tombstone then Domain cookie');
+  assert.match(sessionCookies[0], /^wm-session=; Path=\/; Max-Age=0; HttpOnly; Secure; SameSite=Lax$/);
+  assert.match(sessionCookies[0], /HttpOnly/);
+  assert.doesNotMatch(sessionCookies[0], /Domain=/);
+  assert.match(sessionCookies[1], /Domain=\.worldmonitor\.app/);
+  assert.match(sessionCookies[1], /HttpOnly/);
+  assert.match(sessionCookies[1], /SameSite=Lax/);
+  assert.doesNotMatch(sessionCookies[1], /SameSite=None/);
+  const token = cookieValue(cookies, 'wm-session');
+  assert.equal(body.token, token, 'live Domain cookie value still equals the JSON token');
+  assert.match(token, /^wms_/);
 });
 
 test('POST emits one anonymous mint usage event without exposing cookie material', async () => {
@@ -243,9 +273,9 @@ test('localhost session cookie remains host-only for dev', async () => {
   const resp = await handler(makeLocalReq('POST', { origin: 'http://localhost:5173' }));
   assert.equal(resp.status, 200);
   const cookies = setCookies(resp);
-  const session = cookies.find((cookie) => cookie.startsWith('wm-session='));
-  assert.ok(session, 'wm-session cookie should be set');
-  assert.doesNotMatch(session, /Domain=/);
+  const sessionCookies = cookies.filter((cookie) => cookie.startsWith('wm-session='));
+  assert.equal(sessionCookies.length, 1, 'localhost must not emit a host-only tombstone');
+  assert.doesNotMatch(sessionCookies[0], /Domain=/);
 });
 
 test('OPTIONS preflight returns 204 with CORS', async () => {
@@ -280,17 +310,57 @@ test('GET method is rejected with 405', async () => {
   assert.equal(resp.status, 405);
 });
 
+test('Disallowed origin OPTIONS preflight succeeds with echoed Origin (#6411)', async () => {
+  const origin = 'https://evil.example.com';
+  const resp = await handler(makeReq('OPTIONS', { origin }));
+  assert.equal(resp.status, 204);
+  assert.equal(resp.headers.get('access-control-allow-origin'), origin);
+  assert.equal(resp.headers.get('access-control-allow-credentials'), 'true');
+});
+
 test('Disallowed origin gets 403', async () => {
   const resp = await handler(makeReq('POST', { origin: 'https://evil.example.com' }));
   assert.equal(resp.status, 403);
+});
+
+test('Disallowed origin 403 echoes the request Origin so the client can read it (#6411)', async () => {
+  const origin = 'https://evil.example.com';
+  const resp = await handler(makeReq('POST', { origin }));
+  assert.equal(resp.status, 403);
+  assert.equal(resp.headers.get('access-control-allow-origin'), origin);
+  assert.equal(resp.headers.get('access-control-allow-credentials'), 'true');
+  assert.equal(await resp.text(), 'Forbidden');
+});
+
+test('Google Translate proxy origin can mint an anonymous session (#6411)', async () => {
+  const origin = 'https://www-worldmonitor-app.translate.goog';
+  const resp = await handler(makeReq('POST', { origin }));
+  assert.equal(resp.status, 200);
+  assert.equal(resp.headers.get('access-control-allow-origin'), origin);
+  const body = await resp.json();
+  assert.equal(body.ok, true);
+  assert.match(body.token, /^wms_/);
+  assert.equal(typeof body.exp, 'number');
+});
+
+test('Trailing-dot FQDN first-party origin can mint a session (#6411)', async () => {
+  const origin = 'https://tech.worldmonitor.app.';
+  const resp = await handler(makeReq('POST', { origin }));
+  assert.equal(resp.status, 200);
+  assert.equal(resp.headers.get('access-control-allow-origin'), origin);
+  const body = await resp.json();
+  assert.equal(body.ok, true);
+  assert.match(body.token, /^wms_/);
 });
 
 test('No origin (curl) is allowed (rate limit + token TTL are the throttles)', async () => {
   const resp = await handler(makeReq('POST', {}));
   assert.equal(resp.status, 200);
   const body = await resp.json();
-  assert.equal(body.token, undefined);
-  assert.match(cookieValue(setCookies(resp), 'wm-session'), /^wms_/);
+  const cookieToken = cookieValue(setCookies(resp), 'wm-session');
+  assert.match(body.token, /^wms_/);
+  assert.equal(body.token, cookieToken);
+  assert.equal(await validateSessionToken(body.token), true);
 });
 
 test('POST returns degraded 503 without issuing a token when Redis limiter config is missing', async () => {
@@ -605,4 +675,58 @@ test('Returns 503 when WM_SESSION_SECRET is missing', async () => {
   } finally {
     process.env.WM_SESSION_SECRET = stash;
   }
+});
+
+// --- hadSession: does the caller's browser give the cookie back? -------------
+// The client cannot answer this itself (HttpOnly), so it could not tell "the
+// server rejected my cookie" from "my browser never stored it" — and re-minted
+// forever on the second, reporting it as a server-side retry_401. See
+// WORLDMONITOR-WG/XP.
+
+function makeReqWithCookie(cookie) {
+  const headers = new Headers({ origin: 'https://worldmonitor.app' });
+  if (cookie) headers.set('cookie', cookie);
+  return new Request('https://api.worldmonitor.app/api/wm-session', { method: 'POST', headers });
+}
+
+test('mint reports hadSession:false when the request carries no session cookie', async () => {
+  const resp = await handler(makeReqWithCookie(null));
+  assert.equal(resp.status, 200);
+  const body = await resp.json();
+  assert.equal(body.hadSession, false, 'a first-ever visitor presents no cookie');
+});
+
+test('mint reports hadSession:true when the browser returns the cookie it was issued', async () => {
+  const first = await handler(makeReqWithCookie(null));
+  const token = cookieValue(setCookies(first), 'wm-session');
+  assert.match(token, /^wms_/);
+
+  // Exactly what a browser that stored the cookie sends on the next mint.
+  const resp = await handler(makeReqWithCookie(`wm-session=${encodeURIComponent(token)}`));
+  assert.equal(resp.status, 200);
+  const body = await resp.json();
+  assert.equal(body.hadSession, true, 'a cookie that made the round trip must be reported');
+});
+
+test('mint reports hadSession:false for a tampered or foreign session cookie', async () => {
+  // A cookie that exists but does not verify is not evidence of a working
+  // round trip — it must not suppress the client's re-mint.
+  const first = await handler(makeReqWithCookie(null));
+  const token = cookieValue(setCookies(first), 'wm-session');
+  const tampered = `${token.slice(0, -2)}${token.slice(-2) === 'AA' ? 'BB' : 'AA'}`;
+
+  const resp = await handler(makeReqWithCookie(`wm-session=${encodeURIComponent(tampered)}`));
+  assert.equal(resp.status, 200);
+  const body = await resp.json();
+  assert.equal(body.hadSession, false);
+});
+
+test('mint still succeeds when the cookie header is malformed', async () => {
+  // hadSession is diagnostic, never a gate: a junk Cookie header must not
+  // turn a routine mint into an error.
+  const resp = await handler(makeReqWithCookie('wm-session=%%%not-a-token%%%; other=1'));
+  assert.equal(resp.status, 200);
+  const body = await resp.json();
+  assert.equal(body.hadSession, false);
+  assert.match(cookieValue(setCookies(resp), 'wm-session'), /^wms_/);
 });

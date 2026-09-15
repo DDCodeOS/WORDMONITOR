@@ -1,11 +1,9 @@
 /**
  * RPC: submitContact -- Stores an enterprise contact submission and emails ops.
  * Port from api/contact.js
- * Sources: Convex contactMessages:submit mutation + Resend notification email
+ * Sources: authenticated Convex contact HTTP route + Resend notification email
  */
 
-import { ConvexHttpClient } from 'convex/browser';
-import { ConvexError } from 'convex/values';
 import type {
   ServerContext,
   SubmitContactRequest,
@@ -19,7 +17,7 @@ const PHONE_RE = /^[+(]?\d[\d\s()./-]{4,23}\d$/;
 const MAX_FIELD = 500;
 const MAX_MESSAGE = 2000;
 
-const FREE_EMAIL_DOMAINS = new Set<string>([
+export const FREE_EMAIL_DOMAINS = new Set<string>([
   'gmail.com', 'googlemail.com', 'yahoo.com', 'yahoo.fr', 'yahoo.co.uk', 'yahoo.co.jp',
   'hotmail.com', 'hotmail.fr', 'hotmail.co.uk', 'outlook.com', 'outlook.fr',
   'live.com', 'live.fr', 'msn.com', 'aol.com', 'icloud.com', 'me.com', 'mac.com',
@@ -149,30 +147,47 @@ export async function submitContact(
   const safeMsg = message ? message.slice(0, MAX_MESSAGE) : undefined;
   const safeSource = source ? source.slice(0, 100) : 'enterprise-contact';
 
-  const convexUrl = process.env.CONVEX_URL;
-  if (!convexUrl) {
+  const convexUrl = (process.env.CONVEX_SITE_URL
+    ?? (process.env.CONVEX_URL ?? '').replace('.convex.cloud', '.convex.site')).replace(/\/$/, '');
+  const secret = process.env.CONVEX_SERVER_SHARED_SECRET;
+  if (!convexUrl || !secret) {
     throw new ApiError(503, 'Service unavailable', '');
   }
 
-  const client = new ConvexHttpClient(convexUrl);
+  let response: Response;
   try {
-    await client.mutation('contactMessages:submit' as any, {
-      name: safeName,
-      email: email.trim(),
-      organization: safeOrg,
-      phone: safePhone,
-      message: safeMsg,
-      source: safeSource,
+    response = await fetch(`${convexUrl}/leads/submit-contact`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'worldmonitor-leads/1.0',
+        'x-convex-shared-secret': secret,
+      },
+      body: JSON.stringify({
+        name: safeName,
+        email: email.trim(),
+        organization: safeOrg,
+        phone: safePhone,
+        message: safeMsg,
+        source: safeSource,
+      }),
+      signal: AbortSignal.timeout(10_000),
     });
-  } catch (err) {
-    // Translate the Convex per-email throttle into a proper 429 so the
-    // browser can show "try again in an hour" instead of an opaque 500.
-    // Convex serializes ConvexError payloads onto err.data.
-    const data = (err as { data?: { kind?: string; message?: string } } | null)?.data;
-    if (err instanceof ConvexError && data?.kind === 'rate_limited') {
-      throw new ApiError(429, data.message || 'Too many requests', '');
-    }
-    throw err;
+  } catch {
+    throw new ApiError(503, 'Service unavailable', '');
+  }
+  if (response.status === 429) {
+    throw new ApiError(429, 'Too many recent submissions for this email; try again later.', '');
+  }
+  if (response.status === 422) {
+    throw new ApiError(422, 'Please use a corporate email address.', '');
+  }
+  if (!response.ok) {
+    throw new ApiError(503, 'Service unavailable', '');
+  }
+  const result: unknown = await response.json().catch(() => null);
+  if (!result || typeof result !== 'object' || !('status' in result) || result.status !== 'sent') {
+    throw new ApiError(503, 'Service unavailable', '');
   }
 
   const emailSent = await sendNotificationEmail(

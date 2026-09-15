@@ -12,6 +12,7 @@ import {
   classifyHttpCheckoutError,
   classifySyntheticCheckoutError,
   classifyThrownCheckoutError,
+  parseCheckoutRetryAfterSeconds,
 } from '../src/services/checkout-errors.ts';
 
 describe('classifyHttpCheckoutError', () => {
@@ -48,6 +49,59 @@ describe('classifyHttpCheckoutError', () => {
     assert.equal(err.code, 'invalid_product');
   });
 
+  it('maps 409 idempotency_conflict to service_unavailable, not invalid_product', () => {
+    // The transport retries a transient origin failure 1.5s later with the SAME
+    // Idempotency-Key. When the first attempt is still running, the edge holds
+    // the processing marker and answers 409 `idempotency_conflict` with
+    // Retry-After: 2 (api/_idempotency.js). That is the retry working as
+    // designed, not a bad product — but without this branch it falls through
+    // the generic 4xx arm to `invalid_product`, which tells the buyer "That
+    // product isn't available" AND switches the retry affordance off, turning a
+    // recoverable race into a terminal dead end. Widening the retry set to the
+    // Cloudflare 52x family made this race materially more likely, because 520
+    // and 524 are emitted precisely when the origin DID receive the request.
+    const err = classifyHttpCheckoutError(409, {
+      error: 'idempotency_conflict',
+      message: 'A request with this Idempotency-Key is still being processed. Retry shortly.',
+    });
+    assert.equal(err.code, 'service_unavailable');
+    assert.equal(err.retryable, true);
+    // Raw server string stays off-screen.
+    assert.notEqual(err.userMessage, err.serverMessage);
+  });
+
+  it('keeps the Retry-After the idempotency conflict carries', () => {
+    // The edge sends `Retry-After: 2` with the conflict because it knows how
+    // long the first attempt may still hold the lock. Dropping it threw away
+    // the one number that makes the wait actionable, and left the caller with
+    // nothing to set a cooldown from — so a re-click went straight back into
+    // the same lock.
+    const err = classifyHttpCheckoutError(
+      409,
+      { error: 'idempotency_conflict', message: 'still being processed' },
+      '2',
+    );
+    assert.equal(err.code, 'service_unavailable');
+    assert.equal(err.retryAfterSeconds, 2);
+  });
+
+  it('does NOT put rate-limit wording on a conflict that carries Retry-After', () => {
+    // The copy override used to key on the presence of retryAfterSeconds, so
+    // preserving the header would have started telling buyers they were rate
+    // limited when they were not — swapping one false message for another,
+    // which is the defect this branch exists to fix.
+    const conflict = classifyHttpCheckoutError(409, { error: 'idempotency_conflict' }, '2');
+    assert.match(conflict.userMessage, /temporarily unavailable/i);
+    assert.doesNotMatch(conflict.userMessage, /rate limited/i);
+
+    // The genuine 429 keeps its own wording, seconds and all.
+    const limited = classifyHttpCheckoutError(429, undefined, '10');
+    assert.equal(limited.code, 'rate_limited');
+    assert.equal(limited.retryAfterSeconds, 10);
+    assert.match(limited.userMessage, /rate limited/i);
+    assert.match(limited.userMessage, /10 seconds/);
+  });
+
   it('maps 400 to invalid_product', () => {
     const err = classifyHttpCheckoutError(400);
     assert.equal(err.code, 'invalid_product');
@@ -69,6 +123,22 @@ describe('classifyHttpCheckoutError', () => {
     assert.equal(err.code, 'service_unavailable');
     assert.equal(err.retryable, true);
     assert.equal(err.httpStatus, 403);
+  });
+
+  it('preserves 429 as a bounded rate-limited outcome', () => {
+    const err = classifyHttpCheckoutError(429, {
+      error: 'CHECKOUT_RATE_LIMITED',
+    }, '12');
+    assert.equal(err.code, 'rate_limited');
+    assert.equal(err.retryable, true);
+    assert.equal(err.httpStatus, 429);
+    assert.equal(err.retryAfterSeconds, 12);
+    assert.match(err.userMessage, /wait 12 seconds/i);
+  });
+
+  it('defaults malformed or absent 429 retry hints to the safe edge fallback', () => {
+    assert.equal(classifyHttpCheckoutError(429, undefined, 'later').retryAfterSeconds, 10);
+    assert.equal(classifyHttpCheckoutError(429).retryAfterSeconds, 10);
   });
 
   it('maps 500 to service_unavailable', () => {
@@ -118,6 +188,16 @@ describe('classifyHttpCheckoutError', () => {
     });
     assert.ok(!err.userMessage.includes('leaked'));
     assert.ok(!err.userMessage.includes('db.prod'));
+  });
+});
+
+describe('parseCheckoutRetryAfterSeconds', () => {
+  it('accepts only the numeric 1-4 digit edge contract', () => {
+    assert.equal(parseCheckoutRetryAfterSeconds('0'), 0);
+    assert.equal(parseCheckoutRetryAfterSeconds('9999'), 9999);
+    assert.equal(parseCheckoutRetryAfterSeconds('10000'), undefined);
+    assert.equal(parseCheckoutRetryAfterSeconds('Wed, 21 Oct 2015 07:28:00 GMT'), undefined);
+    assert.equal(parseCheckoutRetryAfterSeconds('-1'), undefined);
   });
 });
 

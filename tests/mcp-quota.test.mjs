@@ -11,6 +11,11 @@
  *   - 401 on no/invalid Clerk session.
  *   - 405 on non-GET methods (Allow header set).
  *   - Cache-Control: no-store on every response.
+ *   - `limit` is the caller's PLAN-resolved allowance (plan 2026-07-25-001 U3b),
+ *     normalised through the same `resolveDailyLimit` the enforcement path uses,
+ *     and `used` is clamped to THAT limit — not to the hardcoded 50. A Pro
+ *     Business caller at 120/250 must never read "50 / 50" here while
+ *     enforcement serves them fine.
  */
 
 import { strict as assert } from 'node:assert';
@@ -27,6 +32,29 @@ function makeReq({ method = 'GET', auth = true } = {}) {
   });
 }
 
+/** Catalog-shaped planLimits block; only mcpCallsPerDay is load-bearing here. */
+function limits(mcpCallsPerDay) {
+  return {
+    apiRequestsPerDay: 0,
+    apiBurstRequestsPerMinute: 0,
+    mcpCallsPerDay,
+    mcpBurstRequestsPerMinute: 60,
+  };
+}
+
+/** Entitlement fixture. `planLimits === undefined` = legacy pre-catalog row. */
+function entitlement(planKey, planLimits) {
+  return {
+    planKey,
+    features: {
+      tier: 1,
+      mcpAccess: true,
+      ...(planLimits === undefined ? {} : { planLimits }),
+    },
+    validUntil: Date.now() + 86_400_000,
+  };
+}
+
 function makeDeps(overrides = {}) {
   // Deterministic UTC time anchor: 2026-05-10T12:34:56Z. resetsAt should
   // therefore be 2026-05-11T00:00:00.000Z.
@@ -34,6 +62,9 @@ function makeDeps(overrides = {}) {
   return {
     resolveUserId: async () => 'user_pro_123',
     redisGet: async () => null,
+    // Default fixture is a LEGACY row (no planLimits) so every pre-U3b
+    // assertion in this file keeps pinning the 50/day fallback.
+    getEntitlements: async () => entitlement('pro_monthly', undefined),
     now: () => FIXED_NOW,
     ...overrides,
   };
@@ -210,3 +241,267 @@ describe('mcp-quota handler', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// U3b — the displayed limit is the caller's PLAN limit
+//
+// Enforcement went plan-driven in U3 (`reserveQuota` + `resolveDailyLimit`);
+// this reader stayed on the hardcoded `PRO_DAILY_QUOTA_LIMIT`. The pairing
+// below is the contract: whatever `resolveDailyLimit` would enforce is what
+// the settings widget must show, and `used` is clamped to THAT number.
+// ---------------------------------------------------------------------------
+describe('mcp-quota handler — plan-resolved limit (U3b)', () => {
+  it('reports the Pro Business allowance (250) with usage unclamped below it', async () => {
+    const deps = makeDeps({
+      getEntitlements: async () => entitlement('pro_business_monthly', limits(250)),
+      redisGet: async () => '120',
+    });
+    const resp = await quotaHandler(makeReq(), deps);
+    assert.equal(resp.status, 200);
+    const body = await resp.json();
+    assert.equal(body.limit, 250, 'Pro Business reads its own 250/day allowance');
+    assert.equal(body.used, 120, 'usage must not be clamped to the 50/day default');
+  });
+
+  it('clamps used to the PLAN limit, not to the 50/day default', async () => {
+    const deps = makeDeps({
+      getEntitlements: async () => entitlement('pro_business_monthly', limits(250)),
+      redisGet: async () => '999',
+    });
+    const body = await (await quotaHandler(makeReq(), deps)).json();
+    assert.equal(body.limit, 250);
+    assert.equal(body.used, 250, 'clamp target is the resolved limit');
+  });
+
+  it('represents an unlimited plan (mcpCallsPerDay: null) as limit: null with no clamp', async () => {
+    const deps = makeDeps({
+      getEntitlements: async () => entitlement('enterprise', limits(null)),
+      redisGet: async () => '4321',
+    });
+    const body = await (await quotaHandler(makeReq(), deps)).json();
+    assert.equal(body.limit, null, 'null = unlimited, same wire meaning as the catalog');
+    assert.equal(body.used, 4321, 'unlimited plans are never clamped');
+  });
+
+  it('honours a real zero allowance verbatim (0 is a limit, not a missing one)', async () => {
+    const deps = makeDeps({
+      getEntitlements: async () => entitlement('free', limits(0)),
+      redisGet: async () => '3',
+    });
+    const body = await (await quotaHandler(makeReq(), deps)).json();
+    assert.equal(body.limit, 0);
+    assert.equal(body.used, 0);
+  });
+
+  it('displays the shared REST budget for an API-tier plan (display == enforcement)', async () => {
+    // The shared budget is only a cap once REST enforcement is on; in shadow
+    // the plan stays on its dedicated counter (mcp-shared-budget-enforcement).
+    process.env.API_RATE_LIMIT_ENFORCE = 'true';
+    // An API-tier plan has no MCP allowance of its own: its calls charge
+    // `apiRequestsPerDay`, so that is the number the meter applies and the only
+    // honest one to display. Showing a separate MCP figure here is what told a
+    // customer they had 1,000 MCP calls that were never provisioned.
+    const deps = makeDeps({
+      getEntitlements: async () => entitlement('api_starter', {
+        apiRequestsPerDay: 1000,
+        apiBurstRequestsPerMinute: 60,
+        mcpCallsPerDay: 'shared-api-budget',
+        mcpBurstRequestsPerMinute: 60,
+      }),
+      redisGet: async () => '48',
+    });
+    const body = await (await quotaHandler(makeReq(), deps)).json();
+    assert.equal(body.limit, 1000, 'the displayed limit is the budget enforcement charges');
+    assert.equal(body.used, 48);
+  });
+
+  it('displays the same 1,000 in SHADOW mode, because that is still what rejects', async () => {
+    // The flag moves the COUNTER, not the number. While it is off the widget
+    // read the dedicated counter at PRO_DAILY_QUOTA_LIMIT and told an API
+    // Starter subscriber they had 50 calls a day — the published number is
+    // 1,000, and 1,000 is what the reservation now enforces.
+    delete process.env.API_RATE_LIMIT_ENFORCE;
+    const deps = makeDeps({
+      getEntitlements: async () => entitlement('api_starter', {
+        apiRequestsPerDay: 1000,
+        apiBurstRequestsPerMinute: 60,
+        mcpCallsPerDay: 'shared-api-budget',
+        mcpBurstRequestsPerMinute: 60,
+      }),
+      redisGet: async () => '48',
+    });
+    const body = await (await quotaHandler(makeReq(), deps)).json();
+    assert.equal(body.limit, 1000);
+    assert.equal(body.used, 48);
+  });
+
+  it('falls back to 50 for a legacy entitlement row with no planLimits', async () => {
+    const deps = makeDeps({
+      getEntitlements: async () => entitlement('pro_monthly', undefined),
+      redisGet: async () => '7',
+    });
+    const body = await (await quotaHandler(makeReq(), deps)).json();
+    assert.equal(body.limit, 50, 'legacy shape keeps the historical default');
+    assert.equal(body.used, 7);
+  });
+
+  it('falls back to 50 for a malformed allowance (stringified number)', async () => {
+    const deps = makeDeps({
+      getEntitlements: async () => entitlement('pro_business_monthly', limits('250')),
+      redisGet: async () => '73',
+    });
+    const body = await (await quotaHandler(makeReq(), deps)).json();
+    assert.equal(body.limit, 50, 'an unreadable limit must never buy a HIGHER cap');
+    assert.equal(body.used, 50);
+  });
+
+  it('falls back to 50 when the entitlement lookup throws (never 500 the widget)', async () => {
+    const deps = makeDeps({
+      getEntitlements: async () => { throw new Error('convex down'); },
+      redisGet: async () => '12',
+    });
+    const resp = await quotaHandler(makeReq(), deps);
+    assert.equal(resp.status, 200, 'a lookup blip must not break a working endpoint');
+    const body = await resp.json();
+    assert.equal(body.limit, 50);
+    assert.equal(body.used, 12);
+  });
+
+  it('falls back to 50 when the entitlement lookup returns null', async () => {
+    const deps = makeDeps({
+      getEntitlements: async () => null,
+      redisGet: async () => '5',
+    });
+    const body = await (await quotaHandler(makeReq(), deps)).json();
+    assert.equal(body.limit, 50);
+    assert.equal(body.used, 5);
+  });
+
+  it('resolves the limit for the SESSION userId only (no client override)', async () => {
+    let observedUserId = '';
+    const deps = makeDeps({
+      resolveUserId: async () => 'user_clerk_xyz',
+      getEntitlements: async (uid) => {
+        observedUserId = uid;
+        return entitlement('pro_business_monthly', limits(250));
+      },
+      redisGet: async () => '1',
+    });
+    const resp = await quotaHandler(makeReq(), deps);
+    assert.equal(resp.status, 200);
+    assert.equal(observedUserId, 'user_clerk_xyz');
+  });
+
+  it('does not look up entitlements for an unauthenticated caller', async () => {
+    let lookups = 0;
+    const deps = makeDeps({
+      resolveUserId: async () => null,
+      getEntitlements: async () => { lookups += 1; return null; },
+    });
+    const resp = await quotaHandler(makeReq({ auth: false }), deps);
+    assert.equal(resp.status, 401);
+    assert.equal(lookups, 0, '401 short-circuits before any backend read');
+  });
+
+  it('client normaliser keeps the wire meaning of null/0 (settings widget end)', async () => {
+    // The endpoint can now answer `limit: null`. The consumer used to coerce
+    // any non-positive limit to 50, which would have put "50 / 50" back in
+    // front of the exact users this unit exists to fix.
+    const { normalizeQuotaLimit } = await import('../src/services/mcp-clients.ts');
+    assert.equal(normalizeQuotaLimit(null), null, 'null = unlimited must survive');
+    assert.equal(normalizeQuotaLimit(250), 250);
+    assert.equal(normalizeQuotaLimit(0), 0, '0 is a real allowance, not a missing one');
+    assert.equal(normalizeQuotaLimit(undefined), 50, 'absent field → plan default');
+    assert.equal(normalizeQuotaLimit(-1), 50);
+    assert.equal(normalizeQuotaLimit(Number.NaN), 50);
+  });
+
+  it('reuses api/mcp/quota.ts resolveDailyLimit — no second copy of the normalisation', async () => {
+    // Drift guard: if the reader ever grows its own copy of the three-way
+    // contract, this import breaks or the pairing below diverges.
+    const { resolveDailyLimit } = await import('../api/mcp/quota.ts');
+    for (const [planLimit, expected] of [
+      [250, 250],
+      [null, null],
+      [0, 0],
+      [undefined, 50],
+      ['250', 50],
+      [Number.NaN, 50],
+      [-1, 50],
+    ]) {
+      assert.equal(
+        resolveDailyLimit(planLimit),
+        expected,
+        `resolveDailyLimit(${String(planLimit)}) must resolve to ${String(expected)}`,
+      );
+      const deps = makeDeps({
+        getEntitlements: async () => entitlement('p', limits(planLimit)),
+        redisGet: async () => '1',
+      });
+      const body = await (await quotaHandler(makeReq(), deps)).json();
+      assert.equal(
+        body.limit,
+        expected,
+        `endpoint limit must equal the enforced limit for ${String(planLimit)}`,
+      );
+    }
+  });
+});
+
+describe('mcp-quota handler — sharedWithRestApi mirrors the counter it read', () => {
+  // Settings shows this number next to "MCP". Once an API plan's MCP calls are
+  // metered on the REST key, that number also counts REST requests, and the
+  // display has to be able to say so — otherwise the endpoint and the
+  // agent-facing allowance resource describe one counter two different ways.
+  const apiStarterEnt = () => ({
+    planKey: 'api_starter',
+    features: {
+      tier: 2,
+      mcpAccess: true,
+      planLimits: {
+        apiRequestsPerDay: 1000,
+        apiBurstRequestsPerMinute: 60,
+        mcpCallsPerDay: 'shared-api-budget',
+        mcpBurstRequestsPerMinute: 60,
+      },
+    },
+    validUntil: Date.now() + 86_400_000,
+  });
+
+  it('is false for a Pro caller on the dedicated counter', async () => {
+    const body = await (await quotaHandler(makeReq(), makeDeps({ redisGet: async () => '7' }))).json();
+    assert.equal(body.sharedWithRestApi, false);
+  });
+
+  it('is false for an API plan while REST enforcement is off', async () => {
+    delete process.env.API_RATE_LIMIT_ENFORCE;
+    let observedKey = '';
+    const deps = makeDeps({
+      getEntitlements: async () => apiStarterEnt(),
+      redisGet: async (k) => { observedKey = k; return '12'; },
+    });
+    const body = await (await quotaHandler(makeReq(), deps)).json();
+    assert.equal(body.limit, 1000, 'the sold number is the same in both flag states');
+    assert.equal(body.sharedWithRestApi, false);
+    assert.match(observedKey, /^mcp:pro-usage:/, 'shadow mode reads MCP\'s own counter');
+  });
+
+  it('is true for an API plan once REST enforcement is on', async () => {
+    process.env.API_RATE_LIMIT_ENFORCE = 'true';
+    try {
+      let observedKey = '';
+      const deps = makeDeps({
+        getEntitlements: async () => apiStarterEnt(),
+        redisGet: async (k) => { observedKey = k; return '640'; },
+      });
+      const body = await (await quotaHandler(makeReq(), deps)).json();
+      assert.equal(body.used, 640);
+      assert.equal(body.limit, 1000);
+      assert.equal(body.sharedWithRestApi, true);
+      assert.match(observedKey, /rl:apikey:day:/, 'the flag must describe the key actually read');
+    } finally {
+      delete process.env.API_RATE_LIMIT_ENFORCE;
+    }
+  });
+});
+

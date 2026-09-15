@@ -1,9 +1,21 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { readdirSync, readFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  BrowserClient,
+  captureException,
+  defaultStackParser,
+  eventFiltersIntegration,
+  setCurrentClient,
+  withScope,
+} from '@sentry/browser';
 import { isDebugBearRumScriptFrame } from '../src/bootstrap/debugbear-rum.ts';
+import { isIosLikeUserAgent } from '../src/bootstrap/platform-ua.ts';
+import { isolateNonProductionSentryEvent } from '../shared/sentry-build-metadata.ts';
+import { buildCheckoutReportTags } from '../src/services/checkout-sentry-policy.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -40,9 +52,36 @@ assert.ok(tpMatch, 'THIRD_PARTY_FETCH_HOST_ALLOWLIST must be defined in src/boot
 
 // Build a callable version. Input: a Sentry-shaped event object. Returns event or null.
 // eslint-disable-next-line no-new-func
-const rawBeforeSend = new Function('event', 'isDebugBearRumScriptFrame', `${tpMatch[0]}\n${fnBody}`);
-function beforeSend(event) {
-  return rawBeforeSend(event, isDebugBearRumScriptFrame);
+const rawBeforeSend = new Function(
+  'event', 'isDebugBearRumScriptFrame', 'isIosLikeUserAgent', 'navigator',
+  'isolateNonProductionSentryEvent', 'environment',
+  `${tpMatch[0]}\n${fnBody}`,
+);
+
+// User-Agent strings, because beforeSend's platform gates read `navigator.userAgent`
+// — NOT `event.contexts.os`, which the browser SDK never populates (see
+// src/bootstrap/platform-ua.ts). `navigator` is passed as a Function parameter so it
+// shadows Node's global and each test can state the platform explicitly.
+/**
+ * The REAL tag block src/services/checkout.ts puts on every checkout report,
+ * built by the shipped helper rather than copied. A hand-written fixture here
+ * would keep passing after the production tags changed shape, which is the
+ * whole failure mode this suite exists to catch.
+ */
+const CHECKOUT_REPORT_TAGS = buildCheckoutReportTags({
+  action: 'exception',
+  code: 'service_unavailable',
+});
+
+const MAC_DESKTOP_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36';
+const IOS_GOOGLE_APP_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) GSA/432.9.954074404 Mobile/15E148 Safari/604.1';
+const DESKTOP_NAVIGATOR = { userAgent: MAC_DESKTOP_UA, maxTouchPoints: 0 };
+const IOS_NAVIGATOR = { userAgent: IOS_GOOGLE_APP_UA, maxTouchPoints: 5 };
+/** iPadOS 13+ desktop mode: Macintosh UA, but touch-capable. */
+const IPADOS_NAVIGATOR = { userAgent: MAC_DESKTOP_UA, maxTouchPoints: 5 };
+
+function beforeSend(event, navigatorStub = DESKTOP_NAVIGATOR, environment = 'production') {
+  return rawBeforeSend(event, isDebugBearRumScriptFrame, isIosLikeUserAgent, navigatorStub, isolateNonProductionSentryEvent, environment);
 }
 
 // Extract the `ignoreErrors` array literal so tests can assert which messages
@@ -59,10 +98,22 @@ const ieBody = mainSrc.slice(ieStart + 'ignoreErrors: ['.length, ieEnd);
 // eslint-disable-next-line no-new-func
 const ignoreErrors = new Function(`return [${ieBody}\n]`)();
 
-/** Mirror Sentry's ignoreErrors semantics: RegExp → test, string → substring. */
-function isIgnored(msg) {
-  return ignoreErrors.some(p =>
-    p instanceof RegExp ? p.test(msg) : typeof p === 'string' ? msg.includes(p) : false);
+/**
+ * Mirror Sentry's ignoreErrors semantics: RegExp → test, string → substring.
+ *
+ * Production tests BOTH candidate spellings of an event — the bare `value` and
+ * `${type}: ${value}` — and drops the event if either matches
+ * (@sentry/core getPossibleEventMessages). Checking only the bare value made
+ * this mirror under-report: an entry anchored on the type prefix
+ * (`/^TimeoutError:/`) would drop a first-party failure in production with the
+ * whole suite green. That layer is not hypothetical — it is exactly where the
+ * Safari checkout timeout hid, since ignoreErrors runs as an event processor
+ * inside prepareEvent, before beforeSend and blind to tags (WORLDMONITOR-Q4).
+ */
+function isIgnored(msg, type) {
+  const candidates = type ? [msg, `${type}: ${msg}`] : [msg];
+  return candidates.some((candidate) => ignoreErrors.some(p =>
+    p instanceof RegExp ? p.test(candidate) : typeof p === 'string' ? candidate.includes(p) : false));
 }
 
 /** Helper to build a minimal Sentry event. */
@@ -88,6 +139,15 @@ function extensionFrame(filename = 'blob:https://example.com/ext-1234', fn = 'in
   return { filename, lineno: 1, function: fn };
 }
 
+/** Every .ts/.mts/.tsx file under `dir`, recursively, skipping node_modules. */
+function walkTsFiles(dir) {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+    const full = join(dir, e.name);
+    if (e.isDirectory()) return e.name === 'node_modules' ? [] : walkTsFiles(full);
+    return /\.(?:m?ts|tsx)$/.test(e.name) ? [full] : [];
+  });
+}
+
 // ─── ignoreErrors message matches ────────────────────────────────────────
 
 describe('ignoreErrors filters', () => {
@@ -104,11 +164,61 @@ describe('ignoreErrors filters', () => {
       'Generic first-party load-failure messages must NOT be ignored',
     );
   });
+
+  // WORLDMONITOR-ZC: Kaspersky-style content script double-injected, redeclaring
+  // its own top-level `SENDER` const. Cannot come from our bundle — esbuild fails
+  // the build on a duplicate top-level declaration.
+  it('suppresses the extension double-injection SENDER redeclaration', () => {
+    assert.ok(
+      isIgnored("Identifier 'SENDER' has already been declared"),
+      'SENDER duplicate-declaration must be ignored',
+    );
+  });
+
+  it('does NOT suppress a duplicate-declaration for an unlisted identifier', () => {
+    assert.ok(
+      !isIgnored("Identifier 'mapLayers' has already been declared"),
+      'Only the enumerated extension identifiers may be ignored',
+    );
+  });
 });
 
 // ─── P2: firstPartyFile regex covers all Vite chunk patterns ─────────────
 
 describe('first-party file detection', () => {
+  // Runs `filter` in a child so a catastrophic-backtracking regression fails on
+  // the spawnSync deadline instead of hanging the suite (`node --test` sets no
+  // default timeout, so an in-process hang would never go red).
+  //
+  // Both cases run in ONE child, because the malformed case alone cannot tell
+  // "the regex ran and terminated" from "firstPartyFile was never reached": a
+  // short-circuit above the call (e.g. gating `hasFirstParty` on frame count)
+  // keeps the malformed event DROPPED and the guard green with the ReDoS live.
+  // The well-formed chunk is the positive control — it goes red under exactly
+  // that mutation, which pins the guard to the predicate it is guarding.
+  it('finishes filtering a malformed asset filename with many hyphens', () => {
+    const malformed = makeEvent('.trim is not a function', 'TypeError', [
+      { filename: `/assets/${'a-'.repeat(64)}!`, lineno: 10, function: 'doStuff' },
+    ]);
+    const wellFormed = makeEvent('.trim is not a function', 'TypeError', [
+      { filename: '/assets/main-AbC123.js', lineno: 10, function: 'doStuff' },
+    ]);
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      const filter = ${rawBeforeSend.toString()};
+      const run = event => filter(event, () => false, () => false,
+        ${JSON.stringify(DESKTOP_NAVIGATOR)}, event => event, 'production');
+      process.stdout.write(JSON.stringify({
+        malformed: run(${JSON.stringify(malformed)}),
+        wellFormed: run(${JSON.stringify(wellFormed)}),
+      }));
+    `], { encoding: 'utf8', timeout: 5000 });
+    assert.equal(child.error?.code, undefined, 'Filtering must finish within five seconds');
+    assert.equal(child.status, 0, child.stderr);
+    const result = JSON.parse(child.stdout);
+    assert.equal(result.malformed, null, 'malformed /assets/ filename is not first-party');
+    assert.notEqual(result.wellFormed, null, 'positive control: a real chunk stays first-party');
+  });
+
   // Note: deck-stack is a VENDOR chunk (@deck.gl/@luma.gl), not first-party app code.
   // It is correctly caught by the "entirely within maplibre/deck.gl internals" filter.
   const testPatterns = [
@@ -345,6 +455,230 @@ describe('dynamic-module-import failures (stale chunk after deploy)', () => {
 // (WORLDMONITOR-66 / WORLDMONITOR-62).
 
 describe('zero-frame async-rejection patterns (timeout / DOMException / OOM / DOM-walker / wrapper-injected timeout)', () => {
+  for (const dispatch of ['direct', 'queued']) {
+    it(`preserves a zero-frame timeout explicitly reported by ${dispatch} panel dispatch`, async () => {
+      const client = new BrowserClient({ stackParser: defaultStackParser, integrations: [] });
+      const reason = new DOMException('signal timed out', 'TimeoutError');
+      // Model the browser timer boundary, without Node's constructor frames.
+      Object.defineProperty(reason, 'stack', { value: '' });
+      assert.ok(reason instanceof Error);
+      const event = await client.eventFromException(reason);
+      assert.equal(event.exception.values[0].stacktrace?.frames?.length ?? 0, 0);
+      event.tags = { kind: 'panel_call_rejected', panel: 'insights', method: 'updateInsights', dispatch };
+      assert.equal(isIgnored('signal timed out'), false);
+      assert.equal(beforeSend(event), event);
+    });
+  }
+
+  // WORLDMONITOR-Q4: the checkout transport times out at 15s and
+  // `reportCheckoutError` captures the rejection, but the event never reached
+  // Sentry. `AbortSignal.timeout` mints its DOMException at the timer
+  // boundary, so the stack is the header line ALONE — verified in Chromium
+  // 141: `{ name: 'TimeoutError', message: 'signal timed out',
+  // stack: 'TimeoutError: signal timed out' }` — and the parser extracts zero
+  // frames. That made a terminal, revenue-losing failure indistinguishable
+  // from extension noise, exactly as it had for panel dispatch before #7552.
+  //
+  // The escape hatch is the PRESENCE of a `kind` tag, not another message name.
+  // Only first-party capture call sites set `kind` (six across src/ at the time
+  // of writing: main.ts `csp_violation`, bootstrap/variant-theme.ts
+  // `variant_theme_load_failed`, app/pending-panel-data.ts
+  // `panel_call_rejected`, services/wm-session.ts `wm_session_dead` and
+  // `wm_session_route_401`, services/checkout.ts `checkout_request_failed`),
+  // and a browser- or extension-originated rejection cannot carry one.
+  //
+  // The cases below are parameterised over a value that appears NOWHERE in
+  // production on purpose. Asserting only the real kinds would leave a
+  // regression that narrows the gate back to a name list fully green — which
+  // is this exact bug repeating one generation later. The counter-fixture is
+  // the untagged `signal timed out` entry in `zeroFrameErrors` below, which
+  // must stay suppressed.
+  for (const kind of [
+    'checkout_request_failed',
+    'panel_call_rejected',
+    'csp_violation',
+    'variant_theme_load_failed',
+    'wm_session_dead',
+    // Belongs to no call site. A name-list gate fails here and only here.
+    'kind_presence_probe',
+    // A truthiness gate reads this as absent and suppresses the report. No
+    // call site can emit it today — all six are string literals — but
+    // `kind: someVar` is one refactor away, and the failure would be silent.
+    '',
+  ]) {
+    it(`preserves a zero-frame timeout carrying kind="${kind}"`, async () => {
+      const client = new BrowserClient({ stackParser: defaultStackParser, integrations: [] });
+      const reason = new DOMException('signal timed out', 'TimeoutError');
+      // The production shape, not an empty string: a header-only stack still
+      // has to parse to zero frames, or the suppression would never have fired.
+      Object.defineProperty(reason, 'stack', { value: 'TimeoutError: signal timed out' });
+      assert.ok(reason instanceof Error);
+      const event = await client.eventFromException(reason);
+      assert.equal(event.exception.values[0].stacktrace?.frames?.length ?? 0, 0);
+      event.tags = { kind };
+      assert.equal(isIgnored('signal timed out'), false);
+      assert.equal(beforeSend(event), event);
+    });
+  }
+
+  // WebKit does not say "signal timed out". src/services/timeout-signal.ts
+  // documents (WORLDMONITOR-10F) that Mobile Safari surfaces an
+  // AbortSignal.timeout rejection as `AbortError: Fetch is aborted`. That
+  // phrase used to sit in `ignoreErrors`, which the SDK applies as an event
+  // processor INSIDE prepareEvent — before beforeSend, and blind to both
+  // frames and tags — so no `kind` tag could rescue it and the Q4 fix would
+  // have restored visibility on Chromium alone.
+  //
+  // The same transport's other terminal failure is a double network failure,
+  // which arrives as a zero-frame `Failed to fetch`. Both belong to the buyer,
+  // not to an extension, once a first-party report has claimed them.
+  for (const [label, message, name] of [
+    ['a WebKit abort-worded timeout', 'Fetch is aborted', 'AbortError'],
+    ['a double network failure', 'Failed to fetch', 'TypeError'],
+    ['a Firefox-worded network failure', 'NetworkError when attempting to fetch resource.', 'TypeError'],
+    // Safari's wording for the same failed fetch. It sat in `ignoreErrors`,
+    // which runs before this gate and cannot read the ownership tag, so a
+    // checkout network failure on Safari stayed invisible even after the
+    // zero-frame exemption shipped.
+    ['a WebKit-worded network failure', 'Load failed', 'TypeError'],
+  ]) {
+    it(`preserves ${label} once checkout has reported it`, () => {
+      assert.equal(
+        isIgnored(message, name),
+        false,
+        `"${message}" must not be dropped by ignoreErrors, which runs before beforeSend and cannot see the kind tag`,
+      );
+      const event = makeEvent(message, name, []);
+      event.tags = { ...CHECKOUT_REPORT_TAGS };
+      assert.equal(beforeSend(event), event);
+    });
+
+    it(`still suppresses ${label} with no first-party report`, () => {
+      const event = makeEvent(message, name, []);
+      assert.equal(beforeSend(event), null);
+    });
+  }
+
+  // The source-level invariant the whole exemption rests on. Keying on tag
+  // PRESENCE is only safe while `kind` cannot arrive on an event we do not
+  // own. `event.tags` is the merge of per-call tags and SCOPE tags, so a
+  // single `Sentry.setTag('kind', ...)` or an `initialScope` carrying one
+  // would put the tag on every event — including third-party noise — and
+  // silently disarm this entire block with nothing going red.
+  it('keeps the licence true: `kind` is never set on a global Sentry scope', () => {
+    const offenders = [];
+    for (const rel of ['../src', '../pro-test/src']) {
+      for (const file of walkTsFiles(resolve(__dirname, rel))) {
+        const text = readFileSync(file, 'utf-8');
+        // A scope-level setter, or an init-time scope, anywhere near `kind`.
+        if (/\bset(?:Tag|Tags)\s*\(/.test(text) && /\bkind\b/.test(text)) offenders.push(`${file} (setTag)`);
+        if (/\binitialScope\b/.test(text)) offenders.push(`${file} (initialScope)`);
+      }
+    }
+    assert.deepEqual(offenders, [], [
+      'A global Sentry tag would apply `kind` to events we do not own, disarming',
+      'the zero-frame suppression above for every message it covers:',
+      ...offenders,
+    ].join('\n'));
+  });
+
+  it('the kind-census scan actually reaches our source', () => {
+    // A source scan that matches nothing is indistinguishable from one that is
+    // silently broken (wrong path, wrong extension filter).
+    const files = walkTsFiles(resolve(__dirname, '../src'));
+    assert.ok(files.length > 100, `sanity: expected to scan src/, got ${files.length} files`);
+    const kindSetters = files.filter((f) => /tags:\s*\{[^}]*\bkind:/.test(readFileSync(f, 'utf-8')));
+    assert.ok(
+      kindSetters.length >= 4,
+      `sanity: expected to find the per-call-site kind tags, found ${kindSetters.length}`,
+    );
+    assert.ok(
+      kindSetters.some((f) => f.endsWith('pending-panel-data.ts')),
+      'scan must reach the panel-dispatch kind setter',
+    );
+  });
+
+  // Everything above assigns `event.tags` by hand, which assumes the thing most
+  // likely to break silently: that a tag passed in the CAPTURE PAYLOAD is on
+  // the event by the time beforeSend runs. Two SDK behaviours have to hold and
+  // neither is ours — `{ level, tags, extra }` must be read as a CaptureContext
+  // rather than an EventHint, and scope data must be applied BEFORE beforeSend.
+  // If an SDK upgrade reorders either, the checkout exemption goes dead in
+  // production while every hand-tagged fixture above stays green. Drive the
+  // real public API end to end so the assumption is proven, not inherited.
+  for (const [label, tags, expectDelivered, thrown] of [
+    ['with the checkout kind tag', CHECKOUT_REPORT_TAGS, true, 'timeout'],
+    ['without any kind tag', { component: 'dodo-checkout', action: 'exception' }, false, 'timeout'],
+    // The layer this fixture exists to cover. `ignoreErrors` runs as an SDK
+    // event processor BEFORE beforeSend, so a client built without
+    // eventFilters proves delivery through half the stack and reports green
+    // while production drops the event. Safari's `Load failed` is the wording
+    // that actually hid here.
+    ['with the kind tag on a WebKit network failure', CHECKOUT_REPORT_TAGS, true, 'webkit-network'],
+    ['without a kind tag on a WebKit network failure', { component: 'dodo-checkout' }, false, 'webkit-network'],
+  ]) {
+    it(`routes a real captureException payload through the full filter stack ${label}`, async () => {
+      const seenByBeforeSend = [];
+      const delivered = [];
+      const client = new BrowserClient({
+        dsn: 'https://examplePublicKey@o0.ingest.sentry.io/0',
+        stackParser: defaultStackParser,
+        // The REAL ignoreErrors array, extracted from the shipped source at the
+        // top of this file — not an empty list. Without this the test cannot
+        // see the layer that runs first.
+        integrations: [eventFiltersIntegration({ ignoreErrors })],
+        transport: () => ({
+          send: async (envelope) => { delivered.push(envelope); return {}; },
+          flush: async () => true,
+        }),
+        beforeSend: (event) => {
+          seenByBeforeSend.push(event);
+          return beforeSend(event);
+        },
+      });
+
+      // withScope forks the current scope, so the client installed here is
+      // discarded on exit and cannot leak into the other tests in this file.
+      await withScope(async () => {
+        setCurrentClient(client);
+        client.init();
+        let reason;
+        if (thrown === 'webkit-network') {
+          // What Safari hands the checkout catch when the fetch fails outright.
+          reason = new TypeError('Load failed');
+          Object.defineProperty(reason, 'stack', { value: 'TypeError: Load failed' });
+        } else {
+          reason = new DOMException('signal timed out', 'TimeoutError');
+          Object.defineProperty(reason, 'stack', { value: 'TimeoutError: signal timed out' });
+        }
+        // The exact shape src/services/checkout.ts hands to captureException.
+        captureException(reason, { level: 'error', tags, extra: { productId: 'pdt_test' } });
+        await client.flush(2000);
+      });
+
+      // Reaching beforeSend at all is the assertion about the FIRST layer: an
+      // ignoreErrors entry would have dropped the event in prepareEvent and
+      // left this at zero. That is the failure this fixture exists to catch.
+      assert.equal(
+        seenByBeforeSend.length,
+        1,
+        'beforeSend must see the event — a value of 0 means ignoreErrors ate it first, where no tag can reach',
+      );
+      assert.equal(
+        seenByBeforeSend[0].tags?.kind,
+        tags.kind,
+        'payload tags must be applied to the event BEFORE beforeSend runs',
+      );
+      assert.equal(
+        delivered.length,
+        expectDelivered ? 1 : 0,
+        expectDelivered
+          ? 'a kind-tagged checkout failure must reach the transport'
+          : 'an untagged zero-frame failure must still be suppressed',
+      );
+    });
+  }
+
   const zeroFrameErrors = [
     ['signal timed out', 'TimeoutError'],
     ['NotSupportedError: The operation is not supported.', 'Error'],
@@ -397,6 +731,36 @@ describe('zero-frame async-rejection patterns (timeout / DOMException / OOM / DO
     // value shapes are matched.
     ['NetworkError when attempting to fetch resource.', 'TypeError'],
     ['TypeError: NetworkError when attempting to fetch resource.', 'TypeError'],
+    // Injected page script inserting its own unparseable source
+    // (WORLDMONITOR-YW). Chrome prefixes the parse error with the DOM API that
+    // triggered it. Our own script-appending call sites (analytics, DebugBear,
+    // Clerk, news embeds) keep a source-mapped .ts frame, so the first-party
+    // case is asserted "lets through" by this same loop — the coverage the
+    // superseded ungated ignoreErrors entry could not provide.
+    ["Failed to execute 'appendChild' on 'Node': Unexpected identifier 'x'", 'SyntaxError'],
+    ["Failed to execute 'appendChild' on 'Node': Unexpected token '}'", 'SyntaxError'],
+    ["SyntaxError: Failed to execute 'appendChild' on 'Node': Unexpected end of input", 'SyntaxError'],
+    // Chromium's WebAuthn / Credential Management bridge wording when the
+    // OS-side credential service is unavailable (WORLDMONITOR-11B: Android 10 /
+    // Chrome Mobile 150, /pro). It arrives as an unhandled rejection out of
+    // Clerk's sign-in passkey autofill (`navigator.credentials.get`), which runs
+    // wholly inside the Clerk bundle — zero captured frames. Our only passkey
+    // call site, `createPasskey()` in src/services/passkeys.ts, try/catches
+    // `user.createPasskey()` and returns a classified outcome, and
+    // `navigator.credentials` appears nowhere else in src/ or api/ — so a
+    // first-party frame here would mean a NEW call site, which the "lets
+    // through" arm of this loop keeps visible.
+    ['NotReadableError: An unknown error occurred while talking to the credential manager.', 'Error'],
+    // The overlapping-request half of the same WebAuthn surface
+    // (WORLDMONITOR-11T: Chrome 151 / Windows, /pro, zero frames, breadcrumbs
+    // ending at Clerk's `POST /v1/client/sign_ins`). Chrome serialises
+    // `navigator.credentials` per page and rejects the second request with this
+    // sentence when the sign-in button is double-clicked or submitted while
+    // Clerk's conditional passkey autofill is still open. Both value shapes:
+    // production carried the bare sentence with `type: 'Error'`, and some
+    // engines fold the type into the value.
+    ['OperationError: A request is already pending.', 'Error'],
+    ['Error: OperationError: A request is already pending.', 'Error'],
   ];
 
   for (const [msg, type] of zeroFrameErrors) {
@@ -415,6 +779,40 @@ describe('zero-frame async-rejection patterns (timeout / DOMException / OOM / DO
       assert.ok(beforeSend(event) !== null, `"${msg}" with first-party stack should NOT be suppressed`);
     });
   }
+
+  // The shape WORLDMONITOR-YW actually arrived in: an injected script's parse
+  // failure carries only `<anonymous>` frames, which nonInfraFrames strips —
+  // so neither the empty-stack nor the extension-URL case above reproduces it.
+  it("suppresses the injected-script appendChild parse failure with only <anonymous> frames", () => {
+    const event = makeEvent(
+      "Failed to execute 'appendChild' on 'Node': Unexpected identifier 'x'",
+      'SyntaxError',
+      [{ filename: '<anonymous>', lineno: 1 }, { filename: '<anonymous>', lineno: 1 }],
+    );
+    assert.equal(beforeSend(event), null);
+  });
+
+  it('keeps a pending-request message that is not the whole browser sentence', () => {
+    // The entry is anchored at both ends precisely so a first-party message
+    // that merely CONTAINS the phrase still reports, even with no frames at all
+    // — the blind spot an unanchored substring would open.
+    const event = makeEvent('Checkout aborted: a request is already pending. Retry in 5s', 'Error', []);
+    assert.ok(beforeSend(event) !== null);
+  });
+
+  it('lets through an appendChild parse failure attributed to a first-party script loader', () => {
+    // analytics.ts / debugbear-rum.ts / clerk.ts / LiveNewsPanel.ts all append a
+    // third-party <script>; if one of those inserts unparseable source the frame
+    // is ours and the event must still reach the dashboard. The superseded
+    // ignoreErrors entry had no frames to check and dropped this case.
+    const event = makeEvent(
+      "Failed to execute 'appendChild' on 'Node': Unexpected identifier 'x'",
+      'SyntaxError',
+      [{ filename: 'src/services/analytics.ts', lineno: 494, function: 'loadUmamiScript' },
+        { filename: '<anonymous>', lineno: 1 }],
+    );
+    assert.ok(beforeSend(event) !== null);
+  });
 });
 
 // ─── All ambiguous errors require confirmed third-party stack ────────────
@@ -592,6 +990,32 @@ describe('existing beforeSend filters', () => {
       { filename: 'chrome-extension://hoklmmgfnpapgjgcpechhaamimifchmp/frame_ant/frame_ant.js', lineno: 2, function: 'r.class.c.value.window.fetch' },
     ]);
     assert.equal(beforeSend(event), null, 'Extension chain-ending-in-window.fetch fetch failure should be suppressed');
+  });
+
+  it('suppresses bare "Failed to fetch" when the extension fetch frame carries an alias annotation (WORLDMONITOR-Y8)', () => {
+    // Real WORLDMONITOR-Y8 stack (Adjust SDK injectScriptAdjust.js, the same
+    // extension already named in the SG gate): Sentry renders the frame whose
+    // function was reached through an alias as `<name> [<annotation>]`, so the
+    // wrapper surfaces as `window.fetch [<annotation>]`. The SG function match
+    // is anchored, so the trailing annotation made it miss and the identical
+    // wrapper class re-surfaced as a new issue.
+    const event = makeEvent('Failed to fetch', 'TypeError', [
+      { filename: '/assets/panel-storage-RVfx_Amx.js', lineno: 2, function: 'Ln' },
+      { filename: 'chrome-extension://bkkbcggnhapdmkeljlodobbkopceiche/injectScriptAdjust.js', lineno: 1, function: 'window.fetch [as originalFetch]' },
+      { filename: '/assets/widget-store-B60Ai24W.js', lineno: 2, function: 'window.fetch' },
+    ]);
+    assert.equal(beforeSend(event), null, 'alias-annotated extension window.fetch frame should be suppressed');
+  });
+
+  it('does NOT suppress when only the ALIAS half of an extension frame looks like fetch', () => {
+    // Precision guard for the annotation strip above: the meaningful name is the
+    // one BEFORE the bracket. An extension frame whose own function is unrelated
+    // must not qualify just because it was stored under a fetch-ish property.
+    const event = makeEvent('Failed to fetch', 'TypeError', [
+      { filename: '/assets/panels-wF5GXf0N.js', lineno: 100, function: 'MyApiCall' },
+      { filename: 'chrome-extension://abcdefghijklmnopabcdefghijklmnop/inject.js', lineno: 1, function: 'trackEvent [as fetch]' },
+    ]);
+    assert.ok(beforeSend(event) !== null, 'alias-only fetch resemblance must not trigger SG suppression');
   });
 
   it('does NOT suppress bare "Failed to fetch" with a first-party frame and a NON-fetch extension frame', () => {
@@ -897,6 +1321,39 @@ describe('existing beforeSend filters', () => {
     assert.ok(beforeSend(event) !== null, 'first-party onmessage regression must surface');
   });
 
+  // WORLDMONITOR-RA: SnapTube (Android video-downloader in-app WebView) JS bridge
+  // parses its own `undefined` payload. `/SnapTube/` already sits in ignoreErrors,
+  // but that layer matches the MESSAGE only — here the attribution lives purely in a
+  // frame function, so it needs the stack-aware layer.
+  it('suppresses SyntaxError "is not valid JSON" from the SnapTube WebView bridge', () => {
+    const event = makeEvent('"undefined" is not valid JSON', 'SyntaxError', [
+      { filename: '/assets/sentry-DMxp_zBn.js', lineno: 488, function: 'r' },
+      { filename: '<anonymous>', lineno: 1, function: 'SnapTube.value' },
+      { filename: '<anonymous>', lineno: 1, function: 'Object.jsReceiveMessages' },
+      { filename: '<anonymous>', lineno: 1, function: 'JSON.parse' },
+    ]);
+    assert.equal(beforeSend(event), null);
+  });
+
+  it('does NOT suppress SnapTube-shaped JSON errors when a first-party frame is present', () => {
+    const event = makeEvent('"undefined" is not valid JSON', 'SyntaxError', [
+      firstPartyFrame('src/services/panel-storage.ts', 'readCached'),
+      { filename: '<anonymous>', lineno: 1, function: 'SnapTube.value' },
+    ]);
+    assert.ok(beforeSend(event) !== null, 'first-party JSON.parse regression must surface');
+  });
+
+  it('does NOT suppress "is not valid JSON" from an unnamed anonymous bridge', () => {
+    const event = makeEvent('"undefined" is not valid JSON', 'SyntaxError', [
+      { filename: '<anonymous>', lineno: 1, function: 'e.value' },
+      { filename: '<anonymous>', lineno: 1, function: 'JSON.parse' },
+    ]);
+    assert.ok(
+      beforeSend(event) !== null,
+      'suppression must key off the named SnapTube bridge, not bare !hasFirstParty',
+    );
+  });
+
   // WORLDMONITOR-NR: deck.gl/maplibre internal null-access on Layer.isHidden
   // during render (Safari 26.4 beta, empty stacks preceded by DeckGLMap map-error
   // breadcrumbs). `\w{1,3}\.isHidden` is gated on !hasFirstParty so a genuine
@@ -1046,6 +1503,45 @@ describe('SyntaxError via deck.gl/maplibre init path (WORLDMONITOR-SP)', () => {
   });
 });
 
+// ─── WORLDMONITOR-ZS: HTML document parsed as JavaScript ──────────────────
+//
+// V8 `SyntaxError: Malformed arrow function parameter list` when an Electron /
+// in-app wrapper loads the SPA document as a script. The only frame is the
+// document path (or an injected third-party frame) — never a hashed /assets
+// chunk. Same `hasAnyStack && !hasFirstParty` family as Unexpected token/keyword.
+describe('HTML-as-JS SyntaxError (WORLDMONITOR-ZS)', () => {
+  const MSG = 'Malformed arrow function parameter list';
+  const documentFrame = { filename: '/dashboard', lineno: 13, function: '?' };
+
+  it('suppresses the V8 HTML-as-JS parse error attributed to the document URL', () => {
+    const event = makeEvent(MSG, 'SyntaxError', [documentFrame]);
+    assert.equal(beforeSend(event), null,
+      'document-URL SyntaxError must be suppressed as HTML-as-JS noise');
+  });
+
+  it('suppresses the type-prefixed value variant', () => {
+    const event = makeEvent(`SyntaxError: ${MSG}`, 'SyntaxError', [documentFrame]);
+    assert.equal(beforeSend(event), null);
+  });
+
+  it('suppresses the same message with an extension-only stack', () => {
+    const event = makeEvent(MSG, 'SyntaxError', [extensionFrame()]);
+    assert.equal(beforeSend(event), null);
+  });
+
+  it('does NOT suppress the same SyntaxError with a first-party frame', () => {
+    const event = makeEvent(MSG, 'SyntaxError', [firstPartyFrame()]);
+    assert.ok(beforeSend(event) !== null,
+      'first-party SyntaxError must still reach Sentry');
+  });
+
+  it('does NOT suppress the same SyntaxError with an empty stack', () => {
+    const event = makeEvent(MSG, 'SyntaxError', []);
+    assert.ok(beforeSend(event) !== null,
+      'empty-stack parse error is not proven third-party and must surface');
+  });
+});
+
 // ─── WORLDMONITOR-TG: mainWorldSdk extension-global ReferenceError ─────────
 //
 // A browser-extension SDK injected into the page's main world references its
@@ -1129,153 +1625,6 @@ describe('injected browser-automation harness errors (Floot)', () => {
   });
 });
 
-// ─── WORLDMONITOR-VC: bare "Failed to fetch" through DebugBear's fetch wrapper ─
-//
-// DebugBear's RUM collector (cdn.debugbear.com/<id>.js → frame `/lpMwA9KpC6pf.js`)
-// monkeypatches window.fetch to time it. A transient network blip on any app
-// fetch rejects and its wrapper re-surfaces the rejection as an unhandled
-// rejection, injecting its own frames. The only "first-party" frames it carries
-// are `window.fetch` trampolines on Vite chunk names (panel-storage/widget-store
-// — neither module actually fetches). Without DebugBear the identical failure is
-// zero-frame and already suppressed. Suppress only when a DebugBear frame is
-// present AND every non-infra frame is that collector or a bare window.fetch
-// trampoline, so a genuine uncaught first-party fetch rejection still surfaces.
-describe('bare "Failed to fetch" via DebugBear RUM fetch wrapper (WORLDMONITOR-VC)', () => {
-  // Verbatim production stack from WORLDMONITOR-VC.
-  const vcStack = [
-    { filename: '/lpMwA9KpC6pf.js', lineno: 1, function: null },
-    { filename: '/lpMwA9KpC6pf.js', lineno: 8, function: null },
-    { filename: '/lpMwA9KpC6pf.js', lineno: 1, function: null },
-    { filename: '/lpMwA9KpC6pf.js', lineno: 1, function: 'e' },
-    { filename: '/assets/widget-store-BQi6MP9w.js', lineno: 38, function: 'window.fetch' },
-    { filename: '/assets/panel-storage-DSqo8-tt.js', lineno: 2, function: 'window.fetch' },
-  ];
-
-  it('suppresses the exact VC stack (DebugBear wrapper + window.fetch trampolines)', () => {
-    assert.equal(beforeSend(makeEvent('Failed to fetch', 'TypeError', vcStack)), null,
-      'DebugBear-wrapped transient fetch failure should be suppressed');
-  });
-
-  it('suppresses the type-prefixed value variant', () => {
-    assert.equal(beforeSend(makeEvent('TypeError: Failed to fetch', 'TypeError', vcStack)), null);
-  });
-
-  it('derives collector-frame identity from the DebugBear loader module', () => {
-    assert.match(mainSrc, /import \{ isDebugBearRumScriptFrame \} from '\.\/debugbear-rum';/,
-      'beforeSend must use the collector identity exported by the loader module');
-    const debugBearGate = mainSrc.slice(mainSrc.indexOf('// Bare `Failed to fetch` surfacing through the DebugBear'));
-    assert.match(debugBearGate, /isDebugBearRumScriptFrame\(f\.filename \?\? ''\)/,
-      'the DebugBear gate must call the shared collector-frame predicate');
-  });
-
-  it('suppresses a generic DebugBear collector with a bare fetch trampoline', () => {
-    const event = makeEvent('Failed to fetch', 'TypeError', [
-      { filename: 'https://cdn.debugbear.com/rotated-collector.js', lineno: 1, function: 'e' },
-      { filename: '/assets/widget-store-BQi6MP9w.js', lineno: 38, function: 'fetch' },
-    ]);
-    assert.equal(beforeSend(event), null, 'generic DebugBear collector and bare fetch trampoline should be suppressed');
-  });
-
-  it('does NOT suppress a DebugBear stack with a non-trampoline fetchContent frame', () => {
-    const event = makeEvent('Failed to fetch', 'TypeError', [
-      { filename: '/lpMwA9KpC6pf.js', lineno: 1, function: 'e' },
-      { filename: '/assets/widget-store-BQi6MP9w.js', lineno: 38, function: 'fetchContent' },
-    ]);
-    assert.ok(beforeSend(event) !== null, 'a named first-party caller must still reach Sentry');
-  });
-
-  it('does NOT suppress a DebugBear stack with the runtime fetch wrapper', () => {
-    const event = makeEvent('Failed to fetch', 'TypeError', [
-      { filename: '/lpMwA9KpC6pf.js', lineno: 1, function: 'e' },
-      { filename: '/assets/runtime-BQi6MP9w.js', lineno: 38, function: 'window.fetch' },
-    ]);
-    assert.ok(beforeSend(event) !== null, 'runtime fetch wrapper failures must still reach Sentry');
-  });
-
-  it('does NOT suppress when a genuine first-party fetch caller frame is present', () => {
-    // A real uncaught first-party fetch rejection carries a real function name
-    // (not a bare window.fetch trampoline) — must surface even with DebugBear on
-    // the stack.
-    const event = makeEvent('Failed to fetch', 'TypeError', [
-      { filename: '/lpMwA9KpC6pf.js', lineno: 1, function: 'e' },
-      { filename: '/assets/panels-DzUv7BBV.js', lineno: 100, function: 'loadCountryGeometry' },
-    ]);
-    assert.ok(beforeSend(event) !== null, 'genuine first-party fetch rejection must reach Sentry');
-  });
-
-  it('does NOT suppress a plain first-party "Failed to fetch" with no DebugBear frame', () => {
-    // Regression guard for the existing contract: without DebugBear, a first-party
-    // window.fetch failure still surfaces (it is not this gate's business).
-    const event = makeEvent('Failed to fetch', 'TypeError', [
-      { filename: '/assets/panels-wF5GXf0N.js', lineno: 100, function: 'MyApiCall' },
-    ]);
-    assert.ok(beforeSend(event) !== null, 'non-DebugBear first-party fetch failure must surface');
-  });
-
-  it('does NOT suppress an observed trampoline without a DebugBear collector', () => {
-    const event = makeEvent('Failed to fetch', 'TypeError', [
-      { filename: '/assets/widget-store-BQi6MP9w.js', lineno: 38, function: 'fetch' },
-    ]);
-    assert.ok(beforeSend(event) !== null,
-      'the allowed trampoline alone must not suppress a first-party fetch failure');
-  });
-
-  it('does NOT suppress a non-"Failed to fetch" error that merely has a DebugBear frame', () => {
-    const event = makeEvent('Something else entirely', 'TypeError', vcStack);
-    assert.ok(beforeSend(event) !== null, 'gate is scoped to the bare Failed-to-fetch message');
-  });
-
-  // WORLDMONITOR-VQ (20ev/12u, 2026-07-09+): the SAME DebugBear-wrapper class as
-  // VC, slipping the gate because a later Vite build emits the trampoline frame
-  // with a minified receiver prefix — `Rt.window.fetch` instead of the bare
-  // `window.fetch` VC carried. The anchored `^(?:window\.)?fetch$` function match
-  // rejects the prefix, `nonInfraFrames.every` fails, and the event surfaces.
-  // The prefix is bounded to a minified identifier (≤3 chars) so a real named
-  // receiver (`apiClient.fetch`) still surfaces as a genuine caller.
-  const vqStack = [
-    { filename: '/lpMwA9KpC6pf.js', lineno: 1, function: null },
-    { filename: '/lpMwA9KpC6pf.js', lineno: 8, function: null },
-    { filename: '/lpMwA9KpC6pf.js', lineno: 1, function: null },
-    { filename: '/lpMwA9KpC6pf.js', lineno: 1, function: null },
-    { filename: '/lpMwA9KpC6pf.js', lineno: 1, function: 'e' },
-    { filename: '/assets/widget-store-DxbOqNLQ.js', lineno: 38, function: 'Rt.window.fetch' },
-    { filename: '/assets/panel-storage-GsJWN0Dg.js', lineno: 2, function: 'window.fetch' },
-  ];
-
-  it('suppresses the exact VQ stack (minified-prefixed `Rt.window.fetch` trampoline)', () => {
-    assert.equal(beforeSend(makeEvent('Failed to fetch', 'TypeError', vqStack)), null,
-      'minified-prefixed trampoline is the same DebugBear wrapper class as VC');
-  });
-
-  it('suppresses a minified-prefixed bare `fetch` trampoline', () => {
-    const event = makeEvent('Failed to fetch', 'TypeError', [
-      { filename: '/lpMwA9KpC6pf.js', lineno: 1, function: 'e' },
-      { filename: '/assets/panel-storage-GsJWN0Dg.js', lineno: 2, function: 'Xt.fetch' },
-    ]);
-    assert.equal(beforeSend(event), null, 'minified receiver on a bare fetch trampoline is still a trampoline');
-  });
-
-  it('does NOT suppress a NAMED receiver on a fetch trampoline frame', () => {
-    // Safety bound: the minified-prefix tolerance must not swallow a real
-    // first-party caller that happens to invoke `.fetch` off a named object.
-    const event = makeEvent('Failed to fetch', 'TypeError', [
-      { filename: '/lpMwA9KpC6pf.js', lineno: 1, function: 'e' },
-      { filename: '/assets/widget-store-DxbOqNLQ.js', lineno: 38, function: 'apiClient.fetch' },
-    ]);
-    assert.ok(beforeSend(event) !== null, 'a named receiver is a real caller, not a minified trampoline');
-  });
-
-  it('does NOT suppress a minified-prefixed trampoline in a NON-allowlisted chunk', () => {
-    // The chunk allowlist stays load-bearing: runtime.ts is our real fetch
-    // wrapper, so its failures must surface regardless of frame naming.
-    const event = makeEvent('Failed to fetch', 'TypeError', [
-      { filename: '/lpMwA9KpC6pf.js', lineno: 1, function: 'e' },
-      { filename: '/assets/runtime-BQi6MP9w.js', lineno: 38, function: 'Rt.window.fetch' },
-    ]);
-    assert.ok(beforeSend(event) !== null, 'runtime fetch wrapper failures must still reach Sentry');
-  });
-});
-
 // ─── WORLDMONITOR-WH/WJ: `Failed to fetch (abacus.worldmonitor.app)` ──────────
 //
 // abacus.worldmonitor.app is our SELF-HOSTED Umami analytics collector
@@ -1311,5 +1660,729 @@ describe('`Failed to fetch (abacus.worldmonitor.app)` — Umami beacon (WORLDMON
     // gate for our data-serving API — a real outage still has to reach Sentry.
     const event = makeEvent('Failed to fetch (api.worldmonitor.app)', 'TypeError', whStack);
     assert.ok(beforeSend(event) !== null, 'API-outage canary must never be masked by the beacon allowlist');
+  });
+});
+
+// ─── WORLDMONITOR-WK: zero-frame RangeError confined to iOS ───────────────────
+//
+// 23 events / 20 users, 100% iOS, 21 inside the Google app's in-app WebView.
+// A blown stack is exactly when the SDK cannot collect frames, so zero frames
+// alone proves nothing — the OS gate is the load-bearing half.
+describe('sentry beforeSend — WK iOS zero-frame call-stack overflow', () => {
+  it('suppresses the exact WK shape on iOS', () => {
+    const event = makeEvent('Maximum call stack size exceeded.', 'RangeError', []);
+    assert.equal(beforeSend(event, IOS_NAVIGATOR), null, 'iOS in-app WebView recursion is not our bundle');
+  });
+
+  it('suppresses the WK shape on iPadOS desktop-mode (Macintosh UA + touch)', () => {
+    const event = makeEvent('Maximum call stack size exceeded.', 'RangeError', []);
+    assert.equal(beforeSend(event, IPADOS_NAVIGATOR), null, 'iPadOS is the same WebView family');
+  });
+
+  it('does NOT suppress the same message on a desktop OS', () => {
+    const event = makeEvent('Maximum call stack size exceeded.', 'RangeError', []);
+    assert.ok(beforeSend(event, DESKTOP_NAVIGATOR) !== null, 'a real recursion regression must still reach Sentry');
+  });
+
+  it('does NOT suppress an iOS call-stack overflow that carries a first-party frame', () => {
+    const event = makeEvent('Maximum call stack size exceeded.', 'RangeError', [firstPartyFrame()]);
+    assert.ok(beforeSend(event, IOS_NAVIGATOR) !== null, 'an attributable recursion is signal, not noise');
+  });
+
+  it('does NOT suppress an unrelated zero-frame iOS RangeError', () => {
+    const event = makeEvent('Invalid array length', 'RangeError', []);
+    assert.ok(beforeSend(event, IOS_NAVIGATOR) !== null, 'the gate is scoped to the call-stack message');
+  });
+
+  // The regression that let WORLDMONITOR-WK run for 44 events across seven builds:
+  // the gate read `event.contexts.os.name`, which the browser SDK never sets, and the
+  // old fixtures fabricated it. Pin BOTH directions so no future gate can pass a test
+  // via a field production does not supply.
+  it('ignores event.contexts.os entirely — a fabricated iOS context cannot suppress', () => {
+    const event = {
+      ...makeEvent('Maximum call stack size exceeded.', 'RangeError', []),
+      contexts: { os: { name: 'iOS', version: '18.0.0' } },
+    };
+    assert.ok(
+      beforeSend(event, DESKTOP_NAVIGATOR) !== null,
+      'contexts.os is ingest-derived and absent in beforeSend; it must not drive the gate',
+    );
+  });
+
+  it('suppresses on an iOS UA even with no contexts at all (the real production shape)', () => {
+    const event = makeEvent('Maximum call stack size exceeded.', 'RangeError', []);
+    assert.equal(event.contexts, undefined, 'production events reach beforeSend without an os context');
+    assert.equal(beforeSend(event, IOS_NAVIGATOR), null, 'the UA is the only platform signal available');
+  });
+});
+
+// ─── WORLDMONITOR-ZG: host attribution replaces the chunk-name gate (#6746) ───
+//
+// The DebugBear trampoline gate is GONE. It tried to identify this class from
+// the stack, which is impossible in principle: every frame in ZG's stack is a
+// `window.fetch` wrapper (DebugBear -> wmSessionFetch -> runtime dispatch ->
+// native fetch), because the rejection originates in native fetch and the async
+// boundary drops the calling frame. The app caller is never present, so six
+// rounds of chunk-name heuristics each broke on the next Vite repartition.
+//
+// `src/services/fetch-failure-attribution.ts` now appends the host at the
+// bottom of the wrapper chain, so the SAME stack reaches a different verdict
+// depending on WHO was being contacted — which is the only thing that ever
+// distinguished a dropped analytics beacon from an origin outage.
+//
+// These tests are what license deleting the gate: they prove the allowlist, not
+// the stack shape, is what decides.
+describe('bare "Failed to fetch" is decided by host, not stack shape (WORLDMONITOR-ZG)', () => {
+  // Verbatim production stack, identical across all 17 ZG events (2026-08-16),
+  // including the four on builds that already contained #6747.
+  const zgStack = [
+    { filename: '/lpMwA9KpC6pf.js', lineno: 0, function: null },
+    { filename: '/lpMwA9KpC6pf.js', lineno: 0, function: null },
+    { filename: '/lpMwA9KpC6pf.js', lineno: 0, function: null },
+    { filename: '/lpMwA9KpC6pf.js', lineno: 0, function: null },
+    { filename: '/lpMwA9KpC6pf.js', lineno: 0, function: 't' },
+    { filename: '/assets/widget-store-DbqgxtxV.js', lineno: 0, function: 'Pn.window.fetch' },
+    { filename: '/assets/analytics-DdK2NArM.js', lineno: 0, function: null },
+    { filename: '/assets/analytics-DdK2NArM.js', lineno: 0, function: 'c' },
+  ];
+
+  it('suppresses the annotated Umami beacon on the exact ZG stack', () => {
+    const event = makeEvent('Failed to fetch (abacus.worldmonitor.app)', 'TypeError', zgStack);
+    assert.equal(beforeSend(event), null, 'a dropped analytics beacon is unactionable');
+  });
+
+  it('SURFACES an annotated api.worldmonitor.app failure on the IDENTICAL stack', () => {
+    // The whole point. Same frames, opposite verdict — decided by the host.
+    const event = makeEvent('Failed to fetch (api.worldmonitor.app)', 'TypeError', zgStack);
+    assert.ok(beforeSend(event) !== null, 'an origin outage must never be suppressed');
+  });
+
+  it('suppresses the annotated DebugBear RUM beacon', () => {
+    const event = makeEvent('Failed to fetch (data.debugbear.com)', 'TypeError', zgStack);
+    assert.equal(beforeSend(event), null);
+  });
+
+  it('suppresses the annotated Clerk SDK fetch', () => {
+    const event = makeEvent('Failed to fetch (clerk.worldmonitor.app)', 'TypeError', zgStack);
+    assert.equal(beforeSend(event), null);
+  });
+
+  it('SURFACES an annotated self-hosted PMTiles failure', () => {
+    // The R2 basemap bucket is deliberately absent from the allowlist so a real
+    // basemap regression is never silently dropped (WORLDMONITOR-NE/NF).
+    const event = makeEvent('Failed to fetch (pub-8ace9f6a86d74cb2bd.r2.dev)', 'TypeError', zgStack);
+    assert.ok(beforeSend(event) !== null, 'first-party basemap failures must surface');
+  });
+
+  it('SURFACES a still-bare "Failed to fetch" — the accepted cached-bundle cost (KTD4)', () => {
+    // Browsers running a bundle cached from before the attribution deploy still
+    // emit an un-annotated message. With the chunk gate deleted these surface
+    // instead of being suppressed. That is a DELIBERATE, temporary trade-off:
+    // an unattributable failure from a chunk carrying runtime.ts could be a real
+    // origin outage, and suppressing it is exactly the blind spot #6746 refuses.
+    const event = makeEvent('Failed to fetch', 'TypeError', zgStack);
+    assert.ok(beforeSend(event) !== null, 'unattributable fetch failures must not be silently dropped');
+  });
+
+  it('closes the Safari blind spot for owned reports only, annotated or not (KTD5)', () => {
+    // This pin previously recorded the blind spot itself: `Load failed` sat in
+    // `ignoreErrors`, so BOTH the bare and host-annotated forms died before
+    // beforeSend ran — including for our own origin — and it existed so that
+    // whoever narrowed the entry would see exactly what changed. That happened
+    // in WORLDMONITOR-Q4: a checkout network failure on Safari is reported by
+    // first-party code, and no tag can survive a layer that runs earlier and
+    // reads only the message.
+    //
+    // The entry moved into beforeSend with its reach intact. What this now pins
+    // is that the move changed exactly one verdict and no others.
+    assert.equal(isIgnored('Load failed', 'TypeError'), false,
+      'the suppression must live late enough to read the ownership tag');
+    assert.equal(isIgnored('Load failed (api.worldmonitor.app)', 'TypeError'), false);
+
+    // Unowned: dropped exactly as before, both forms, with or without frames.
+    assert.equal(beforeSend(makeEvent('Load failed', 'TypeError', [])), null);
+    assert.equal(beforeSend(makeEvent('Load failed (api.worldmonitor.app)', 'TypeError', [])), null);
+    assert.equal(beforeSend(makeEvent('Load failed', 'TypeError', [firstPartyFrame()])), null,
+      'a first-party frame must NOT rescue it — only an explicit report does');
+
+    // Owned: the one verdict that changed.
+    const owned = makeEvent('Load failed (api.worldmonitor.app)', 'TypeError', []);
+    owned.tags = { ...CHECKOUT_REPORT_TAGS };
+    assert.equal(beforeSend(owned), owned);
+  });
+
+  // ── The shape that hid a P0 ────────────────────────────────────────────────
+  //
+  // `linkedErrorsIntegration()` is a DEFAULT @sentry/browser integration
+  // (build/npm/cjs/prod/sdk.js:32) that runs in preprocessEvent, BEFORE
+  // beforeSend. When the thrown error carries `.cause`, it expands the chain
+  // into `event.exception.values` with the ORIGINAL error LAST (@sentry/core
+  // aggregate-errors.js:20) — so a bare cause occupies values[0], which is
+  // exactly what beforeSend reads (sentry-init.ts:353).
+  //
+  // Every other fixture in this file builds a ONE-entry values array, so the
+  // whole suite is structurally blind to that reordering. These two cases are
+  // the only thing standing between us and silently shipping an inert filter.
+  const twoValueEvent = (causeValue, outerValue, frames) => ({
+    exception: {
+      values: [
+        { type: 'TypeError', value: causeValue, stacktrace: { frames } },
+        { type: 'TypeError', value: outerValue, stacktrace: { frames } },
+      ],
+    },
+  });
+
+  it('a bare cause at values[0] defeats host suppression — why we never set `cause`', () => {
+    // If the attribution module ever re-adds `annotated.cause = error`, THIS is
+    // the event Sentry actually delivers, and the beacon stops being suppressed.
+    const event = twoValueEvent(
+      'Failed to fetch',
+      'Failed to fetch (abacus.worldmonitor.app)',
+      zgStack,
+    );
+    assert.ok(
+      beforeSend(event) !== null,
+      'values[0] is the bare cause, so the allowlist cannot fire — this is the '
+      + 'regression that re-adding `cause` would reintroduce',
+    );
+  });
+
+  it('the single-value shape we actually emit IS suppressed', () => {
+    // Contrast case. Same message, same stack, one value — the shape produced
+    // when no `cause` is set. This is what production must look like.
+    const event = makeEvent('Failed to fetch (abacus.worldmonitor.app)', 'TypeError', zgStack);
+    assert.equal(beforeSend(event), null, 'no cause -> annotated message at values[0] -> suppressed');
+  });
+
+  // ── Period-less Gecko, end to end ─────────────────────────────────────────
+  //
+  // `FETCH_FAILURE_MESSAGE` admits `resource\.?`, so the module annotates the
+  // period-less Gecko phrasing too. Until #6762 review, `isHostScopedFetchFailure`
+  // required the period literally — that message was annotated and then never
+  // routed to the allowlist. Both sides now accept it; these two fixtures are
+  // what make the widening observable, since every other Gecko fixture in this
+  // file uses the period form.
+
+  it('suppresses the annotated period-less Gecko phrasing for an allowlisted host', () => {
+    const event = makeEvent(
+      'NetworkError when attempting to fetch resource (abacus.worldmonitor.app)',
+      'TypeError',
+      zgStack,
+    );
+    assert.equal(beforeSend(event), null, 'period-less Gecko must route through the host allowlist');
+  });
+
+  it('SURFACES the annotated period-less Gecko phrasing for api.worldmonitor.app', () => {
+    const event = makeEvent(
+      'NetworkError when attempting to fetch resource (api.worldmonitor.app)',
+      'TypeError',
+      zgStack,
+    );
+    assert.ok(beforeSend(event) !== null, 'an origin outage must surface in the period-less shape too');
+  });
+
+  it('accepts the `TypeError: ` prefix on an annotated message', () => {
+    // The file's sibling gates already tolerate this prefix, which means the
+    // project has observed it in `exception.values[].value`. The host detector
+    // must not be the one place that misses it.
+    const event = makeEvent(
+      'TypeError: Failed to fetch (abacus.worldmonitor.app)',
+      'TypeError',
+      zgStack,
+    );
+    assert.equal(beforeSend(event), null, 'prefixed annotated message must still reach the allowlist');
+  });
+
+  it('the producer and consumer regexes accept the same phrasing set', () => {
+    // Belt-and-braces against the drift that caused the period-less gap. The
+    // module PRODUCES annotated messages; sentry-init CONSUMES them. They are
+    // separate literals in separate files (sentry-init's beforeSend body is
+    // eval'd standalone by this harness, so it cannot import a shared one), so
+    // assert equivalence behaviourally instead.
+    const attributionSrc = readFileSync(
+      resolve(__dirname, '../src/services/fetch-failure-attribution.ts'),
+      'utf-8',
+    );
+    const producerMatch = attributionSrc.match(
+      /const FETCH_FAILURE_MESSAGE =\s*(\/\^[\s\S]*?\/);/,
+    );
+    assert.ok(producerMatch, 'FETCH_FAILURE_MESSAGE must be a single regex literal');
+    // eslint-disable-next-line no-new-func
+    const producer = new Function(`return ${producerMatch[1]}`)();
+
+    for (const phrase of [
+      'Failed to fetch',
+      'NetworkError when attempting to fetch resource.',
+      'NetworkError when attempting to fetch resource',
+      'Load failed',
+    ]) {
+      assert.ok(producer.test(phrase), `producer must annotate: ${phrase}`);
+      // Anything the producer annotates must be routable by the consumer once
+      // the host suffix is appended — otherwise it is annotated-but-unsuppressable.
+      const annotated = `${phrase} (abacus.worldmonitor.app)`;
+      const verdict = beforeSend(makeEvent(annotated, 'TypeError', zgStack));
+      const ignored = isIgnored(`TypeError: ${annotated}`);
+      assert.ok(
+        verdict === null || ignored,
+        `consumer must be able to act on an annotated message the producer emits: ${annotated}`,
+      );
+    }
+  });
+
+  it('the attribution module does not set `cause`', () => {
+    // Belt-and-braces: assert the source-level invariant too, so the reason is
+    // discoverable from this file without reading the module.
+    const attributionSrc = readFileSync(
+      resolve(__dirname, '../src/services/fetch-failure-attribution.ts'),
+      'utf-8',
+    );
+    // Strip comments first — the module explains the hazard in prose, and that
+    // prose necessarily contains the very assignment we are banning.
+    const code = attributionSrc
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^[ \t]*\/\/.*$/gm, '');
+    assert.ok(
+      !/\.cause\s*=/.test(code),
+      'fetch-failure-attribution.ts must not assign .cause — it activates LinkedErrors '
+      + 'and moves the bare message to values[0], defeating host attribution',
+    );
+  });
+
+  it('no longer references Vite chunk names in the beforeSend policy', () => {
+    // The deletion this whole block licenses. Chunk names are arbitrary build
+    // output; a policy keyed on them cannot stay correct across repartitions.
+    assert.ok(
+      !/panel-storage|widget-store/.test(mainSrc),
+      'sentry-init.ts must not key suppression on Vite chunk names',
+    );
+  });
+});
+
+// ─── WORLDMONITOR-105: extDomain extension-global ReferenceError ───────────
+//
+// A browser extension injected into the page's main world references its own
+// `extDomain` global before defining it. The production event (Chrome 151 /
+// Windows, 2026-08-19) carries three `<anonymous>:1` frames and nothing else.
+// `extDomain` appears nowhere in src/, api/, public/ or index.html, so the
+// message can never originate from our own bundle — same disposition as the
+// `mainWorldSdk`, `hackLocationFailed` and `userScripts` entries above.
+describe('ignoreErrors — extDomain extension global (WORLDMONITOR-105)', () => {
+  const PROD_MSG = 'extDomain is not defined';
+  const pattern = ignoreErrors.find(p => p instanceof RegExp && /extDomain/.test(p.source));
+
+  it('defines an extDomain ignore pattern', () => {
+    assert.ok(pattern, 'an /extDomain/ ignoreErrors pattern must exist');
+  });
+
+  it('suppresses the production "extDomain is not defined" message', () => {
+    assert.ok(isIgnored(PROD_MSG), `ignoreErrors must drop: ${PROD_MSG}`);
+  });
+
+  it('is scoped so a longer first-party identifier still surfaces', () => {
+    // The `\b...\b` anchors keep the pattern from swallowing a real
+    // `extDomainResolver is not defined` bug in our own code.
+    assert.ok(!isIgnored('extDomainResolver is not defined'),
+      'pattern must not swallow a longer identifier with the same prefix');
+    assert.ok(!isIgnored('myExtDomain is not defined'),
+      'pattern must not swallow a longer identifier with the same suffix');
+  });
+});
+
+// ─── WORLDMONITOR-106: Firefox `uncaught exception: undefined` ─────────────
+//
+// Firefox's window.onerror wording when a script throws a bare primitive
+// (`throw undefined` / `throw null`). The production event (Firefox 153 /
+// Windows, 2026-08-19) has one frame — the DOCUMENT url
+// `https://www.worldmonitor.app/#moments` at line 0 — so there is no script
+// file to attribute it to at all.
+//
+// Our bundle never throws a bare primitive: `throw undefined` / `throw null`
+// appear nowhere in src/, shared/ or api/, and every rethrow (`throw err`)
+// re-raises a caught value from a first-party frame, which would put that
+// frame on the stack and fail the `!hasFirstParty` gate. So this goes in
+// beforeSend with stack-gating rather than ignoreErrors: the wording is
+// engine-generic enough that a first-party origin must still surface.
+describe('beforeSend — Firefox bare-primitive throw (WORLDMONITOR-106)', () => {
+  const docFrame = { filename: 'https://www.worldmonitor.app/#moments', lineno: 0 };
+
+  it('suppresses "uncaught exception: undefined" with no first-party frame', () => {
+    assert.equal(
+      beforeSend(makeEvent('uncaught exception: undefined', 'Error', [docFrame])),
+      null,
+      'a bare-primitive throw with only a document-URL frame must be dropped',
+    );
+  });
+
+  it('suppresses the null variant too', () => {
+    assert.equal(
+      beforeSend(makeEvent('uncaught exception: null', 'Error', [docFrame])),
+      null,
+      'Firefox emits the same wording for `throw null`',
+    );
+  });
+
+  it('PRESERVES the same message when a first-party frame is present', () => {
+    const event = makeEvent('uncaught exception: undefined', 'Error', [
+      docFrame,
+      firstPartyFrame(),
+    ]);
+    assert.ok(
+      beforeSend(event) !== null,
+      'a first-party frame means our code rethrew it — must surface',
+    );
+  });
+
+  it('PRESERVES a thrown object, which names a real injector or a real bug', () => {
+    assert.ok(
+      beforeSend(makeEvent('uncaught exception: [object Object]', 'Error', [docFrame])) !== null,
+      'only the bare undefined/null primitives are provably not ours',
+    );
+  });
+
+  // The trailing `[^A-Za-z0-9_]|$` is what stops `throw nullValue` /
+  // `throw undefinedThing` from matching, and accepting end-of-line there is what
+  // catches an ASI-terminated `throw undefined` with no semicolon — requiring `;`
+  // would let exactly the statement this invariant exists to forbid slip past.
+  const BARE_PRIMITIVE_THROW = /throw\s+(?:undefined|null|void 0)(?:[^A-Za-z0-9_]|$)/m;
+
+  /**
+   * Source with comments removed. Load-bearing, not tidiness: the beforeSend
+   * policy EXPLAINS this rule in prose, and that prose necessarily contains the
+   * very statement being banned (`throw undefined` / `throw null`). Scanning raw
+   * text makes the explanation trip its own rule. Same reason the `.cause`
+   * invariant above strips comments before matching.
+   */
+  const stripComments = (src) => src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^[ \t]*\/\/.*$/gm, '');
+
+  /** Every .ts/.mts/.tsx file under `dir`, recursively. */
+  const walk = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+    const full = join(dir, e.name);
+    if (e.isDirectory()) return e.name === 'node_modules' ? [] : walk(full);
+    return /\.(?:m?ts|tsx)$/.test(e.name) ? [full] : [];
+  });
+
+  it('the bundle never throws a bare primitive', () => {
+    // The source-level invariant the suppression rests on, asserted here so it
+    // cannot silently stop being true.
+    const offenders = [];
+    for (const rel of ['../src', '../shared', '../api']) {
+      for (const file of walk(resolve(__dirname, rel))) {
+        const code = stripComments(readFileSync(file, 'utf-8'));
+        if (BARE_PRIMITIVE_THROW.test(code)) offenders.push(file);
+      }
+    }
+    assert.deepEqual(offenders, [],
+      `bare-primitive throw found — the WORLDMONITOR-106 suppression is no longer safe:\n${offenders.join('\n')}`);
+  });
+
+  it('the invariant actually fires on the statements it forbids', () => {
+    // A source scan that matches nothing is indistinguishable from a source scan
+    // that is silently broken. Positive controls, so the test above is known to
+    // have teeth — including the semicolon-less ASI form.
+    for (const forbidden of ['throw undefined;', 'throw undefined', 'throw null;', 'throw null', 'throw void 0;']) {
+      assert.ok(BARE_PRIMITIVE_THROW.test(forbidden), `pattern must catch: ${forbidden}`);
+    }
+    for (const allowed of ['throw nullValue;', 'throw undefinedThing;', 'throw err;', 'throw new Error("x");']) {
+      assert.ok(!BARE_PRIMITIVE_THROW.test(allowed), `pattern must NOT catch: ${allowed}`);
+    }
+  });
+
+  it('the scan reaches real files, and comment-stripping is what keeps it green', () => {
+    // Two ways the invariant could pass vacuously, both closed here: a walk that
+    // returns nothing, and a scan that would fail if it did NOT strip comments.
+    const files = ['../src', '../shared', '../api'].flatMap(rel => walk(resolve(__dirname, rel)));
+    assert.ok(files.length > 100, `walk must reach the real tree, got ${files.length} files`);
+    assert.ok(files.some(f => f.endsWith('bootstrap/sentry-init.ts')), 'walk must include sentry-init.ts');
+
+    const raw = readFileSync(resolve(__dirname, '../src/bootstrap/sentry-init.ts'), 'utf-8');
+    assert.ok(BARE_PRIMITIVE_THROW.test(raw),
+      'the policy comment is expected to contain the banned statement — if it stops doing so, '
+      + 'this control no longer proves comment-stripping is load-bearing');
+    assert.ok(!BARE_PRIMITIVE_THROW.test(stripComments(raw)),
+      'stripping comments must clear it');
+  });
+});
+
+// ─── WORLDMONITOR-ZG grouping: host-attributed fetch failures must not share ──
+// ─── one issue with third-party beacons ───────────────────────────────────────
+//
+// `fetch-failure-attribution.ts` put the host in the MESSAGE, and the allowlist
+// block above uses it to decide suppression. Grouping was never updated, and
+// Sentry groups these on the stack — which the attribution module's own
+// docstring establishes is identical for every fetch failure (all frames are
+// `window.fetch` wrappers; the async boundary drops the caller).
+//
+// Measured consequence (2026-08-27 triage of WORLDMONITOR-ZG, 32 events):
+//   21 x bare `Failed to fetch`         (pre-attribution builds)
+//    8 x `api.worldmonitor.app`         (a real ~90s origin blip, 2026-08-16)
+//    3 x `motramby.com`                 (injected adware beacon, 2026-08-27)
+// all in ONE issue, titled after whichever host arrived last. The eight
+// first-party origin failures — the exact population the whole attribution
+// effort existed to surface — were invisible under an adware title.
+//
+// The split is by OWNERSHIP, not by raw host: every foreign host collapses into
+// a single `third-party` bucket so a rotating adware domain cannot explode
+// issue cardinality, while each of our own hosts keeps its own issue.
+describe('host-attributed fetch failures are fingerprinted by host (WORLDMONITOR-ZG)', () => {
+  const zgStack = [
+    { filename: '/lpMwA9KpC6pf.js', lineno: 0, function: null },
+    { filename: '/lpMwA9KpC6pf.js', lineno: 0, function: 't' },
+    { filename: '/assets/widget-store-DbqgxtxV.js', lineno: 0, function: 'Pn.window.fetch' },
+    { filename: '/assets/analytics-DdK2NArM.js', lineno: 0, function: 'c' },
+  ];
+
+  it('isolates non-production fetch groups after host attribution', () => {
+    for (const environment of ['preview', 'development']) {
+      for (const [host, bucket] of [
+        ['api.worldmonitor.app', 'api.worldmonitor.app'],
+        ['pub-8ace9f6a86d74cb2bd5eb1de5590dd9e.r2.dev', 'pub-8ace9f6a86d74cb2bd5eb1de5590dd9e.r2.dev'],
+        ['foreign.example', 'third-party'],
+      ]) {
+        const input = makeEvent(`Failed to fetch (${host})`, 'TypeError', zgStack);
+        input.release = 'a'.repeat(40);
+        input.dist = 'a'.repeat(40);
+        const event = beforeSend(input, DESKTOP_NAVIGATOR, environment);
+        assert.ok(event !== null);
+        assert.deepEqual(event.fingerprint, ['fetch-failure', bucket, `worldmonitor:${environment}`]);
+        assert.equal(event.release, undefined);
+        assert.equal(event.dist, undefined);
+      }
+    }
+  });
+
+  it('gives a first-party origin failure its own fingerprint', () => {
+    const event = beforeSend(makeEvent('Failed to fetch (api.worldmonitor.app)', 'TypeError', zgStack));
+    assert.ok(event !== null, 'an origin outage must never be suppressed');
+    assert.deepEqual(event.fingerprint, ['fetch-failure', 'api.worldmonitor.app']);
+  });
+
+  it('gives the self-hosted PMTiles bucket its own fingerprint', () => {
+    // Deliberately absent from the suppression allowlist (WORLDMONITOR-NE/NF),
+    // so a basemap regression must also be readable on its own. The exact
+    // bucket, per docs/maps-and-geocoding.mdx.
+    const event = beforeSend(makeEvent('Failed to fetch (pub-8ace9f6a86d74cb2bd5eb1de5590dd9e.r2.dev)', 'TypeError', zgStack));
+    assert.ok(event !== null);
+    assert.deepEqual(event.fingerprint, ['fetch-failure', 'pub-8ace9f6a86d74cb2bd5eb1de5590dd9e.r2.dev']);
+  });
+
+  it('does not hand every Cloudflare R2 tenant a first-party group', () => {
+    // `r2.dev` is a SHARED suffix — any Cloudflare account gets a `pub-<id>.r2.dev`
+    // bucket. Matching it by suffix would give each foreign tenant its own raw-host
+    // fingerprint, reopening the unbounded cardinality the third-party bucket
+    // exists to close, and dressing an unrelated bucket up as our incident
+    // (greptile review, PR #7228).
+    const foreign = beforeSend(makeEvent('Failed to fetch (pub-0000000000000000000000000000000.r2.dev)', 'TypeError', zgStack));
+    assert.ok(foreign !== null);
+    assert.deepEqual(foreign.fingerprint, ['fetch-failure', 'third-party']);
+  });
+
+  it('collapses every foreign host into one bounded bucket', () => {
+    // Adware/tracker domains rotate. Bucketing them keeps cardinality at
+    // (our hosts + 1) instead of unbounded.
+    const adware = beforeSend(makeEvent('Failed to fetch (motramby.com)', 'TypeError', zgStack));
+    const other = beforeSend(makeEvent('Failed to fetch (a8f3c1e9.example-tracker.net)', 'TypeError', zgStack));
+    assert.ok(adware !== null && other !== null);
+    assert.deepEqual(adware.fingerprint, ['fetch-failure', 'third-party']);
+    assert.deepEqual(other.fingerprint, adware.fingerprint,
+      'two rotating foreign hosts must land in the SAME issue');
+  });
+
+  it('does not separate the first-party bucket from the third-party one by accident', () => {
+    // Positive control for the ownership predicate: a host that merely CONTAINS
+    // our domain is not ours.
+    const spoof = beforeSend(makeEvent('Failed to fetch (worldmonitor.app.evil.example)', 'TypeError', zgStack));
+    assert.ok(spoof !== null);
+    assert.deepEqual(spoof.fingerprint, ['fetch-failure', 'third-party']);
+  });
+
+  it('leaves suppression verdicts unchanged', () => {
+    assert.equal(beforeSend(makeEvent('Failed to fetch (abacus.worldmonitor.app)', 'TypeError', zgStack)), null);
+    assert.equal(beforeSend(makeEvent('Failed to fetch (data.debugbear.com)', 'TypeError', zgStack)), null);
+  });
+
+  it('leaves events that are not host-attributed fetch failures ungrouped', () => {
+    // A still-bare `Failed to fetch` carries no host, so there is nothing
+    // honest to fingerprint on — it must keep Sentry's default grouping.
+    const bare = beforeSend(makeEvent('Failed to fetch', 'TypeError', zgStack));
+    assert.ok(bare !== null);
+    assert.equal(bare.fingerprint, undefined);
+
+    const unrelated = beforeSend(makeEvent('Something else broke', 'Error', zgStack));
+    assert.ok(unrelated !== null);
+    assert.equal(unrelated.fingerprint, undefined);
+  });
+});
+
+// ─── WORLDMONITOR-117 / -YN: Android WebView Java-bridge envelope ─────────
+//
+// Chromium's `android_webview` wraps a failed `@JavascriptInterface` call as
+// `Error invoking <method>: <GinJavaBridgeError>`. The two bare substring
+// entries this replaced (`/Java object is gone/`, `/Java bridge method
+// invocation error/`) matched the reason ANYWHERE in a message, and
+// `ignoreErrors` is frame-blind — so a first-party error merely containing the
+// phrase was dropped with an `/assets/*.js` frame on the stack.
+describe('ignoreErrors — Android WebView Java bridge (WORLDMONITOR-117, -YN)', () => {
+  const JAVA_BRIDGE_PATTERN = ignoreErrors.find(
+    (p) => p instanceof RegExp && p.source.includes('Error invoking'));
+
+  it('the anchored envelope entry exists', () => {
+    assert.ok(JAVA_BRIDGE_PATTERN, 'an anchored `Error invoking …` pattern must exist');
+  });
+
+  it('drops both verbatim production values', () => {
+    // WORLDMONITOR-117 — Instagram 415 / Android 13, marketing document.
+    assert.ok(isIgnored('Error invoking enableButtonsClickedMetaDataLogging: Java object is gone'));
+    // WORLDMONITOR-YN — Chrome Mobile 150 / Android 10, dashboard bundle.
+    assert.ok(isIgnored('Error invoking process: Java bridge method invocation error'));
+  });
+
+  it('drops the envelope with any host-app bridge method name', () => {
+    // The method is whichever `@JavascriptInterface` the host called, so the
+    // slot is matched by shape rather than pinned to the two observed names.
+    assert.ok(isIgnored('Error invoking getDeviceInfo: Java object is gone'));
+    assert.ok(isIgnored('Error invoking $handler_2: Java object is gone'));
+  });
+
+  it('drops the envelope with a non-ASCII bridge method name', () => {
+    // Java identifiers are not ASCII-only — `@JavascriptInterface
+    // obtenirDonnées()` is legal and Chromium emits the same sentence for it.
+    // An `[\w$]+` slot silently misses these because JavaScript's `\w` is
+    // ASCII-only, which is what this control exists to catch (PR #7356 review).
+    assert.ok(isIgnored('Error invoking obtenirDonnées: Java object is gone'));
+    assert.ok(isIgnored('Error invoking 获取设备信息: Java object is gone'));
+    assert.ok(isIgnored('Error invoking процесс: Java bridge method invocation error'));
+  });
+
+  // THE control that matters, and the one the superseded substring entries
+  // could not fail. A control that changes a word the pattern REQUIRES
+  // (`gateway` for `object`) passes against the broken pattern too, so it can
+  // never go red — these all go red against the bare substring entries.
+  it('keeps a first-party message that merely CONTAINS the reason', () => {
+    assert.ok(!isIgnored('Our Java object is gone'));
+    assert.ok(!isIgnored('Session expired: Java object is gone'));
+    assert.ok(!isIgnored('Retry failed: Java bridge method invocation error'));
+    assert.ok(!isIgnored('Error invoking foo: Java object is gone (retrying)'));
+  });
+
+  it('keeps a non-Chromium reason inside the envelope so it surfaces once', () => {
+    // Under-suppression announces itself as a new Sentry issue and gets added
+    // deliberately; over-suppression is silent. Deliberate failure direction.
+    assert.ok(!isIgnored('Error invoking process: Method not found'));
+  });
+
+  // The source-level invariant the whole entry rests on. A message-level
+  // suppression is only safe while our own bundle cannot mint the sentence.
+  it('keeps the licence true: no `Error invoking` call site in our own source', () => {
+    const offenders = [];
+    for (const rel of ['../src', '../pro-test/src', '../api']) {
+      for (const file of walkTsFiles(resolve(__dirname, rel))) {
+        // sentry-init.ts and sentry-filter-policy.ts hold the suppressors
+        // themselves; every other textual hit would be a real call site.
+        if (/sentry-init\.ts$|sentry-filter-policy\.ts$/.test(file)) continue;
+        if (/Error invoking /.test(readFileSync(file, 'utf-8'))) offenders.push(file);
+      }
+    }
+    assert.deepEqual(offenders, [],
+      `\`Error invoking\` now appears in our own source — the suppression is no longer safe:\n${offenders.join('\n')}`);
+  });
+
+  it('the licence scan actually reaches our source', () => {
+    // A source scan that matches nothing is indistinguishable from one that is
+    // silently broken (wrong path, wrong extension filter).
+    const files = walkTsFiles(resolve(__dirname, '../src'));
+    assert.ok(files.length > 100, `sanity: expected to scan src/, got ${files.length} files`);
+    assert.ok(files.some((f) => f.endsWith('sentry-init.ts')), 'scan must reach sentry-init.ts');
+  });
+});
+
+// ─── WORLDMONITOR-10W: UC Browser native JS bridge global ─────────────────
+//
+// UC Browser's in-app WebView injects `__BrowserJSBridgeObj` and its own chrome
+// script references it before (or after) the native side defines it. Observed on
+// UC Browser 12.2.1 / iOS 17.6.1 with a single `global code` frame on the
+// /dashboard document. Named vendor bridge global, same class as the
+// UCShellJava / ucapi / ucConfig / zaloJSV2 entries already in ignoreErrors.
+describe('ignoreErrors — UC Browser bridge global (WORLDMONITOR-10W)', () => {
+  const PROD_MSG = "Can't find variable: __BrowserJSBridgeObj";
+  const pattern = ignoreErrors.find(p => p instanceof RegExp && /__BrowserJSBridgeObj/.test(p.source));
+
+  it('defines a __BrowserJSBridgeObj ignore pattern', () => {
+    assert.ok(pattern, 'a /__BrowserJSBridgeObj/ ignoreErrors pattern must exist');
+  });
+
+  it('suppresses the verbatim production WebKit message', () => {
+    assert.ok(isIgnored(PROD_MSG), `ignoreErrors must drop: ${PROD_MSG}`);
+  });
+
+  it('suppresses the Chromium phrasing of the same global', () => {
+    // UC Browser ships on both engines: WebKit says `Can't find variable: X`,
+    // Chromium says `X is not defined`. Matching the identifier covers both.
+    assert.ok(isIgnored('__BrowserJSBridgeObj is not defined'),
+      'the Chromium phrasing must be dropped by the same entry');
+  });
+
+  it('does not swallow an unrelated bridge-shaped identifier', () => {
+    assert.ok(!isIgnored('BrowserJSBridgeObj is not defined'),
+      'the double-underscore vendor prefix is load-bearing');
+  });
+
+  // The source-level invariant the message-only suppression rests on.
+  it('keeps the licence true: __BrowserJSBridgeObj is absent from our own source', () => {
+    const offenders = [];
+    for (const rel of ['../src', '../api']) {
+      for (const file of walkTsFiles(resolve(__dirname, rel))) {
+        if (/sentry-init\.ts$|sentry-filter-policy\.ts$/.test(file)) continue;
+        if (/__BrowserJSBridgeObj/.test(readFileSync(file, 'utf-8'))) offenders.push(file);
+      }
+    }
+    assert.deepEqual(offenders, [],
+      `__BrowserJSBridgeObj now appears in our own source — the suppression is no longer safe:\n${offenders.join('\n')}`);
+  });
+});
+
+// ─── WORLDMONITOR-10B: SpiderMonkey malformed-numeric-literal parse error ──
+//
+// Firefox iOS 154.1 / iOS 18.7, sole frame `https://www.worldmonitor.app/:1` —
+// how Gecko/WebKit attribute a main-world injected content script. A runtime
+// parse error cannot come from our own bundle (compiled and parsed at build
+// time), so this joins the `hasAnyStack && !hasFirstParty` SyntaxError family
+// alongside Unexpected token/keyword and Invalid or unexpected token.
+describe('malformed numeric literal SyntaxError (WORLDMONITOR-10B)', () => {
+  const MSG = 'No identifiers allowed directly after numeric literal';
+  const documentFrame = { filename: 'https://www.worldmonitor.app/', lineno: 1, function: null };
+
+  it('suppresses the parse error attributed to the page document URL', () => {
+    const event = makeEvent(MSG, 'SyntaxError', [documentFrame]);
+    assert.equal(beforeSend(event), null,
+      'document-URL numeric-literal parse error must be suppressed as injected-script noise');
+  });
+
+  it('suppresses the same message with an extension-only stack', () => {
+    const event = makeEvent(MSG, 'SyntaxError', [extensionFrame()]);
+    assert.equal(beforeSend(event), null);
+  });
+
+  it('does NOT suppress the same SyntaxError with a first-party frame', () => {
+    const event = makeEvent(MSG, 'SyntaxError', [firstPartyFrame()]);
+    assert.ok(beforeSend(event) !== null,
+      'a first-party parse error must still reach Sentry');
+  });
+
+  it('does NOT suppress the same SyntaxError with an empty stack', () => {
+    const event = makeEvent(MSG, 'SyntaxError', []);
+    assert.ok(beforeSend(event) !== null,
+      'empty-stack parse error is not proven third-party and must surface');
+  });
+
+  it('is anchored so a longer first-party message still surfaces', () => {
+    const event = makeEvent(
+      `${MSG} while parsing the operator config`,
+      'SyntaxError',
+      [documentFrame],
+    );
+    assert.ok(beforeSend(event) !== null,
+      'the entry is anchored to the whole engine sentence');
   });
 });

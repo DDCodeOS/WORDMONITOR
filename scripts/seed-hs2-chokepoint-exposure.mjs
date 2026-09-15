@@ -14,6 +14,9 @@ import {
 
 loadEnvFile(import.meta.url);
 
+const require = createRequire(import.meta.url);
+const SUPPLY_VULNERABILITY_COMMODITIES = require('./shared/supply-vulnerability-commodities.json');
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /** @type {string} */
@@ -27,7 +30,7 @@ const LOCK_TTL_MS = 5 * 60 * 1000;
 const COMTRADE_KEY_PREFIX = 'comtrade:bilateral-hs4:';
 
 // Top 10 HS2 chapters by global trade volume and strategic importance.
-const HS2_CODES = [
+const BASE_HS2_CODES = [
   '27', // Mineral Fuels (energy)
   '84', // Machinery & Mechanical Appliances
   '85', // Electrical Machinery & Electronics
@@ -39,6 +42,11 @@ const HS2_CODES = [
   '10', // Cereals (food security)
   '62', // Apparel (textiles)
 ];
+
+export const HS2_CODES = Array.from(new Set([
+  ...BASE_HS2_CODES,
+  ...SUPPLY_VULNERABILITY_COMMODITIES.commodities.map((commodity) => commodity.transitHs2),
+])).sort((a, b) => Number(a) - Number(b));
 
 // Lightweight copy of the chokepoint registry fields needed for exposure computation.
 // Kept in sync with src/config/chokepoint-registry.ts — update both together.
@@ -61,9 +69,14 @@ const CHOKEPOINT_REGISTRY = [
 
 // ── Load country-port-clusters ────────────────────────────────────────────────
 
-const require = createRequire(import.meta.url);
 /** @type {Record<string, {nearestRouteIds: string[], coastSide: string}>} */
 const COUNTRY_PORT_CLUSTERS = require('./shared/country-port-clusters.json');
+
+// The country universe this seeder writes for. Derived from static config, so it is
+// knowable even when a run fails — writeMeta() publishes it on every path so a failed
+// seed cannot erase the manifest the scenario worker depends on.
+const SEEDED_COUNTRY_IDS = Object.keys(COUNTRY_PORT_CLUSTERS)
+  .filter(k => k !== '_comment' && k.length === 2);
 
 // ── Exposure computation ──────────────────────────────────────────────────────
 
@@ -174,6 +187,7 @@ export function computeCountryLevelExposure(nearestRouteIds, coastSide, hs2) {
     exposures: entries,
     primaryChokepointId: entries[0]?.chokepointId ?? '',
     vulnerabilityIndex,
+    coverage: 'country_route_fallback',
   };
 }
 
@@ -244,8 +258,7 @@ export async function main() {
   const lock = await acquireLockSafely(LOCK_DOMAIN, runId, LOCK_TTL_MS, { label: LOCK_DOMAIN });
 
   if (lock.skipped) {
-    const allKeys = Object.keys(COUNTRY_PORT_CLUSTERS)
-      .filter(k => k !== '_comment' && k.length === 2)
+    const allKeys = SEEDED_COUNTRY_IDS
       .flatMap(iso2 => HS2_CODES.map(hs2 => `${KEY_PREFIX}${iso2}:${hs2}:v1`));
     await extendExistingTtl([...allKeys, META_KEY], TTL_SECONDS)
       .catch(e => console.warn('[chokepoint-exposure] TTL extension (skipped) failed:', e.message));
@@ -256,9 +269,25 @@ export async function main() {
     return;
   }
 
-  /** @param {number} count @param {string} [status] */
+  /**
+   * Publish seed metadata. The manifest fields describe the country/sector UNIVERSE,
+   * which comes from static config and is therefore still true after a failed run —
+   * so they are emitted on every path. Only `status` and `recordCount` report the run.
+   * Dropping them on the error path would blank the scenario worker (which gates all
+   * computation on manifestVersion) even though the exposure keys it reads are
+   * deliberately TTL-extended by the same catch block.
+   *
+   * @param {number} count @param {string} [status]
+   */
   const writeMeta = async (count, status = 'ok') => {
-    const meta = JSON.stringify({ fetchedAt: Date.now(), recordCount: count, status });
+    const meta = JSON.stringify({
+      fetchedAt: Date.now(),
+      recordCount: count,
+      status,
+      manifestVersion: 1,
+      countryIds: SEEDED_COUNTRY_IDS,
+      hs2Codes: HS2_CODES,
+    });
     await redisPipeline([['SET', META_KEY, meta, 'EX', TTL_SECONDS * 3]])
       .catch(e => console.warn('[chokepoint-exposure] Failed to write seed-meta:', e.message));
   };
@@ -267,7 +296,7 @@ export async function main() {
     const countries = Object.entries(COUNTRY_PORT_CLUSTERS).filter(
       ([k]) => k !== '_comment' && k.length === 2,
     );
-    const iso2List = countries.map(([iso2]) => iso2);
+    const iso2List = SEEDED_COUNTRY_IDS;
 
     console.log(`[chokepoint-exposure] Loading Comtrade bilateral data for ${iso2List.length} countries...`);
     const comtradeMap = await loadComtradeData(iso2List);
@@ -301,6 +330,7 @@ export async function main() {
               exposures,
               primaryChokepointId: exposures[0]?.chokepointId ?? '',
               vulnerabilityIndex: buildVulnIndex(exposures),
+              coverage: 'flow_weighted',
             };
             flowWeightedCount++;
           } else {
@@ -325,7 +355,7 @@ export async function main() {
 
     commands.push([
       'SET', META_KEY,
-      JSON.stringify({ fetchedAt: Date.now(), recordCount: writtenCount, status: 'ok' }),
+      JSON.stringify({ fetchedAt: Date.now(), recordCount: writtenCount, status: 'ok', manifestVersion: 1, countryIds: SEEDED_COUNTRY_IDS, hs2Codes: HS2_CODES }),
       'EX', TTL_SECONDS * 3,
     ]);
 
@@ -346,8 +376,7 @@ export async function main() {
     console.log(`[chokepoint-exposure] Seeded ${writtenCount} keys (${flowWeightedCount} flow-weighted, ${fallbackCount} fallback)`);
   } catch (err) {
     console.error('[chokepoint-exposure] Seed failed:', err.message || err);
-    const existingKeys = Object.keys(COUNTRY_PORT_CLUSTERS)
-      .filter(k => k !== '_comment' && k.length === 2)
+    const existingKeys = SEEDED_COUNTRY_IDS
       .flatMap(iso2 => HS2_CODES.map(hs2 => `${KEY_PREFIX}${iso2}:${hs2}:v1`));
     await extendExistingTtl([...existingKeys, META_KEY], TTL_SECONDS)
       .catch(e => console.warn('[chokepoint-exposure] TTL extension failed:', e.message));
@@ -360,8 +389,16 @@ export async function main() {
 
 const isMain = process.argv[1]?.endsWith('seed-hs2-chokepoint-exposure.mjs');
 if (isMain) {
-  main().catch(err => {
-    console.error(err);
-    process.exit(1);
-  });
+  // Terminal success marker. Emitted from .then() so it can ONLY print after main() has fully
+  // resolved — a throw anywhere inside, including a late publish step, skips it. Any marker
+  // written INSIDE main() would print before later work and could vouch for a run that then
+  // died (exactly how #6092 stayed invisible). Format mirrors runSeed() so the crash
+  // diagnostic recognises it; without it a clean run is indistinguishable from a silent death.
+  const __runStartedAt = Date.now();
+  main()
+    .then(() => console.log(`\n=== Done (${Date.now() - __runStartedAt}ms) ===`))
+    .catch(err => {
+      console.error(err);
+      process.exit(1);
+    });
 }

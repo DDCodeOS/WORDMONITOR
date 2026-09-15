@@ -41,7 +41,17 @@ function epochToTimestamp(epochMs) {
   return `timestamp '${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}'`;
 }
 
-function computeWow(history) {
+/**
+ * Week-over-week change in total transits, as a percentage to one decimal.
+ *
+ * Needs 14 days: the trailing 7 compared against the 7 before them. A zero
+ * prior week reports 0 rather than dividing by it — an infinite spike on a
+ * chokepoint that simply had no traffic last week is noise, not signal.
+ *
+ * Exported so the arithmetic is tested against this function rather than a
+ * copy of it.
+ */
+export function computeWow(history) {
   if (history.length < 14) return 0;
   const sorted = [...history].sort((a, b) => b.date.localeCompare(a.date));
   let thisWeek = 0;
@@ -52,7 +62,7 @@ function computeWow(history) {
   return Math.round(((thisWeek - lastWeek) / lastWeek) * 1000) / 10;
 }
 
-async function fetchAllPages(portname, sinceEpoch) {
+export async function fetchAllPages(portname, sinceEpoch) {
   const all = [];
   let offset = 0;
   for (;;) {
@@ -75,8 +85,11 @@ async function fetchAllPages(portname, sinceEpoch) {
     const body = await resp.json();
     if (body.error) throw new Error(`ArcGIS error for ${portname}: ${body.error.message}`);
     if (body.features?.length) all.push(...body.features);
-    if (!body.exceededTransferLimit) break;
-    offset += PAGE_SIZE;
+    if (!body.exceededTransferLimit || !body.features?.length) break;
+    // Advance by rows actually returned, not PAGE_SIZE: the layer's server-side
+    // maxRecordCount (1000) is below PAGE_SIZE, so += PAGE_SIZE skips rows once
+    // a query spans more than one server page (latent at 180 days, real beyond).
+    offset += body.features.length;
   }
   return all;
 }

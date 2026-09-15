@@ -1,11 +1,12 @@
 ---
 title: "Country Resilience Index Methodology"
-description: "A practical guide to the WorldMonitor Country Resilience Index: 196 countries, 6 domains, 20 active dimensions, 3 pillars, and a transparent 0-100 score."
+description: "A practical guide to the WorldMonitor Country Resilience Index: 72 indicators across 21 active dimensions and 6 domains, with transparent 0-100 scoring."
 metaTitle: "Country Resilience Index Methodology | WorldMonitor"
 keywords: "country resilience index, resilience score methodology, country risk methodology, national resilience indicators, shock absorption score"
 audience: "Risk analysts, policy teams, country researchers, resilience modelers"
-heroImage: "/blog/og/country-resilience-index-methodology-explained.png"
+heroImage: "/blog/images/blog/country-resilience-index-methodology-explained.jpg"
 pubDate: "2026-06-13"
+modifiedDate: "2026-07-22"
 ---
 
 Country risk tools usually start with the question "how unstable is this country right now?" That is useful, but it is not the whole decision. A country can be under pressure and still absorb the shock. Another can look calm until a single outage, debt squeeze, or import disruption exposes how little capacity it has to recover.
@@ -14,7 +15,7 @@ WorldMonitor's Country Resilience Index is built for the second question:
 
 > How well positioned is this country to absorb, adapt to, and recover from shocks?
 
-The CRI is a 0-100 national resilience score for a public rankable universe of 196 countries. It combines long-run structural capacity with current stress signals, then publishes the result through a methodology that exposes domains, coverage, and imputation context instead of hiding the model behind a black-box rating.
+The CRI is a 0-100 national resilience score for a public rankable country universe. It combines long-run structural capacity with current stress signals, then publishes the result through a methodology that exposes domains, coverage, and imputation context instead of hiding the model behind a black-box rating.
 
 It complements the Country Instability Index, which is faster and more stress-oriented. CII asks where pressure is rising now. CRI asks which countries have the institutional, infrastructure, fiscal, health, energy, and recovery capacity to withstand pressure.
 
@@ -30,7 +31,7 @@ The CRI measures national shock capacity at a point in time. It does not try to 
 - health, public service, food, and water resilience
 - recovery capacity, including fiscal space, debt coverage, reserves, and import concentration
 
-The live methodology uses 6 domains and 20 active dimensions. Two structurally retired dimensions remain in the registry for schema continuity but do not carry active signal.
+The live methodology uses 72 indicators across 21 active dimensions and 6 domains. Two structurally retired dimensions remain in the registry for schema continuity but do not carry active signal.
 
 Every country is scored on a 0-100 scale. Higher is better. The score is not a GDP ranking, and the methodology deliberately avoids pure affluence proxies where the only thing they measure is "this country is rich." Indicators need to answer a mechanism question: what direct shock channel does this measure?
 
@@ -106,6 +107,8 @@ The methodology pulls from official and authoritative providers such as World Ba
 WorldMonitor treats missing data as a first-class modeling issue. Coverage, imputation class, retired dimensions, and source failures are distinct states. A missing upstream feed should not quietly become a zero score, and a structurally absent data point should not be rendered as if a source failed.
 
 That is the difference between a display metric and an auditable index. A display metric only says "Country A is 74." An auditable index lets you ask why, how much evidence was observed, what changed, and whether the methodology itself changed.
+
+The underlying public series can be checked at the [World Bank Data portal](https://data.worldbank.org/), [IMF Data](https://www.imf.org/en/Data), [WHO Global Health Observatory](https://www.who.int/data/gho), and [UNHCR Refugee Data Finder](https://www.unhcr.org/refugee-statistics/). WorldMonitor's score is a synthesis of those and other named sources, not a substitute for the original series.
 
 ## Frequently Asked Questions
 

@@ -1,6 +1,33 @@
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
-import { channelTypeValidator, digestModeValidator, quietHoursOverrideValidator, sensitivityValidator } from "./constants";
+import {
+  channelTypeValidator,
+  digestModeValidator,
+  proActivationStepIdValidator,
+  quietHoursOverrideValidator,
+  sensitivityValidator,
+} from "./constants";
+import {
+  companyMonitoringCompleteReceiptValidator,
+  companyMonitoringCandidateStateValidator,
+  companyMonitoringCandidateTerminalReasonValidator,
+  companyMonitoringAdmissionAuthorityValidator,
+  companyMonitoringAdmissionClassificationValidator,
+  companyMonitoringAdmissionConfidenceFloorsValidator,
+  companyMonitoringEvidenceAuthorityValidator,
+  companyMonitoringEvidenceIndependenceValidator,
+  companyMonitoringEvidenceProviderValidator,
+  companyMonitoringEvidenceStateValidator,
+  companyMonitoringNonReassuringReasonValidator,
+  companyMonitoringNonReassuringReceiptValidator,
+  companyMonitoringScanSourceValidator,
+  companyMonitoringXAllowedUseValidator,
+  companyMonitoringXAuthorityRoleValidator,
+  companyMonitoringXContentStateValidator,
+  companyMonitoringXDemotionReasonValidator,
+  companyMonitoringXStorageStateValidator,
+} from "./companyMonitoring/validators";
+import { SHARED_API_BUDGET } from "./config/productCatalog";
 
 // Subscription status enum — maps Dodo statuses to our internal set
 const subscriptionStatus = v.union(
@@ -55,6 +82,35 @@ const apiPlanLimitCtaKind = v.union(
   v.literal("none"),
 );
 
+const companyMonitoringObligationIdentity = {
+  obligationId: v.string(),
+  ownerAccountId: v.string(),
+  companyId: v.string(),
+  source: companyMonitoringScanSourceValidator,
+  queryVersion: v.string(),
+  dueAt: v.number(),
+  checkpoint: v.optional(v.string()),
+  createdAt: v.number(),
+  updatedAt: v.number(),
+};
+
+const companyMonitoringWorkIdentity = {
+  workId: v.string(),
+  workKey: v.string(),
+  ownerAccountId: v.string(),
+  cohortKey: v.string(),
+  source: companyMonitoringScanSourceValidator,
+  windowStart: v.number(),
+  windowEnd: v.number(),
+  queryVersion: v.string(),
+  scheduledDueAt: v.number(),
+  selectionDueAt: v.number(),
+  resultCap: v.number(),
+  attemptCount: v.number(),
+  createdAt: v.number(),
+  updatedAt: v.number(),
+};
+
 export default defineSchema({
   userPreferences: defineTable({
     userId: v.string(),
@@ -70,7 +126,13 @@ export default defineSchema({
     windowStart: v.number(),
     count: v.number(),
     updatedAt: v.number(),
-  }).index("by_user_window", ["userId", "windowStart"]),
+  })
+    .index("by_user_window", ["userId", "windowStart"])
+    // Retention scan for `pruneStaleWriteRateLimits` (#6706). Expired-window
+    // rows are garbage-collected off the write path, so the sweep needs a
+    // cross-user range on age alone; without it the prune would be a full
+    // table scan whose read set collides with every live counter.
+    .index("by_windowStart", ["windowStart"]),
 
   notificationChannels: defineTable(
     v.union(
@@ -79,6 +141,7 @@ export default defineSchema({
         channelType: v.literal("telegram"),
         chatId: v.string(),
         verified: v.boolean(),
+        telegramOwnership: v.optional(v.literal("verified_callback")),
         linkedAt: v.number(),
       }),
       v.object({
@@ -95,6 +158,7 @@ export default defineSchema({
         userId: v.string(),
         channelType: v.literal("email"),
         email: v.string(),
+        emailOwnership: v.optional(v.literal("verified_account")),
         verified: v.boolean(),
         linkedAt: v.number(),
       }),
@@ -269,6 +333,7 @@ export default defineSchema({
     variant: v.optional(v.string()),
   })
     .index("by_token", ["token"])
+    .index("by_expiresAt", ["expiresAt"])
     .index("by_user", ["userId"]),
 
   registrations: defineTable({
@@ -397,7 +462,7 @@ export default defineSchema({
   // budget at any wave size.
   //
   // `waveRuns` is the per-run state row. `wavePickedContacts` is the
-  // per-contact tri-state row that the push pipeline drains in batches.
+  // per-contact state row that the push pipeline drains in batches.
   // Together they are the durable source of truth for an in-flight wave;
   // `broadcastRampConfig.lastWave*` is updated atomically by
   // `_finalizeWaveRun` only when the whole pipeline succeeds.
@@ -436,11 +501,15 @@ export default defineSchema({
     requestedCount: v.number(),
     // = picked.length after reservoir sampling. Finalization gates on
     // "zero `pending` rows for this runId", NOT on pushedCount === totalCount —
-    // failed contacts are tolerated up to the 5% threshold.
+    // failed contacts are tolerated up to the 5% threshold after remote
+    // unsubscribe rows are excluded.
     totalCount: v.number(),
     underfilled: v.boolean(),
     pushedCount: v.number(),
     failedCount: v.number(),
+    // Optional so runs created before remote-unsubscribe handling retain a
+    // zero count when they are read or resumed.
+    suppressedCount: v.optional(v.number()),
     batchSize: v.number(),
     // Updated by every successful batch + by lease-revalidating recovery
     // mutations. Used (with createdAt/updatedAt fallback) by `runDailyRamp`'s
@@ -473,8 +542,9 @@ export default defineSchema({
     .index("by_runId", ["runId"])
     .index("by_status", ["status"]),
 
-  // Per-contact tri-state row written by `_persistPickedBatch` during pick
-  // and patched atomically by `_markContactPushed` / `_markContactFailed`
+  // Per-contact state row written by `_persistPickedBatch` during pick
+  // and patched atomically by `_markContactPushed`, `_markContactFailed`,
+  // or `_markContactSuppressed`
   // during push. The CAS guard on those mutations (no-op unless
   // status==='pending') makes them idempotent under overlapping
   // pushBatchAction invocations or operator-resume-while-original-still-running.
@@ -490,10 +560,12 @@ export default defineSchema({
       v.literal("pending"),
       v.literal("pushed"),
       v.literal("failed"),
+      v.literal("suppressed"),
     ),
     pushedAt: v.optional(v.number()),
     failedAt: v.optional(v.number()),
     failedReason: v.optional(v.string()),
+    suppressedAt: v.optional(v.number()),
   })
     .index("by_runId", ["runId"])
     .index("by_runId_status", ["runId", "status"]),
@@ -568,6 +640,9 @@ export default defineSchema({
     // may still rely on tiers 2-3 until
     // `backfillSubscriptionDodoCustomerId` lands their values here.
     dodoCustomerId: v.optional(v.string()),
+    // MCP paid-funnel upgrade attribution (#6716). Stamped from checkout
+    // metadata.wm_attribution on first subscription.active only.
+    attributionSource: v.optional(v.string()),
     // Epoch ms of the event that opened the CURRENT on_hold episode.
     // Set by handleSubscriptionOnHold only on the active→on_hold
     // transition (webhook replays while already on_hold keep the
@@ -595,8 +670,25 @@ export default defineSchema({
     // kinds for backoff) so the terminal "subscription deleted in Dodo"
     // downgrade requires repeated 404s specifically, not just any prior failure.
     reconcileNotFoundCount: v.optional(v.number()),
+    // Request-path renewal verification (#4770). The state + attempt timestamp
+    // form a durable lease/cooldown shared by every Convex action instance, so
+    // concurrent premium requests cannot fan out into duplicate Dodo lookups.
+    // Kept separate from the daily reconciler's backoff fields above so a cron
+    // failure does not suppress the bounded customer-facing rescue attempt —
+    // and vice versa: on-demand attempts advance/reset only the shared
+    // consecutive-404 streak (reconcileNotFoundCount — provider evidence
+    // counts from either path); the backoff pair (reconcileFailureCount /
+    // lastReconcileAttemptAt) is cron-only, so request-path failures cannot
+    // defer the nightly safety net (see markDodoReconcileAttempt `source`).
+    renewalVerificationState: v.optional(v.union(
+      v.literal("pending"),
+      v.literal("failed"),
+      v.literal("lapsed"),
+    )),
+    renewalVerificationAttemptAt: v.optional(v.number()),
   })
     .index("by_userId", ["userId"])
+    .index("by_userId_status_currentPeriodEnd", ["userId", "status", "currentPeriodEnd"])
     .index("by_dodoSubscriptionId", ["dodoSubscriptionId"])
     .index("by_dodoCustomerId", ["dodoCustomerId"])
     // Dunning scan (#4932): on_hold is a small TRANSIENT set (tens of rows),
@@ -612,7 +704,76 @@ export default defineSchema({
     // post-cancel window and outside it once access actually ends — never
     // winback-eligible (review round 2, finding 3). The winback email says
     // "your access ended ~a month ago", so access end is the right clock.
-    .index("by_status_currentPeriodEnd", ["status", "currentPeriodEnd"]),
+    .index("by_status_currentPeriodEnd", ["status", "currentPeriodEnd"])
+    // Cancellation-confirm retry (#7314, PR #7328): still-covering cancelled
+    // rows can sit in by_status_currentPeriodEnd for a full annual period.
+    // Keying this index on cancelledAt lets the daily scan range-read only
+    // the three-day retry cohort instead of every paid-through cancellation.
+    // Rows without cancelledAt are omitted (optional field) — the scan
+    // already skips those as having no stable episode key.
+    .index("by_status_cancelledAt", ["status", "cancelledAt"]),
+
+  // What happened in a Pro-activation session, one row per subscription per
+  // cohort (see `cohort` below).
+  //
+  // For the markerless retro cohort the row is ALSO a cross-device
+  // single-presentation lease: a short pending claim closes concurrent mount
+  // races without permanently suppressing onboarding when a browser crashes
+  // before rendering the flow. The day-0 cohort has no lease — its fire-once
+  // is the browser-local checkout marker — so its row is purely the outcome
+  // record.
+  //
+  // The outcome buckets mirror ActivationStepOutcome
+  // (pro-activation-state.ts). They are updated as the subscriber acts so a
+  // tab close cannot erase engagement, then frozen when `exitedAt` is set.
+  // `outcomeRevision` rejects late/out-of-order best-effort writes.
+  proActivationPresentations: defineTable({
+    userId: v.string(),
+    subscriptionId: v.id("subscriptions"),
+    // Which activation cohort this row records (#5621). ABSENT is the
+    // markerless retro backfill — the only cohort that existed before, so
+    // every pre-#5621 row reads correctly with no backfill, and the lease
+    // lookups keep matching them by querying `cohort: undefined`.
+    // "day0" is the post-checkout welcome session. The two are SEPARATE rows
+    // for one subscription on purpose: day-0 carries no lease (its fire-once
+    // is the browser-local checkout marker), so a day-0 row must never occupy
+    // the retro claim slot or set the `presentedAt` gate that suppresses a
+    // later legitimate backfill for a subscriber whose day-0 writes all
+    // failed (#5600).
+    cohort: v.optional(v.literal("day0")),
+    claimNonce: v.string(),
+    claimedAt: v.number(),
+    // Day-0 only: client-generated session start used with claimNonce as a
+    // total ownership order. Optional so rows written before the ordered
+    // takeover contract deploy without a backfill.
+    sessionStartedAt: v.optional(v.number()),
+    presentedAt: v.optional(v.number()),
+    // Set when a presentation is confirmed by an outcome-aware client. This
+    // excludes rows created before #5582 without losing post-deploy sessions
+    // that abandon the flow before their first progress snapshot.
+    outcomeTrackingVersion: v.optional(v.literal(1)),
+    confirmedSteps: v.optional(v.array(proActivationStepIdValidator)),
+    skippedSteps: v.optional(v.array(proActivationStepIdValidator)),
+    // Browser-refused steps (#5617). A separate bucket rather than a marker on
+    // `skippedSteps` so rows written before it existed stay valid and every
+    // existing consumer of the original three keeps its exact meaning.
+    //
+    // ROLLBACK: once any row has this field populated, deleting this line fails
+    // the Convex deploy — schema validation rejects a stored field the
+    // validator does not declare. To revert, revert the WRITE path (the client
+    // and the mutation arg) and leave this field in place; drop it only after
+    // the surviving rows have aged out.
+    blockedSteps: v.optional(v.array(proActivationStepIdValidator)),
+    failedSteps: v.optional(v.array(proActivationStepIdValidator)),
+    outcomeRevision: v.optional(v.number()),
+    outcomeUpdatedAt: v.optional(v.number()),
+    exitedAt: v.optional(v.number()),
+  })
+    // Cohort is part of the key so each lookup names the row it means. A
+    // prefix query on `subscriptionId` alone still reads BOTH cohorts (used
+    // by subscription deletion); every lease/outcome lookup pins the second
+    // component so it can never cross cohorts.
+    .index("by_subscription_cohort", ["subscriptionId", "cohort"]),
 
   // Dunning/winback send ledger (#4932): one row per email step actually
   // delivered for a given subscription episode. `episodeAt` is the on_hold
@@ -627,6 +788,11 @@ export default defineSchema({
       v.literal("dunning_day3"),
       v.literal("dunning_day7"),
       v.literal("winback_day30"),
+      // Paid-through cancellation confirmation (#7314). Shares this ledger
+      // with winback because both are keyed on the same cancellation episode
+      // (`subscriptions.cancelledAt`) — distinct `step` values keep their
+      // one-shot guarantees independent under `by_sub_step_episode`.
+      v.literal("cancellation_confirm"),
     ),
     episodeAt: v.number(),
     email: v.string(),
@@ -644,7 +810,15 @@ export default defineSchema({
       planLimits: v.optional(v.object({
         apiRequestsPerDay: v.union(v.number(), v.null()),
         apiBurstRequestsPerMinute: v.union(v.number(), v.null()),
-        mcpCallsPerDay: v.union(v.number(), v.null()),
+        // `SHARED_API_BUDGET` = the plan has no MCP allowance of its own; its
+        // MCP calls charge `apiRequestsPerDay`. Imported rather than retyped:
+        // this validator is what ACCEPTS the marker on every entitlement write,
+        // so a renamed constant that left a stale string literal here would
+        // typecheck and then reject the webhook's write at runtime.
+        mcpCallsPerDay: v.union(v.number(), v.null(), v.literal(SHARED_API_BUDGET)),
+        // Optional for entitlement rows written before the dashboard-AI
+        // dimension existed; the read-time catalog merge supplies it.
+        dashboardAiCallsPerDay: v.optional(v.union(v.number(), v.null())),
         mcpBurstRequestsPerMinute: v.union(v.number(), v.null()),
       })),
       prioritySupport: v.boolean(),
@@ -660,12 +834,26 @@ export default defineSchema({
       // validator MUST accept it or the webhook's entitlement write is
       // rejected (v.object is strict on extra keys).
       apiDailyAllowance: v.optional(v.number()),
+      // Optional — partner-embed key issuance. Legacy rows predate it; the
+      // read-time catalog merge supplies it and consumers treat undefined as
+      // false (fail-closed). Catalog-sourced writes always set it, so this
+      // validator MUST accept it or the Dodo webhook's entitlement write is
+      // rejected at runtime (v.object is strict on extra keys).
+      embedAccess: v.optional(v.boolean()),
+      // Optional — data-export entitlement (plan 2026-07-25-001). Legacy rows
+      // predate it; consumers treat undefined on a tier >= 2 row as entitled
+      // (fail-OPEN, permanently — see the PlanFeatures JSDoc). Catalog-sourced
+      // writes always set it, so this validator MUST accept it.
+      dataExport: v.optional(v.boolean()),
     }),
     validUntil: v.number(),
     // Optional complimentary-entitlement floor. When set and in the future,
     // subscription.expired events skip the normal downgrade-to-free so
     // goodwill credits outlive Dodo subscription cancellations.
     compUntil: v.optional(v.number()),
+    // Independent goodwill source; never derive this from a paid effective plan.
+    // Legacy rows without it require an audited source before migration.
+    compPlanKey: v.optional(v.string()),
     updatedAt: v.number(),
   })
     .index("by_userId", ["userId"])
@@ -725,6 +913,15 @@ export default defineSchema({
     // filtering `current` in memory -- bounds the hot path to live rows.
     .index("by_user_dimension_current", ["userId", "dimension", "current"]),
 
+  // Subscription cleanup must not erase customer-wide invoice ownership.
+  // Rows are retained after deletion and move with a verified anonymous claim.
+  deletedSubscriptionCustomers: defineTable({
+    userId: v.string(),
+    dodoCustomerId: v.string(),
+  })
+    .index("by_customer_user", ["dodoCustomerId", "userId"])
+    .index("by_userId", ["userId"]),
+
   customers: defineTable({
     userId: v.string(),
     dodoCustomerId: v.optional(v.string()),
@@ -744,7 +941,10 @@ export default defineSchema({
     .index("by_normalized_email", ["normalizedEmail"]),
 
   // Canonical per-Clerk-user record. Populated on first authenticated session
-  // by client → `users:ensureRecord` (see convex/users.ts). Distinct from
+  // by client → `users:ensureRecord` (see convex/users.ts), and server-side at
+  // checkout start by `users:recordTermsAcceptance` — which INSERTS when no row
+  // exists, because a /pro buyer may never have run ensureRecord (pro-test has
+  // no Convex client). Distinct from
   // `customers` (which is paid-only, populated by Dodo subscription webhook):
   // `users` covers EVERY Clerk-authenticated user, free or paid. Holds
   // operational properties used for product personalization and broadcast
@@ -767,6 +967,24 @@ export default defineSchema({
     country: v.optional(v.string()), // ISO 3166-1 alpha-2; CLIENT-REPORTED — see warning above
     firstSeenAt: v.number(),
     lastSeenAt: v.number(),
+    // Terms-of-service assent (#6976). Written at the two moments the user is
+    // actually shown the documents: account creation, and checkout start (the
+    // assent line sits immediately above every CTA). Both write the version
+    // read from `shared/legal.ts` server-side, so no client can record a
+    // version that was never in effect, and every recorded version resolves to
+    // an archived snapshot under docs/legal/.
+    //
+    // OPTIONAL, and deliberately not backfilled: users who predate #6976 were
+    // never shown an assent surface, and claiming otherwise would be worse than
+    // an empty column. They fill in on their next checkout.
+    termsAcceptedAt: v.optional(v.number()),
+    termsVersion: v.optional(v.string()), // ISO date, e.g. "2026-08-20"
+    // Set once, never overwritten (#6983). `termsAcceptedAt` moves to the
+    // newest acceptance, so without this the date of the acceptance that
+    // actually formed the agreement is destroyed by the first version bump —
+    // and it cannot be reconstructed afterwards. The bump in #6983
+    // (2026-07-27 → 2026-08-20) is the first one that would have done it.
+    termsFirstAcceptedAt: v.optional(v.number()),
   })
     .index("by_userId", ["userId"])
     .index("by_normalizedEmail", ["normalizedEmail"])
@@ -781,6 +999,100 @@ export default defineSchema({
   })
     .index("by_webhookId", ["webhookId"])
     .index("by_eventType", ["eventType"]),
+
+  // Durable dead-letter records for Dodo events that fail processing. Keep
+  // this projection intentionally payload-free: operators need stable Dodo
+  // identifiers and shape metadata to repair a subscription/payment, not a
+  // second copy of customer data or webhook secrets.
+  paymentWebhookFailures: defineTable({
+    webhookId: v.string(),
+    eventType: v.string(),
+    dodoSubscriptionId: v.optional(v.string()),
+    dodoPaymentId: v.optional(v.string()),
+    dodoCustomerId: v.optional(v.string()),
+    errorKind: v.string(),
+    errorMessage: v.string(),
+    dataKeys: v.array(v.string()),
+    eventTimestamp: v.number(),
+    receivedAt: v.number(),
+    lastSeenAt: v.number(),
+    attemptCount: v.number(),
+    unresolved: v.boolean(),
+    resolvedAt: v.optional(v.number()),
+    resolvedBy: v.optional(v.string()),
+    resolutionNote: v.optional(v.string()),
+  })
+    .index("by_webhookId", ["webhookId"])
+    .index("by_unresolved_lastSeenAt", ["unresolved", "lastSeenAt"])
+    .index("by_dodoSubscriptionId", ["dodoSubscriptionId"])
+    .index("by_dodoPaymentId", ["dodoPaymentId"]),
+
+  // Bounded aggregate used for the Sentry/ops signal. Keeping it separate
+  // from the dead-letter rows avoids collecting an incident-sized table from
+  // every retry just to report queue counts. The pre-seeded global document
+  // also serializes failure-row inserts and lifecycle transitions; see
+  // `payments/webhookMutations:_seedFailureSummary` and the Convex deploy
+  // workflow. It must not be lazily created in the failure mutation because
+  // an empty index range does not serialize concurrent first inserts.
+  paymentWebhookFailureSummary: defineTable({
+    key: v.literal("global"),
+    unresolvedCount: v.number(),
+    eventTypes: v.array(
+      v.object({
+        eventType: v.string(),
+        count: v.number(),
+      }),
+    ),
+    updatedAt: v.number(),
+  }).index("by_key", ["key"]),
+
+  // Dodo events we received and authenticated but could not attribute to a
+  // user: no signed checkout metadata and no `customers` row. The canonical
+  // source is a Dodo *payment link* / dashboard-created subscription, which
+  // carries `metadata: {}` because only our own checkout attaches the signed
+  // `wm_user_id`.
+  //
+  // These are NOT `paymentWebhookFailures`. That table means "processing broke,
+  // Dodo should retry"; retrying this never helps, because the identity lookup
+  // is deterministic — all 8 attempts fail identically (2026-08-03). This table
+  // means "received intact, needs a human to say who it belongs to", and the
+  // webhook acknowledges 200 once the row is durably committed.
+  unattributedPaymentEvents: defineTable({
+    webhookId: v.string(),
+    eventType: v.string(),
+    // Did money actually move? Drives alert severity and whether we owe the
+    // buyer fulfillment. An abandoned 3DS attempt is a sales signal; a settled
+    // charge with nobody attached is a paid customer holding no access.
+    charged: v.boolean(),
+    dodoCustomerId: v.optional(v.string()),
+    dodoPaymentId: v.optional(v.string()),
+    dodoSubscriptionId: v.optional(v.string()),
+    dodoProductId: v.optional(v.string()),
+    // Contact details come straight from the Dodo payload — they are how an
+    // operator finds the human to talk to, and the only identity signal we have.
+    customerEmail: v.optional(v.string()),
+    customerName: v.optional(v.string()),
+    amount: v.optional(v.number()),
+    currency: v.optional(v.string()),
+    errorCode: v.optional(v.string()),
+    errorMessage: v.optional(v.string()),
+    rawPayload: v.any(),
+    eventTimestamp: v.number(),
+    receivedAt: v.number(),
+    lastSeenAt: v.number(),
+    occurrences: v.number(),
+    notifiedAt: v.optional(v.number()),
+    resolved: v.boolean(),
+    resolvedUserId: v.optional(v.string()),
+    resolvedAt: v.optional(v.number()),
+    resolutionNote: v.optional(v.string()),
+  })
+    .index("by_webhookId", ["webhookId"])
+    .index("by_resolved_lastSeenAt", ["resolved", "lastSeenAt"])
+    // Powers the per-customer notification throttle: a card-testing burst must
+    // not turn into one admin email per attempt.
+    .index("by_dodoCustomerId_lastSeenAt", ["dodoCustomerId", "lastSeenAt"])
+    .index("by_dodoSubscriptionId", ["dodoSubscriptionId"]),
 
   paymentEvents: defineTable({
     userId: v.string(),
@@ -824,6 +1136,29 @@ export default defineSchema({
     .index("by_dodoPaymentId", ["dodoPaymentId"])
     .index("by_reconciledAt", ["reconciledAt"]),
 
+  // One row per checkout that exhausted the #6027 provider-429 retry ladder
+  // and returned a terminal CHECKOUT_RATE_LIMITED to the buyer (#6698). This
+  // is the rate signal the alarm in `payments/checkoutRateLimitAlarm.ts`
+  // measures; the browser-side Sentry event is corroboration, not the source,
+  // because it is ad-blockable and fires at level `info`.
+  //
+  // Deliberately payload-free and self-pruning: each insert deletes a bounded
+  // batch of rows older than CHECKOUT_RATE_LIMIT_EVENT_RETENTION_MS, so a
+  // storm drains over the inserts that follow it rather than accumulating for
+  // the lifetime of the deployment. Rows left behind when 429s stop entirely
+  // are inert — every count is window-relative, so a stale row can never
+  // inflate a verdict.
+  checkoutRateLimitEvents: defineTable({
+    userId: v.string(),
+    productId: v.string(),
+    occurredAt: v.number(),
+    // Stamped on the row whose insert crossed a threshold and emitted the ops
+    // signal. This doubles as the alert cooldown clock, which is why the alarm
+    // needs no pre-seeded singleton document — there is no state row whose
+    // absence could silently disarm it.
+    alertedAt: v.optional(v.number()),
+  }).index("by_occurredAt", ["occurredAt"]),
+
   productPlans: defineTable({
     dodoProductId: v.string(),
     planKey: v.string(),
@@ -833,6 +1168,469 @@ export default defineSchema({
     .index("by_dodoProductId", ["dodoProductId"])
     .index("by_planKey", ["planKey"]),
 
+  // Company Monitoring's account root. Imports are replayed from company-row
+  // idempotency fields, and purge progress lives on this root. Provider tables
+  // below remain account-prefixed so destructive purge never scans globally.
+  companyMonitoringAccounts: defineTable({
+    logicalAccountId: v.string(),
+    ownerUserId: v.optional(v.string()),
+    ownerFenceHash: v.string(),
+    lifecycle: v.union(
+      v.literal("entitled"),
+      v.literal("entitlement_lapsed"),
+      v.literal("denied"),
+    ),
+    terminalReason: v.optional(v.union(v.literal("owner_deleted"), v.literal("account_deleted"))),
+    entitlementDigest: v.optional(v.string()),
+    lifecycleSequence: v.number(),
+    companyCount: v.optional(v.number()),
+    companyLimit: v.optional(v.number()),
+    snapshotGeneration: v.optional(v.number()),
+    purgeGeneration: v.number(),
+    purgePhase: v.union(
+      v.literal("none"),
+      v.literal("pending"),
+      v.literal("scan"),
+      v.literal("companies"),
+      v.literal("finalizing"),
+      v.literal("complete"),
+    ),
+    destructivePurgeStarted: v.boolean(),
+    pendingReactivation: v.boolean(),
+    // Legacy accounts remain unstamped until every company page has had its
+    // customer claim policy and current-name alias repaired. Provider rollout
+    // gates fail closed on a missing or older version.
+    claimPolicyVersion: v.optional(v.number()),
+    // Durable orchestration cursors. Claims always begin from these indexed
+    // account fields and read only a fixed page; work/company tables are never
+    // scanned globally to discover due customer work.
+    nextExaScanDueAt: v.optional(v.number()),
+    nextXScanDueAt: v.optional(v.number()),
+    purgeAfter: v.optional(v.number()),
+    purgeCursor: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_logicalAccountId", ["logicalAccountId"])
+    .index("by_ownerUserId", ["ownerUserId"])
+    .index("by_ownerFenceHash", ["ownerFenceHash"])
+    .index("by_purgePhase_updatedAt", ["purgePhase", "updatedAt"])
+    // Consumer: accounts.reconcileAccountEntitlements. Entitlement writes no
+    // longer push lapses (#6256), so the reconciler pulls them by scanning
+    // entitled roots oldest-first.
+    .index("by_lifecycle_updatedAt", ["lifecycle", "updatedAt"])
+    .index("by_lifecycle_nextExaScanDueAt", ["lifecycle", "nextExaScanDueAt"])
+    .index("by_lifecycle_nextXScanDueAt", ["lifecycle", "nextXScanDueAt"]),
+
+  companyMonitoringCompanies: defineTable({
+    ownerAccountId: v.string(),
+    companyId: v.string(),
+    name: v.optional(v.string()),
+    sortName: v.optional(v.string()),
+    domicileCountry: v.optional(v.union(v.literal("US"), v.literal("GB"))),
+    customerReference: v.optional(v.string()),
+    lifecycle: v.union(v.literal("active"), v.literal("paused"), v.literal("removed")),
+    coverageState: v.optional(v.union(v.literal("awaiting_first_scan"), v.literal("identity_unresolved"))),
+    observationState: v.optional(v.literal("unknown")),
+    // Any new deletion tombstone advances this version and makes downstream
+    // derived state stale until the later recomputation slice consumes it.
+    evidenceRevision: v.optional(v.number()),
+    recomputeRequiredAt: v.optional(v.number()),
+    snapshotGeneration: v.number(),
+    directRequestId: v.optional(v.string()),
+    directFingerprint: v.optional(v.string()),
+    clientImportId: v.optional(v.string()),
+    importOrdinal: v.optional(v.number()),
+    importFingerprint: v.optional(v.string()),
+    purgeGeneration: v.number(),
+    purgePhase: v.union(
+      v.literal("none"),
+      v.literal("scan"),
+      v.literal("evidence"),
+      v.literal("candidates"),
+      v.literal("payload"),
+      v.literal("complete"),
+    ),
+    removedAt: v.optional(v.number()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_account_companyId", ["ownerAccountId", "companyId"])
+    .index("by_account_lifecycle_sortName", ["ownerAccountId", "lifecycle", "sortName"])
+    .index("by_account_customerReference_lifecycle", ["ownerAccountId", "customerReference", "lifecycle"])
+    .index("by_account_directRequestId", ["ownerAccountId", "directRequestId"])
+    .index("by_account_import_tuple", ["ownerAccountId", "clientImportId", "importOrdinal"]),
+
+  companyMonitoringClaims: defineTable({
+    ownerAccountId: v.string(),
+    companyId: v.string(),
+    claimId: v.string(),
+    type: v.union(
+      v.literal("alias"),
+      v.literal("domain"),
+      v.literal("legal_identifier"),
+      v.literal("x_account_id"),
+      v.literal("x_handle"),
+      v.literal("location"),
+      v.literal("customer_reference"),
+    ),
+    value: v.string(),
+    provenance: v.union(v.literal("customer"), v.literal("independent_provider")),
+    trustState: v.union(
+      v.literal("unverified"),
+      v.literal("verified"),
+      v.literal("expired"),
+      v.literal("rejected"),
+    ),
+    allowedUses: v.optional(v.array(v.union(
+      v.literal("discovery"),
+      v.literal("attribution"),
+      v.literal("primary_evidence"),
+    ))),
+    expiresAt: v.optional(v.number()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_account_company", ["ownerAccountId", "companyId"]),
+
+  // One current official-X authority decision per company. The immutable
+  // account ID is the binding key; handles are current display/routing data.
+  // Claim IDs retain the exact independently verified domain evidence and
+  // customer handle claim used for each decision.
+  companyMonitoringXIdentities: defineTable({
+    ownerAccountId: v.string(),
+    companyId: v.string(),
+    domainClaimId: v.string(),
+    xHandleClaimId: v.string(),
+    officialDomain: v.string(),
+    officialPageUrl: v.string(),
+    accountId: v.string(),
+    currentHandle: v.string(),
+    profileName: v.string(),
+    domicileCountry: v.union(v.literal("US"), v.literal("GB")),
+    authorityRole: companyMonitoringXAuthorityRoleValidator,
+    state: v.union(v.literal("authoritative"), v.literal("demoted")),
+    demotionReason: v.optional(companyMonitoringXDemotionReasonValidator),
+    badgeVerified: v.boolean(),
+    allowedUses: v.array(companyMonitoringXAllowedUseValidator),
+    evidenceHash: v.string(),
+    checkedAt: v.number(),
+    expiresAt: v.number(),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_account_company", ["ownerAccountId", "companyId"])
+    .index("by_account_accountId", ["ownerAccountId", "accountId"])
+    .index("by_account_currentHandle", ["ownerAccountId", "currentHandle"]),
+
+  // Compliance-aware recent posts. Deleted content remains as a tombstone;
+  // protected/withheld content retains only permitted metadata.
+  companyMonitoringXEvidence: defineTable({
+    ownerAccountId: v.string(),
+    companyId: v.string(),
+    postId: v.string(),
+    authorAccountId: v.string(),
+    currentHandle: v.string(),
+    createdAt: v.number(),
+    observedAt: v.number(),
+    contentState: companyMonitoringXContentStateValidator,
+    storageState: companyMonitoringXStorageStateValidator,
+    text: v.optional(v.string()),
+    editHistoryPostIds: v.array(v.string()),
+    withheldCountryCodes: v.optional(v.array(v.string())),
+    evidenceRevision: v.number(),
+    lastReconciledAt: v.optional(v.number()),
+    firstSeenAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_account_company", ["ownerAccountId", "companyId"])
+    .index("by_account_company_observedAt", ["ownerAccountId", "companyId", "observedAt"])
+    .index("by_account_company_contentState_lastReconciledAt", [
+      "ownerAccountId",
+      "companyId",
+      "contentState",
+      "lastReconciledAt",
+    ])
+    .index("by_account_postId", ["ownerAccountId", "postId"])
+    .index("by_account_company_postId", ["ownerAccountId", "companyId", "postId"]),
+
+  // Every X edit-history ID resolves to one canonical evidence row. This
+  // keeps later compliance events for any edit sibling from leaving another
+  // version active after a deletion.
+  companyMonitoringXPostAliases: defineTable({
+    ownerAccountId: v.string(),
+    companyId: v.string(),
+    postId: v.string(),
+    canonicalPostId: v.string(),
+    authorAccountId: v.string(),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_account_postId", ["ownerAccountId", "postId"])
+    .index("by_account_company", ["ownerAccountId", "companyId"]),
+
+  // Provider locators are copied into account + company rows. No unscoped
+  // locator or fingerprint index exists, so identical provider results in two
+  // portfolios remain separate customer evidence.
+  companyMonitoringEvidence: defineTable({
+    ownerAccountId: v.string(),
+    companyId: v.string(),
+    evidenceId: v.string(),
+    provider: companyMonitoringEvidenceProviderValidator,
+    providerLocator: v.string(),
+    queryVersion: v.optional(v.string()),
+    providerLocatorHash: v.string(),
+    providerOrigin: v.string(),
+    providerOriginFingerprint: v.string(),
+    contentFingerprint: v.string(),
+    evidenceFingerprint: v.string(),
+    occurrenceDedupeKey: v.string(),
+    matchedClaimIds: v.array(v.string()),
+    sourceAuthority: companyMonitoringEvidenceAuthorityValidator,
+    independence: companyMonitoringEvidenceIndependenceValidator,
+    state: companyMonitoringEvidenceStateValidator,
+    url: v.optional(v.string()),
+    title: v.optional(v.string()),
+    text: v.optional(v.string()),
+    author: v.optional(v.string()),
+    authorAccountId: v.optional(v.string()),
+    publishedAt: v.number(),
+    observedAt: v.number(),
+    expiresAt: v.optional(v.number()),
+    firstSeenAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_account_company", ["ownerAccountId", "companyId"])
+    .index("by_account_company_locator", [
+      "ownerAccountId",
+      "companyId",
+      "provider",
+      "providerLocatorHash",
+    ])
+    .index("by_account_company_fingerprint", [
+      "ownerAccountId",
+      "companyId",
+      "evidenceFingerprint",
+    ])
+    .index("by_account_company_occurrence", [
+      "ownerAccountId",
+      "companyId",
+      "occurrenceDedupeKey",
+    ])
+    .index("by_account_company_occurrence_state", [
+      "ownerAccountId",
+      "companyId",
+      "occurrenceDedupeKey",
+      "state",
+    ])
+    .index("by_account_company_provider_state", [
+      "ownerAccountId",
+      "companyId",
+      "provider",
+      "state",
+    ])
+    .index("by_account_company_state_expiresAt", [
+      "ownerAccountId",
+      "companyId",
+      "state",
+      "expiresAt",
+    ]),
+
+  // One account/company occurrence is the classifier handoff. References are
+  // bounded snapshots; referenceCount preserves the full active evidence size.
+  companyMonitoringCandidates: defineTable({
+    ownerAccountId: v.string(),
+    companyId: v.string(),
+    candidateId: v.string(),
+    occurrenceDedupeKey: v.string(),
+    state: companyMonitoringCandidateStateValidator,
+    firstDiscoveredAt: v.number(),
+    firstDiscoveredPath: v.string(),
+    attemptCount: v.number(),
+    holdUntil: v.optional(v.number()),
+    expiresAt: v.number(),
+    observationBlocking: v.boolean(),
+    referenceEvidenceFingerprints: v.array(v.string()),
+    referenceCount: v.number(),
+    referencesTruncated: v.boolean(),
+    selectionPolicyVersion: v.string(),
+    terminalReason: v.optional(companyMonitoringCandidateTerminalReasonValidator),
+    evidenceRevision: v.number(),
+    evidenceSnapshotDigest: v.optional(v.string()),
+    lastAdmissionDecisionId: v.optional(v.id("companyMonitoringAdmissionDecisions")),
+    classificationWorkerId: v.optional(v.string()),
+    classificationLeaseToken: v.optional(v.string()),
+    classificationLeaseExpiresAt: v.optional(v.number()),
+    classificationRunId: v.optional(v.string()),
+    classificationRequestedModelVersion: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_account_company", ["ownerAccountId", "companyId"])
+    .index("by_account_company_occurrence", [
+      "ownerAccountId",
+      "companyId",
+      "occurrenceDedupeKey",
+    ])
+    .index("by_account_state_updatedAt", ["ownerAccountId", "state", "updatedAt"])
+    .index("by_state_updatedAt", ["state", "updatedAt"]),
+
+  // Append-only outcome ledger. Model output is never stored directly: only
+  // the strict normalized classification and deterministic policy result are
+  // durable. The replay index fences one classification run to one evidence
+  // revision while preserving every later retry as a separate row.
+  companyMonitoringAdmissionDecisions: defineTable({
+    ownerAccountId: v.string(),
+    companyId: v.string(),
+    candidateId: v.string(),
+    occurrenceDedupeKey: v.string(),
+    evidenceRevision: v.number(),
+    classificationRunId: v.string(),
+    submissionDigest: v.string(),
+    decision: v.union(
+      v.literal("publish"),
+      v.literal("hold"),
+      v.literal("reject"),
+      v.literal("expire"),
+    ),
+    reasonCodes: v.array(v.string()),
+    referenceEvidenceFingerprints: v.array(v.string()),
+    confidenceFloors: companyMonitoringAdmissionConfidenceFloorsValidator,
+    classification: v.optional(companyMonitoringAdmissionClassificationValidator),
+    overallConfidence: v.optional(v.number()),
+    authority: v.optional(companyMonitoringAdmissionAuthorityValidator),
+    queryVersions: v.array(v.string()),
+    classificationSchemaVersion: v.string(),
+    admissionPolicyVersion: v.string(),
+    sourcePolicyVersion: v.string(),
+    retryPolicyVersion: v.string(),
+    evidenceSelectionPolicyVersion: v.string(),
+    modelVersion: v.string(),
+    requestedModelVersion: v.optional(v.string()),
+    evidenceSnapshotDigest: v.optional(v.string()),
+    retryAt: v.optional(v.number()),
+    terminalAt: v.number(),
+    decidedAt: v.number(),
+    previousDecisionId: v.optional(v.id("companyMonitoringAdmissionDecisions")),
+  })
+    .index("by_account_company", ["ownerAccountId", "companyId"])
+    .index("by_account_candidate", ["ownerAccountId", "candidateId", "decidedAt"])
+    .index("by_replay_fence", [
+      "ownerAccountId",
+      "companyId",
+      "occurrenceDedupeKey",
+      "evidenceRevision",
+      "classificationRunId",
+    ]),
+
+  // One durable company/source obligation. The closed state variants keep a
+  // single uniqueness row while a work item's terminal receipt preserves the
+  // history for every completed window. A failed/non-reassuring attempt never
+  // changes `checkpoint`; a later window reuses that exact value.
+  companyMonitoringScanObligations: defineTable(v.union(
+    v.object({
+      ...companyMonitoringObligationIdentity,
+      state: v.literal("due"),
+      workId: v.string(),
+    }),
+    v.object({
+      ...companyMonitoringObligationIdentity,
+      state: v.literal("leased"),
+      workId: v.string(),
+      leaseToken: v.string(),
+      leaseExpiresAt: v.number(),
+      workerId: v.string(),
+    }),
+    v.object({
+      ...companyMonitoringObligationIdentity,
+      state: v.literal("complete"),
+      workId: v.string(),
+      terminalReceiptId: v.string(),
+      completedAt: v.number(),
+    }),
+    v.object({
+      ...companyMonitoringObligationIdentity,
+      state: v.literal("non_reassuring"),
+      workId: v.string(),
+      terminalReceiptId: v.string(),
+      completedAt: v.number(),
+      reason: companyMonitoringNonReassuringReasonValidator,
+    }),
+    v.object({
+      ...companyMonitoringObligationIdentity,
+      state: v.literal("cancelled"),
+      workId: v.optional(v.string()),
+      cancelledAt: v.number(),
+      reason: v.union(
+        v.literal("company_removed"),
+        v.literal("account_inactive"),
+        v.literal("superseded"),
+      ),
+    }),
+  ))
+    .index("by_account_company_source", ["ownerAccountId", "companyId", "source"])
+    .index("by_workId", ["workId"]),
+
+  // Durable cohort membership for terminal receipts. Live obligations move
+  // to the next due work item, while these bounded links retain which
+  // companies the immutable terminal work receipt covered. Company purge
+  // removes its links page-by-page and deletes a receipt only after the final
+  // cohort member link is gone.
+  companyMonitoringScanReceiptLinks: defineTable({
+    ownerAccountId: v.string(),
+    companyId: v.string(),
+    workId: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_account_company", ["ownerAccountId", "companyId"])
+    .index("by_workId", ["workId"])
+    .index("by_workId_company", ["workId", "companyId"]),
+
+  // Cohort/source/window work is the sole lease and terminal-receipt
+  // authority. `selectionDueAt` is `scheduledDueAt` while due and the lease
+  // expiry while leased, so crash replay remains an indexed bounded lookup.
+  companyMonitoringScanWorkItems: defineTable(v.union(
+    v.object({
+      ...companyMonitoringWorkIdentity,
+      state: v.literal("due"),
+    }),
+    v.object({
+      ...companyMonitoringWorkIdentity,
+      state: v.literal("leased"),
+      leaseToken: v.string(),
+      leaseExpiresAt: v.number(),
+      workerId: v.string(),
+    }),
+    v.object({
+      ...companyMonitoringWorkIdentity,
+      state: v.literal("complete"),
+      terminalLeaseToken: v.string(),
+      terminalWorkerId: v.string(),
+      terminalReceipt: companyMonitoringCompleteReceiptValidator,
+    }),
+    v.object({
+      ...companyMonitoringWorkIdentity,
+      state: v.literal("non_reassuring"),
+      terminalLeaseToken: v.string(),
+      terminalWorkerId: v.string(),
+      terminalReceipt: companyMonitoringNonReassuringReceiptValidator,
+    }),
+    v.object({
+      ...companyMonitoringWorkIdentity,
+      state: v.literal("cancelled"),
+      cancelledAt: v.number(),
+      cancelReason: v.union(
+        v.literal("company_removed"),
+        v.literal("account_inactive"),
+        v.literal("superseded"),
+      ),
+    }),
+  ))
+    .index("by_workId", ["workId"])
+    .index("by_workKey", ["workKey"])
+    .index("by_account_state_selectionDueAt", ["ownerAccountId", "state", "selectionDueAt"])
+    .index("by_account_source_state_selectionDueAt", ["ownerAccountId", "source", "state", "selectionDueAt"]),
+
   userApiKeys: defineTable({
     userId: v.string(),
     name: v.string(),
@@ -841,8 +1639,41 @@ export default defineSchema({
     createdAt: v.number(),
     lastUsedAt: v.optional(v.number()),
     revokedAt: v.optional(v.number()),
+    scopes: v.optional(v.array(v.string())),
+    companyMonitoringAccountId: v.optional(v.string()),
   })
     .index("by_userId", ["userId"])
+    .index("by_userId_revokedAt", ["userId", "revokedAt"])
+    .index("by_keyHash", ["keyHash"]),
+
+  // Partner-embed keys (`wme_…`). A SEPARATE table from `userApiKeys` on
+  // purpose: an embed key is pasted into the partner's public HTML, so it must
+  // be mintable by every paid tier, while `userApiKeys` issuance is
+  // deliberately fenced behind the `API_ACCESS_REQUIRED` throw that keeps
+  // `wm_…` away from Pro. Sharing one table would mean relaxing that throw.
+  embedKeys: defineTable({
+    userId: v.string(),
+    name: v.string(),
+    keyPrefix: v.string(),        // first 9 chars of plaintext key, for display
+    keyHash: v.string(),          // SHA-256 hex digest — never store plaintext
+    createdAt: v.number(),
+    lastUsedAt: v.optional(v.number()),
+    revokedAt: v.optional(v.number()),
+    // Set when a key is replaced by a rotation rather than revoked outright,
+    // so a partner mid-swap can be told which of two dead keys their page is
+    // still serving. Rotation is a later unit; nothing writes this yet.
+    supersededAt: v.optional(v.number()),
+    // DECLARED, NOT ENFORCED. The origins a partner says they will embed from,
+    // captured at issuance for attribution and to catch honest misconfiguration.
+    // This is NOT an auth boundary and must never be read as one: the key ships
+    // in the partner's public HTML and `Origin` is attacker-controlled off a
+    // browser entirely. A later unit consumes it; nothing reads it yet. The
+    // column lands now so that unit is additive rather than a schema change on
+    // a table with live rows.
+    allowedOrigins: v.optional(v.array(v.string())),
+  })
+    .index("by_userId", ["userId"])
+    .index("by_userId_revokedAt", ["userId", "revokedAt"])
     .index("by_keyHash", ["keyHash"]),
 
   // Non-key Pro MCP identity rows. One row per OAuth grant for a Pro user.
@@ -857,11 +1688,59 @@ export default defineSchema({
     createdAt: v.number(),
     lastUsedAt: v.optional(v.number()),
     revokedAt: v.optional(v.number()),
-  }).index("by_userId", ["userId"]),
+  })
+    .index("by_userId", ["userId"])
+    .index("by_userId_revokedAt_createdAt", ["userId", "revokedAt", "createdAt"]),
+
+  // API Business domain-gated Pro-seat invites (#4634/#4635). One row per seat
+  // invite issued by an active `api_business` owner to a corporate-email
+  // invitee. The grant is an explicit, revocable object keyed to the owner's
+  // Business `dodoSubscriptionId` (KTD1) — NOT a fake subscription — so
+  // `pickBestCoveringSub` stays clean. An `accepted` grant under a covering
+  // Business sub resolves the invitee to Pro (U5); when the Business sub stops
+  // covering, its grants flip to `revoked` and each invitee recomputes down (U6).
+  // `inviteeEmail` and the owner `domain` are stored lowercased for stable comparisons
+  // and reporting.
+  businessProGrants: defineTable({
+    businessSubscriptionId: v.string(),
+    ownerUserId: v.string(),
+    inviteeEmail: v.string(),
+    domain: v.string(),
+    status: v.union(
+      v.literal("pending"),
+      v.literal("accepted"),
+      v.literal("revoked"),
+      v.literal("expired"),
+    ),
+    inviteeUserId: v.optional(v.string()),
+    createdAt: v.number(),
+    acceptedAt: v.optional(v.number()),
+    expiresAt: v.number(),
+  })
+    .index("by_businessSubscriptionId", ["businessSubscriptionId"])
+    .index("by_inviteeEmail", ["inviteeEmail"])
+    .index("by_inviteeUserId", ["inviteeUserId"]),
+
+  // Per-Business-subscription serialization document for the 4-seat cap.
+  // EVERY mutation that mutates `businessProGrants` for a Business sub reads
+  // AND writes this row, forcing Convex's per-document OCC to serialize
+  // concurrent inviteSeats / removeSeat calls. Without this, two parallel
+  // invites could both pass the cap check and insert a 5th grant.
+  businessSeatLocks: defineTable({
+    businessSubscriptionId: v.string(),
+    lastTouchedAt: v.number(),
+  }).index("by_businessSubscriptionId", ["businessSubscriptionId"]),
 
   emailSuppressions: defineTable({
     normalizedEmail: v.string(),
-    reason: v.union(v.literal("bounce"), v.literal("complaint"), v.literal("manual")),
+    // unsubscribe withdraws broadcast and marketing consent. The other
+    // reasons suppress broadcast, marketing, and transactional delivery.
+    reason: v.union(
+      v.literal("bounce"),
+      v.literal("complaint"),
+      v.literal("manual"),
+      v.literal("unsubscribe"),
+    ),
     suppressedAt: v.number(),
     source: v.optional(v.string()),
   }).index("by_normalized_email", ["normalizedEmail"]),
@@ -886,4 +1765,110 @@ export default defineSchema({
   })
     .index("by_webhookEventId", ["webhookEventId"])
     .index("by_broadcast_event", ["broadcastId", "eventType"]),
+
+  // Pre-seeded, document-backed serialization point for `intelHistory.append`.
+  //
+  // Convex does not treat an empty `by_dedupeKey` index range as a conflict
+  // dependency, so concurrent first-seen appends could both see no row and
+  // insert the same key. `intelHistory.append` reads and patches this
+  // always-existing singleton before checking dedupe keys, making the OCC
+  // dependency document-backed. The historical seeders are low-frequency,
+  // so one global serialization point is intentional and keeps the invariant
+  // simple. It is seeded by the deploy workflow; append fails loudly if it is
+  // absent rather than silently weakening idempotency.
+  intelHistoryAppendLocks: defineTable({
+    lockKey: v.string(),
+    lastTouchedAt: v.number(),
+  }).index("by_lockKey", ["lockKey"]),
+
+  // Append-only historical intelligence memory (#5694). Seeders publish a
+  // rolling live snapshot to Redis that overwrites itself every run; this
+  // table is the durable long tail behind it — one row per distinct event,
+  // never updated in place. `dedupeKey` is the seeder-side identity of an
+  // event, so a re-publish of the same event is a skip, not a second row
+  // (see `append` in convex/intelHistory.ts).
+  //
+  // EMBEDDING CONTRACT — `embedding` is produced by
+  // openai/text-embedding-3-small at 512 dimensions: the SAME model and
+  // dimension pair the brief deduper uses (EMBED_MODEL / EMBED_DIMS in
+  // scripts/lib/brief-dedup-consts.mjs). The vector index below hard-codes
+  // `dimensions: 512` and Convex rejects a stored vector of any other length,
+  // so changing the model OR the dimension is a table migration (a new /
+  // version-suffixed table plus a full re-embed) — NOT an in-place edit of
+  // this number. Mixing vectors from two models in one index is worse than a
+  // hard failure: the search still returns results, they are just ranked
+  // against a similarity scale that no longer means anything. The deduper
+  // carries the same warning on its CACHE_VERSION prefix.
+  intelHistory: defineTable({
+    // "conflict" | "military" | "energy" today. Deliberately v.string() and
+    // not a v.union of literals: a new seeder domain should be a code change
+    // in the collector, not a schema deploy that has to land first.
+    domain: v.string(),
+    resource: v.string(),
+    country: v.optional(v.string()),
+    category: v.optional(v.string()),
+    title: v.string(),
+    summary: v.optional(v.string()),
+    sourceUrl: v.optional(v.string()),
+    // Event time as reported by the source, vs. the time we stored it. Both
+    // are kept: reads are ordered by `occurredAt` (what a user means by "what
+    // happened last week") while retention ages rows out by `ingestedAt` (so
+    // a backfill of old events is not deleted by the next prune tick).
+    occurredAt: v.number(),
+    ingestedAt: v.number(),
+    runId: v.string(),
+    dedupeKey: v.string(),
+    embedding: v.array(v.float64()),
+  })
+    .index("by_dedupeKey", ["dedupeKey"])
+    .index("by_ingestedAt", ["ingestedAt"])
+    .index("by_domain_occurredAt", ["domain", "occurredAt"])
+    .index("by_country_occurredAt", ["country", "occurredAt"])
+    // Convex's vector-index filter builder supports only `eq` and `or` — there
+    // is no `and`. A query scoped to BOTH domain and country therefore pushes
+    // one field down and post-filters the other; see `search` in
+    // convex/intelHistory.ts for which one and why.
+    .vectorIndex("by_embedding", {
+      vectorField: "embedding",
+      dimensions: 512,
+      filterFields: ["domain", "country"],
+    }),
+
+  // Retraction tombstones for `intelHistory` (#5743).
+  //
+  // Deleting a poisoned or wrong history row is not enough on its own. The
+  // producing seeders republish a rolling window every run, and `append`
+  // decides "already stored?" by looking for a row with the same `dedupeKey` —
+  // so a bare delete is undone by the next seed tick, usually within the hour.
+  // A retraction therefore writes a tombstone keyed on the same `dedupeKey`
+  // the delete removed, and `append` skips any record that matches one.
+  //
+  // Tombstones, not a soft-delete flag on `intelHistory`: the row must
+  // genuinely leave the vector index (that is the whole point of a retraction,
+  // and a filtered-out row still costs index space and can still be ranked),
+  // while the identity has to survive it. They age out on the same 180-day
+  // clock as the history itself — by `retractedAt`, so the window starts when
+  // the operator acted rather than when the event happened.
+  intelHistoryRetractions: defineTable({
+    // Matches `intelHistory.dedupeKey` exactly. One row per retracted
+    // identity; re-retracting the same key refreshes it rather than
+    // accumulating duplicates.
+    dedupeKey: v.string(),
+    // When suppression was last ASSERTED — not when the operator first acted.
+    // `retract` sets it, and every `append` this tombstone suppresses refreshes
+    // it, because a record still arriving from the producer is evidence the
+    // feed has not stopped serving it and expiry would be premature. Expiry is
+    // therefore measured from the producer's last attempt, so `listRetractions`
+    // orders by "most recently still-live" rather than by when someone typed
+    // the command. The original action time lives in the `reason` an operator
+    // is required to supply and in the `intel_history_retracted` breadcrumb.
+    retractedAt: v.number(),
+    // Free text from the operator, e.g. "poisoned RSS item, #5743". Required
+    // at the relay boundary: a tombstone with no stated cause is unreviewable
+    // six weeks later, when the only question that matters is whether it is
+    // still deserved.
+    reason: v.string(),
+  })
+    .index("by_dedupeKey", ["dedupeKey"])
+    .index("by_retractedAt", ["retractedAt"]),
 });

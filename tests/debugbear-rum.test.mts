@@ -3,12 +3,13 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { guardProBuiltOutput, shouldSkipProBuiltOutput } from './_lib/pro-built-output.mjs';
 
 import {
   DEBUGBEAR_RUM_SAMPLE_RATE,
   DEBUGBEAR_RUM_SCRIPT_SRC,
   initDebugBearRum,
-  reportBootstrapR2Rum,
+  reportBootstrapTransferRum,
   resetDebugBearRumForTesting,
   shouldEnableDebugBearRum,
 } from '../src/bootstrap/debugbear-rum.ts';
@@ -57,7 +58,11 @@ interface FakeDebugBearScript {
   fetchPriority?: string;
 }
 
-function installDebugBearHarness(hostname: string, existingScript: FakeDebugBearScript | null = null): {
+function installDebugBearHarness(
+  hostname: string,
+  existingScript: FakeDebugBearScript | null = null,
+  random: () => number = () => 0,
+): {
   appendedScripts: FakeDebugBearScript[];
   listeners: Map<string, (event: Event) => void>;
   win: Window & { dbbRum?: unknown[] };
@@ -91,6 +96,10 @@ function installDebugBearHarness(hostname: string, existingScript: FakeDebugBear
   };
   Object.defineProperty(globalThis, 'window', { configurable: true, value: win });
   Object.defineProperty(globalThis, 'document', { configurable: true, value: doc });
+  // Force the sample gate to pass deterministically so these tests verify behavior WHEN sampled,
+  // independent of DEBUGBEAR_RUM_SAMPLE_RATE (< 100 makes real Math.random probabilistic).
+  const savedRandom = Math.random;
+  Math.random = random;
 
   return {
     appendedScripts,
@@ -101,6 +110,7 @@ function installDebugBearHarness(hostname: string, existingScript: FakeDebugBear
         if (desc) Object.defineProperty(globalThis, key, desc);
         else delete (globalThis as Record<string, unknown>)[key];
       }
+      Math.random = savedRandom;
       resetDebugBearRumForTesting();
       resetMarketingDebugBearRumForTesting();
     },
@@ -134,7 +144,7 @@ describe('DebugBear RUM loader', () => {
       h.listeners.get('error')!(errorEvent);
       h.listeners.get('unhandledrejection')!(rejectionEvent);
       assert.deepEqual(h.win.dbbRum, [
-        ['presampling', 100],
+        ['presampling', DEBUGBEAR_RUM_SAMPLE_RATE],
         ['error', errorEvent],
         ['unhandledrejection', rejectionEvent],
       ]);
@@ -143,25 +153,25 @@ describe('DebugBear RUM loader', () => {
     }
   });
 
-  it('queues only numeric U3a durations and closed low-cardinality tags', () => {
+  it('queues transfer metrics and closed low-cardinality tags in the documented slots', () => {
     const h = installDebugBearHarness('www.worldmonitor.app');
     try {
       initDebugBearRum();
-      reportBootstrapR2Rum({
-        bootstrap_tier: 'slow',
+      reportBootstrapTransferRum({
+        tier: 'slow',
         device_class: 'mobile',
-        total_duration_ms: 880,
-        redis_duration_ms: 310,
-        non_r2_overhead_ms: 570,
-        outcome: 'abort',
+        duration_ms: 880,
+        decoded_bytes: 1_937_018,
+        encoded_bytes: 351_175,
+        outcome: 'complete',
       });
 
       assert.deepEqual(h.win.dbbRum?.slice(1), [
         ['metric1', 880],
-        ['metric2', 310],
-        ['metric3', 570],
+        ['metric2', 1_937_018],
+        ['metric3', 351_175],
         ['tag1', 'slow'],
-        ['tag2', 'abort'],
+        ['tag2', 'complete'],
         ['tag3', 'mobile'],
       ]);
       assert.equal(JSON.stringify(h.win.dbbRum).includes('request'), false);
@@ -196,12 +206,28 @@ describe('DebugBear RUM loader', () => {
       h.restore();
     }
   });
+
+  it('keeps the RUM sample rate at 10% and skips out-of-sample loads', () => {
+    assert.equal(DEBUGBEAR_RUM_SAMPLE_RATE, 10);
+
+    const h = installDebugBearHarness('worldmonitor.app', null, () => 0.1);
+    try {
+      initDebugBearRum();
+
+      assert.equal(h.appendedScripts.length, 0);
+      assert.equal(h.win.dbbRum, undefined);
+      assert.equal(h.listeners.size, 0);
+    } finally {
+      h.restore();
+    }
+  });
 });
 
 describe('DebugBear RUM marketing loader', () => {
   it('uses the same script endpoint and sample rate as the dashboard loader', () => {
     assert.equal(MARKETING_DEBUGBEAR_RUM_SCRIPT_SRC, DEBUGBEAR_RUM_SCRIPT_SRC);
     assert.equal(MARKETING_DEBUGBEAR_RUM_SAMPLE_RATE, DEBUGBEAR_RUM_SAMPLE_RATE);
+    assert.equal(MARKETING_DEBUGBEAR_RUM_SAMPLE_RATE, 10);
   });
 
   it('uses the same production-host gate as the dashboard loader', () => {
@@ -241,10 +267,27 @@ describe('DebugBear RUM marketing loader', () => {
       h.restore();
     }
   });
+
+  it('skips out-of-sample marketing page loads', () => {
+    const h = installDebugBearHarness('worldmonitor.app', null, () => 0.1);
+    try {
+      initMarketingDebugBearRum();
+
+      assert.equal(h.appendedScripts.length, 0);
+      assert.equal(h.win.dbbRum, undefined);
+      assert.equal(h.listeners.size, 0);
+    } finally {
+      h.restore();
+    }
+  });
 });
 
-describe('DebugBear RUM marketing build output', () => {
-  it('/pro and root welcome can reach the DebugBear loader in committed assets', () => {
+// public/pro/ is built by `npm run build:pro`, not committed (#6898): skip when the
+// checkout has not built it, fail when WM_EXPECT_BUILT_OUTPUT=1 says CI did.
+describe('DebugBear RUM marketing build output', { skip: shouldSkipProBuiltOutput() }, () => {
+  guardProBuiltOutput();
+
+  it('/pro and root welcome can reach the DebugBear loader in built assets', () => {
     for (const page of ['public/pro/index.html', 'public/pro/welcome.html']) {
       const entries = proPageModuleEntries(page);
       assert.ok(entries.length > 0, `${page}: no module entry found`);

@@ -3,6 +3,7 @@ import { getOptionalUpstashCreds } from './_upstash-rest.mjs';
 import {
   CHINA_COVERAGE_ENTRIES,
   CHINA_COVERAGE_REASON_CODES as REASON,
+  CHINA_COVERAGE_SUMMARY_KEY,
   chinaCoverageRedisKeys,
 } from './china-coverage-manifest.mjs';
 
@@ -81,6 +82,13 @@ function probeContent(payload, probe) {
   if (probe.kind === 'object') {
     if (probe.requiredTruthyPaths?.some((path) => !valuesAtPath(payload, path).some(Boolean))) {
       return { status: 'empty', rows: [payload] };
+    }
+    if (
+      Array.isArray(probe.validStatusValues)
+      && !valuesAtPath(payload, probe.statusPath ?? ['status'])
+        .some((value) => probe.validStatusValues.includes(String(value)))
+    ) {
+      return { status: 'partial', rows: [payload] };
     }
     return { status: 'present', rows: [payload] };
   }
@@ -162,11 +170,99 @@ function reasonCodesFor(transport, content) {
   return reasons;
 }
 
+export function normalizeChinaProblemIdentity(entries) {
+  const problems = entries
+    .filter((entry) => entry?.launchStatus === 'launched' && entry?.status !== 'healthy')
+    .map((entry) => ({
+      id: typeof entry.id === 'string' ? entry.id : '',
+      status: typeof entry.status === 'string' ? entry.status : '',
+      reasonCodes: [...new Set(
+        Array.isArray(entry.reasonCodes)
+          ? entry.reasonCodes.filter((reason) => typeof reason === 'string')
+          : [],
+      )].sort(),
+    }))
+    .sort((left, right) => {
+      const leftKey = JSON.stringify(left);
+      const rightKey = JSON.stringify(right);
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    });
+  return problems.length > 0 ? JSON.stringify(problems) : null;
+}
+
+function isConsistentCoverageSummary(summary, currentEntries, evaluatedAt, now) {
+  if (
+    !Array.isArray(summary?.entries)
+    || summary.entries.length === 0
+    || summary.entries.length > 100
+  ) return false;
+
+  const ids = new Set();
+  for (const entry of summary.entries) {
+    if (
+      !entry
+      || typeof entry !== 'object'
+      || typeof entry.id !== 'string'
+      || entry.id.length === 0
+      || entry.id.length > 100
+      || ids.has(entry.id)
+      || !['launched', 'planned', 'blocked'].includes(entry.launchStatus)
+      || !Array.isArray(entry.reasonCodes)
+      || entry.reasonCodes.length > 16
+      || entry.reasonCodes.some((reason) => typeof reason !== 'string' || reason.length > 64)
+      || (entry.launchStatus === 'launched'
+        ? !['healthy', 'degraded', 'unavailable'].includes(entry.status)
+        : entry.status !== entry.launchStatus)
+    ) {
+      return false;
+    }
+    ids.add(entry.id);
+  }
+
+  const launched = summary.entries.filter((entry) => entry.launchStatus === 'launched');
+  const currentLaunchedIds = currentEntries
+    .filter((entry) => entry.launchStatus === 'launched')
+    .map((entry) => entry.id)
+    .sort();
+  const previousLaunchedIds = launched.map((entry) => entry.id).sort();
+  if (
+    currentLaunchedIds.length !== previousLaunchedIds.length
+    || currentLaunchedIds.some((id, index) => id !== previousLaunchedIds[index])
+  ) {
+    return false;
+  }
+
+  const healthy = launched.filter((entry) => entry.status === 'healthy').length;
+  const degraded = launched.filter((entry) => entry.status === 'degraded').length;
+  const unavailable = launched.filter((entry) => entry.status === 'unavailable').length;
+  const expectedStatus = unavailable === launched.length
+    ? 'unavailable'
+    : degraded > 0 || unavailable > 0
+      ? 'degraded'
+      : 'healthy';
+  return summary?.schemaVersion === 1
+    && summary?.countryCode === 'CN'
+    && launched.length > 0
+    && healthy + degraded + unavailable === launched.length
+    && summary.status === expectedStatus
+    && summary?.counts?.total === summary.entries.length
+    && summary?.counts?.launched === launched.length
+    && summary.counts.planned === summary.entries.filter((entry) => entry.launchStatus === 'planned').length
+    && summary.counts.blocked === summary.entries.filter((entry) => entry.launchStatus === 'blocked').length
+    && summary.counts.healthy === healthy
+    && summary.counts.degraded === degraded
+    && summary.counts.unavailable === unavailable
+    && Number.isSafeInteger(evaluatedAt)
+    && evaluatedAt > 0
+    && evaluatedAt <= now;
+}
+
 export function evaluateChinaCoverage({
   entries = CHINA_COVERAGE_ENTRIES,
   data = {},
   meta = {},
   now = Date.now(),
+  previous = null,
 } = {}) {
   const evaluated = entries.map((entry) => {
     if (entry.launchStatus !== 'launched') {
@@ -212,10 +308,37 @@ export function evaluateChinaCoverage({
   if (launched.length > 0 && counts.unavailable === launched.length) status = 'unavailable';
   else if (counts.degraded > 0 || counts.unavailable > 0) status = 'degraded';
 
+  // Keep the instantaneous status truthful while retaining the last proven
+  // healthy clock. Non-healthy evaluations never advance it.
+  const degradedProblemKey = normalizeChinaProblemIdentity(evaluated);
+  const previousStreak = Number.isInteger(previous?.degradedStreak)
+    && previous.degradedStreak > 0
+    && previous.degradedProblemKey === degradedProblemKey
+    ? previous.degradedStreak
+    : 0;
+  const degradedStreak = status === 'healthy' ? 0 : previousStreak + 1;
+  const previousEvaluatedAt = Date.parse(previous?.evaluatedAt ?? '');
+  const explicitLastHealthyAt = Number.isSafeInteger(previous?.lastHealthyAt)
+    && previous.lastHealthyAt > 0
+    && previous.lastHealthyAt <= previousEvaluatedAt
+    && previous.lastHealthyAt <= now
+      ? previous.lastHealthyAt
+      : null;
+  const previousSummaryValid = isConsistentCoverageSummary(previous, evaluated, previousEvaluatedAt, now);
+  const legacyLastHealthyAt = previousSummaryValid && previous.status === 'healthy'
+      ? previousEvaluatedAt
+      : null;
+  const lastHealthyAt = status === 'healthy'
+    ? now
+    : previousSummaryValid ? explicitLastHealthyAt ?? legacyLastHealthyAt : null;
+
   return {
     schemaVersion: 1,
     countryCode: 'CN',
     status,
+    degradedStreak,
+    degradedProblemKey,
+    lastHealthyAt,
     evaluatedAt: new Date(now).toISOString(),
     counts,
     entries: evaluated,
@@ -236,7 +359,9 @@ export async function readChinaCoverageInputs(entries = CHINA_COVERAGE_ENTRIES) 
   const credentials = getOptionalUpstashCreds();
   if (!credentials) throw new Error('Redis not configured');
   const keys = chinaCoverageRedisKeys(entries);
-  const ordered = [...keys.data, ...keys.meta];
+  // The previous summary rides the same pipeline: one extra GET, and the streak
+  // cannot be computed without it.
+  const ordered = [...keys.data, ...keys.meta, CHINA_COVERAGE_SUMMARY_KEY];
   const response = await fetch(`${credentials.restUrl}/pipeline`, {
     method: 'POST',
     headers: {
@@ -256,13 +381,24 @@ export async function readChinaCoverageInputs(entries = CHINA_COVERAGE_ENTRIES) 
   if (errorCount > 0) throw new Error(`Redis pipeline returned ${errorCount} command error(s)`);
   const data = {};
   const meta = {};
+  let previous = null;
   for (let index = 0; index < ordered.length; index++) {
     const key = ordered[index];
+    if (index === ordered.length - 1) {
+      try {
+        previous = parseRedisJson(results[index]?.result);
+      } catch {
+        // History is advisory. A corrupt prior summary must not prevent this
+        // run from publishing a fresh value that repairs the Redis slot.
+        previous = null;
+      }
+      continue;
+    }
     const value = parseRedisJson(results[index]?.result);
     if (index < keys.data.length) data[key] = value;
     else meta[key] = value;
   }
-  return { data, meta };
+  return { data, meta, previous };
 }
 
 export function chinaCoverageReadCommands(keys) {

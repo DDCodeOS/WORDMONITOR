@@ -21,6 +21,9 @@ import {
   getIdempotencyKey,
 } from './_idempotency.js';
 import { validateBearerToken } from '../server/auth-session';
+// From the canonical shared module, not via api/mcp/upgrade — the checkout edge
+// function has no reason to depend on the MCP transport tree (#6716).
+import { normalizeCheckoutAttributionSource } from '../shared/mcp-attribution';
 
 const CONVEX_SITE_URL =
   process.env.CONVEX_SITE_URL ??
@@ -56,13 +59,19 @@ export function __setCreateCheckoutDepsForTests(overrides: Partial<CreateCheckou
     : createDefaultCreateCheckoutDeps();
 }
 
-function json(body: unknown, status: number, cors: Record<string, string>): Response {
+function json(
+  body: unknown,
+  status: number,
+  cors: Record<string, string>,
+  extraHeaders: Record<string, string> = {},
+): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
       'Content-Type': 'application/json',
       'Cache-Control': 'no-store',
       ...cors,
+      ...extraHeaders,
     },
   });
 }
@@ -120,6 +129,7 @@ export default async function handler(
     returnUrl?: string;
     discountCode?: string;
     referralCode?: string;
+    attributionSource?: string;
     bypassPendingGuard?: boolean;
   };
   try {
@@ -155,6 +165,8 @@ export default async function handler(
     return completeStandaloneIdempotency(idempotency, json({ error: 'Service unavailable' }, 503, cors));
   }
 
+  const attributionSource = normalizeCheckoutAttributionSource(body.attributionSource);
+
   // Relay to Convex
   try {
     const resp = await createCheckoutDeps.fetch(`${CONVEX_SITE_URL}/relay/create-checkout`, {
@@ -172,6 +184,7 @@ export default async function handler(
         returnUrl: body.returnUrl,
         discountCode: body.discountCode,
         referralCode: body.referralCode,
+        attributionSource,
         bypassPendingGuard: body.bypassPendingGuard,
       }),
       signal: AbortSignal.timeout(15_000),
@@ -179,6 +192,29 @@ export default async function handler(
 
     const data = await resp.json();
     if (!resp.ok) {
+      if (resp.status === 400 && data?.error === 'INVALID_CHECKOUT_PRODUCT') {
+        return completeStandaloneIdempotency(
+          idempotency,
+          json({ error: 'INVALID_CHECKOUT_PRODUCT' }, 400, cors),
+        );
+      }
+      if (resp.status === 429) {
+        const retryAfter = resp.headers.get('retry-after');
+        return completeStandaloneIdempotency(
+          idempotency,
+          json(
+            {
+              error: typeof data?.error === 'string' ? data.error : 'CHECKOUT_RATE_LIMITED',
+              message: typeof data?.message === 'string'
+                ? data.message
+                : 'Checkout is temporarily rate limited. Retry shortly.',
+            },
+            429,
+            cors,
+            { 'Retry-After': retryAfter && /^\d{1,4}$/.test(retryAfter) ? retryAfter : '10' },
+          ),
+        );
+      }
       if (resp.status === 409) {
         // Two distinct blocks share 409; the client discriminates on `error`
         // (ACTIVE_SUBSCRIPTION_EXISTS vs PAYMENT_IN_PROGRESS, #4438). Forward
@@ -195,7 +231,14 @@ export default async function handler(
         return completeStandaloneIdempotency(idempotency, json(blockedBody, 409, cors));
       }
       console.error('[create-checkout] Relay error:', resp.status, data);
-      return completeStandaloneIdempotency(idempotency, json({ error: data?.error || 'Checkout creation failed' }, 502, cors));
+      // A reached relay returning 500 is an application/provider failure. Keep
+      // it distinct from an edge-to-relay fetch failure (the catch below),
+      // which remains 502 and is eligible for the browser's single retry.
+      const edgeStatus = resp.status === 500 ? 500 : 502;
+      return completeStandaloneIdempotency(
+        idempotency,
+        json({ error: data?.error || 'Checkout creation failed' }, edgeStatus, cors),
+      );
     }
 
     return completeStandaloneIdempotency(idempotency, json(data, 200, cors));

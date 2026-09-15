@@ -21,9 +21,23 @@ const { readSeedSnapshot, verifySeedKey } = await import('../scripts/_seed-utils
 const originalFetch = globalThis.fetch;
 
 function mockFetch(upstashResult) {
+  const requests = [];
+  globalThis.fetch = async (_url, options) => {
+    requests.push(options);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ result: upstashResult == null ? null : JSON.stringify(upstashResult) }),
+    };
+  };
+  return requests;
+}
+
+function mockUpstashBody(body) {
   globalThis.fetch = async () => ({
     ok: true,
-    json: async () => ({ result: upstashResult == null ? null : JSON.stringify(upstashResult) }),
+    status: 200,
+    json: async () => body,
   });
 }
 
@@ -31,11 +45,12 @@ beforeEach(() => { /* per-test mock set inside test body */ });
 afterEach(() => { globalThis.fetch = originalFetch; });
 
 test('readSeedSnapshot: envelope-wrapped value returns inner data only', async () => {
-  mockFetch({
+  const requests = mockFetch({
     _seed: { fetchedAt: 1, recordCount: 3, sourceVersion: 'v1', schemaVersion: 1, state: 'OK' },
     data: { countries: [{ code: 'US' }, { code: 'GB' }, { code: 'MY' }] },
   });
   const snap = await readSeedSnapshot('economic:bigmac:v1');
+  assert.ok(new Headers(requests[0].headers).get('User-Agent'));
   assert.deepEqual(snap, { countries: [{ code: 'US' }, { code: 'GB' }, { code: 'MY' }] });
   assert.equal(snap._seed, undefined);
 });
@@ -57,6 +72,94 @@ test('readSeedSnapshot: strict mode distinguishes an upstream read failure from 
     readSeedSnapshot('conflict:acled:v1:all:0:0', { strict: true }),
     /Redis snapshot read failed: HTTP 503/,
   );
+});
+
+test('readSeedSnapshot: strict mode accepts only an explicit null result as a missing key', async () => {
+  mockUpstashBody({ result: null });
+  assert.equal(await readSeedSnapshot('missing:key:v1', { strict: true }), null);
+});
+
+test('readSeedSnapshot: strict mode accepts a valid envelope and unwraps it', async () => {
+  mockFetch({
+    _seed: { fetchedAt: 1, recordCount: 1, sourceVersion: 'v1', schemaVersion: 1, state: 'OK' },
+    data: { samples: [1] },
+  });
+  assert.deepEqual(await readSeedSnapshot('rolling:baseline:v1', { strict: true }), { samples: [1] });
+});
+
+test('readSeedSnapshot: can return data and envelope meta from one Redis read', async () => {
+  const meta = { fetchedAt: 1, recordCount: 1, sourceVersion: 'v1', schemaVersion: 1, state: 'OK' };
+  mockFetch({ _seed: meta, data: { samples: [1] } });
+  assert.deepEqual(
+    await readSeedSnapshot('rolling:baseline:v1', { strict: true, includeEnvelopeMeta: true }),
+    { data: { samples: [1] }, meta },
+  );
+});
+
+test('readSeedSnapshot: strict mode accepts a valid legacy payload', async () => {
+  mockFetch({ samples: [1], fetchedAt: 1 });
+  assert.deepEqual(await readSeedSnapshot('rolling:baseline:v1', { strict: true }), { samples: [1], fetchedAt: 1 });
+});
+
+test('readSeedSnapshot: strict mode rejects malformed Upstash response envelopes', async () => {
+  const malformedEnvelopes = [
+    [{}, /without a result/],
+    [{ error: 'upstream protocol error' }, /rejected by Upstash: upstream protocol error/],
+    [{ result: { unexpected: true } }, /non-string result/],
+    [[], /unexpected Upstash response/],
+  ];
+
+  for (const [body, expected] of malformedEnvelopes) {
+    mockUpstashBody(body);
+    await assert.rejects(
+      readSeedSnapshot('rolling:baseline:v1', { strict: true }),
+      expected,
+    );
+  }
+});
+
+test('readSeedSnapshot: strict mode rejects malformed stored JSON', async () => {
+  for (const result of ['{not valid json', '']) {
+    mockUpstashBody({ result });
+    await assert.rejects(
+      readSeedSnapshot('rolling:baseline:v1', { strict: true }),
+      /malformed stored JSON/,
+    );
+  }
+});
+
+test('readSeedSnapshot: strict mode does not confuse a stored JSON null with a missing key', async () => {
+  mockUpstashBody({ result: 'null' });
+  await assert.rejects(
+    readSeedSnapshot('rolling:baseline:v1', { strict: true }),
+    /null stored snapshot/,
+  );
+});
+
+test('readSeedSnapshot: strict mode rejects an unparseable HTTP-200 body', async () => {
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => { throw new SyntaxError('bad response'); },
+  });
+  await assert.rejects(
+    readSeedSnapshot('rolling:baseline:v1', { strict: true }),
+    /returned invalid JSON \(HTTP 200\)/,
+  );
+});
+
+test('readSeedSnapshot: non-strict mode preserves null degradation for ambiguous reads', async () => {
+  for (const body of [{}, { error: 'upstream protocol error' }, { result: { unexpected: true } }, []]) {
+    mockUpstashBody(body);
+    assert.equal(await readSeedSnapshot('best-effort:key:v1'), null);
+  }
+
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => { throw new SyntaxError('bad response'); },
+  });
+  assert.equal(await readSeedSnapshot('best-effort:key:v1'), null);
 });
 
 test('verifySeedKey: envelope-wrapped value returns inner data only', async () => {

@@ -4,8 +4,9 @@ description: "How Scenario Engine turns chokepoint, trade, and HS2 exposure data
 metaTitle: "Supply Chain Scenario Engine Stress Test | WorldMonitor"
 keywords: "supply chain scenario engine, geopolitical stress test, chokepoint scenario, supply chain risk simulation, trade exposure analysis"
 audience: "Supply chain teams, commodity desks, risk managers, policy analysts"
-heroImage: "/blog/og/stress-test-supply-chain-scenario-engine-worldmonitor.png"
+heroImage: "/blog/images/blog/stress-test-supply-chain-scenario-engine-worldmonitor.jpg"
 pubDate: "2026-06-13"
+modifiedDate: "2026-09-10"
 ---
 
 Most supply-chain dashboards answer a live-state question: which ports, corridors, commodities, or countries are under pressure right now?
@@ -40,12 +41,14 @@ The live template catalog is defined in the codebase, and the API response shoul
 
 | Template | Core question |
 |---|---|
-| Taiwan Strait Full Closure | What happens to electronics, machinery, and vehicle routes if East Asia traffic is blocked? |
-| Suez + Bab el-Mandeb Simultaneous Disruption | What happens if the Red Sea corridor is heavily impaired? |
-| Panama Canal Drought - 50% Capacity | What happens when climate stress cuts a key canal's throughput? |
-| Hormuz Strait Tanker Blockade | What happens when Persian Gulf energy and petrochemical exports are severed? |
+| [Taiwan Strait](https://www.worldmonitor.app/chokepoints/taiwan-strait/) Full Closure | What happens to electronics, machinery, and vehicle routes if East Asia traffic is blocked? |
+| [Suez](https://www.worldmonitor.app/chokepoints/suez-canal/) + [Bab el-Mandeb](https://www.worldmonitor.app/chokepoints/bab-el-mandeb/) Simultaneous Disruption | What happens if the Red Sea corridor is heavily impaired? |
+| [Panama Canal](https://www.worldmonitor.app/chokepoints/panama-canal/) Drought - 50% Capacity | What happens when climate stress cuts a key canal's throughput? |
+| [Hormuz Strait](https://www.worldmonitor.app/chokepoints/strait-of-hormuz/) Tanker Blockade | What happens when Persian Gulf energy and petrochemical exports are severed? |
 | Russia Baltic Grain Export Suspension | What happens to cereals and oilseeds when a grain route is suspended? |
 | US Tariff Escalation - Electronics | What happens when a tariff shock hits electronics without a physical chokepoint closure? |
+
+Open a linked waterway to compare its published observations with the hypothetical scenario.
 
 The templates cover conflict, weather, sanctions, and tariff-shock categories. The type system leaves room for infrastructure and pandemic categories, but those categories do not ship templates today.
 
@@ -103,6 +106,8 @@ Use the [maritime chokepoint explainer](/blog/posts/what-is-a-maritime-chokepoin
 Scenario Engine sits on top of WorldMonitor's chokepoint registry, live chokepoint status, HS2 exposure caches, and supply-chain panel state. The template catalog is curated in code. The job queue and worker output are explicit: callers can see pending, processing, done, and failed states rather than receiving an opaque spinner.
 
 That is the right shape for geopolitical modeling. A useful stress test should show its assumptions, expose its scope, and avoid pretending a relative impact score is a dollar-denominated forecast.
+
+The template assumptions and execution path are inspectable in the public [scenario-engine source](https://github.com/koala73/worldmonitor/tree/main/server/worldmonitor/scenario) and [scenario template catalog](https://github.com/koala73/worldmonitor/blob/main/server/worldmonitor/supply-chain/v1/scenario-templates.ts).
 
 ## Frequently Asked Questions
 

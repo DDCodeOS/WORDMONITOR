@@ -14,10 +14,10 @@ interface MomentConfig {
 }
 
 const MOMENTS: MomentConfig[] = [
-  { key: 'm1', twoLineTitle: true, signals: ['RISK', 'FLOW', 'MACRO', 'PRICE'], chips: ['free', 'free', 'pro', 'pro'], href: 'https://finance.worldmonitor.app/dashboard?ref=welcome-m1' },
-  { key: 'm2', twoLineTitle: true, signals: ['AIS', 'WEATHER', 'SUPPLY', 'SPREAD'], chips: ['free', 'free', 'pro', 'pro'], href: 'https://commodity.worldmonitor.app/dashboard?ref=welcome-m2' },
-  { key: 'm3', twoLineTitle: true, signals: ['AI', 'GRID', 'CLIMATE', 'MARKET'], chips: ['free', 'free', 'pro', 'pro'], href: 'https://tech.worldmonitor.app/dashboard?ref=welcome-m3' },
-  { key: 'm4', twoLineTitle: false, signals: ['CABLE', 'BGP', 'PORTS', 'RISK'], chips: ['free', 'free', 'free', 'free'], href: `${DASHBOARD_PATH}?ref=welcome-m4` },
+  { key: 'm1', twoLineTitle: true, signals: ['RISK', 'FLOW', 'MACRO', 'PRICE'], chips: ['free', 'free', 'pro', 'pro'], href: 'https://finance.worldmonitor.app/dashboard?utm_source=welcome&utm_content=m1' },
+  { key: 'm2', twoLineTitle: true, signals: ['AIS', 'WEATHER', 'SUPPLY', 'SPREAD'], chips: ['free', 'free', 'pro', 'pro'], href: 'https://commodity.worldmonitor.app/dashboard?utm_source=welcome&utm_content=m2' },
+  { key: 'm3', twoLineTitle: true, signals: ['AI', 'GRID', 'CLIMATE', 'MARKET'], chips: ['free', 'free', 'pro', 'pro'], href: 'https://tech.worldmonitor.app/dashboard?utm_source=welcome&utm_content=m3' },
+  { key: 'm4', twoLineTitle: false, signals: ['CABLE', 'BGP', 'PORTS', 'RISK'], chips: ['free', 'free', 'free', 'free'], href: `${DASHBOARD_PATH}?utm_source=welcome&utm_content=m4` },
 ];
 
 const CHIP_CLASS: Record<ChipTier, string> = {
@@ -41,7 +41,7 @@ export const Moments = () => (
           return (
             <motion.article
               key={key}
-              initial={{ opacity: 0, y: 24 }}
+              initial={false}
               whileInView={{ opacity: 1, y: 0 }}
               viewport={{ once: true, margin: '-60px' }}
               transition={{ duration: 0.5, delay: (mi % 2) * 0.1 }}
@@ -106,7 +106,7 @@ export const Moments = () => (
         })}
       </div>
       <motion.p
-        initial={{ opacity: 0 }}
+        initial={false}
         whileInView={{ opacity: 1 }}
         viewport={{ once: true, margin: '-40px' }}
         transition={{ duration: 0.5 }}
